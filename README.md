@@ -1,137 +1,166 @@
-# DINIS — High-Performance ICMP Network Monitor
+# DINIS — ICMP Network Monitor
 
-**DINIS** is a lightweight, blazing-fast, and real-time ICMP Echo (ping) network monitoring application built in Go. It enables DevOps engineers and NOC teams to monitor subnets via CIDR notation, exclude specific hosts or IP ranges, receive instant alerts for unreachable targets, acknowledge outages with operator notes, and visualize network health through a dark-mode web dashboard.
-
----
-
-## Key Features
-
-- ⚡ **Interval-Stretched Pacing & Scaling**:
-  - Automatically spreads and staggers ICMP probes uniformly across the duration of the configured interval ($\Delta t = \text{Window} / N$).
-  - Instead of sending burst spikes all at $t=0$, packets are dispatched in a continuous, smooth, low-impact trickle (e.g. 200 hosts across 5s = 1 probe every 20ms).
-  - Eliminates network switch buffer overruns, ARP storming, and router rate-limiting on large subnets.
-- 🔍 **Intelligent Subnet Discovery**:
-  - Automatically sweeps configured CIDR subnets on a **configurable discovery interval** (e.g. every 5m, 15m, 1h, or manual on-demand).
-  - Only adds hosts that are **actually online during discovery** to continuous live monitoring. Unallocated/unused IPs in the subnet are not continuously pinged and do not trigger false alerts!
-  - Ability to trigger "Run Discovery Now" globally or per-subnet in the Web UI.
-- 🌐 **CIDR Notation Support**: Add entire subnets (e.g. `192.168.1.0/24`, `10.0.0.0/16`) or single static IPs (`8.8.8.8`). Displays active hosts vs total subnet capacity.
-- 🚫 **IP & Subnet Exclusions**: Exclude specific IPs or ranges from both discovery and live monitoring with custom reasons.
-- 🚨 **Alert & Incident Management**:
-  - Live outage detection when an active monitored device stops responding.
-  - One-click or noted **Alert Acknowledgements** (track operator names, notes, and duration).
-  - Automatic resolution when hosts recover.
-  - Incident history logging.
-- 📊 **Modern NOC Web Dashboard**:
-  - Real-time updates via **Server-Sent Events (SSE)** with zero-polling latency.
-  - Live micro-sparkline latency trend charts and packet loss gauges.
-  - Dual view modes: Visual Cards and High-Density NOC Table.
-  - Audio alert chime generator using Web Audio API.
-  - Host inspection drawer with on-demand manual pinging and custom host aliases.
-- 📦 **Single Standalone Binary**: Web assets (HTML, CSS, JS) are embedded directly into the Go binary (`embed.FS`) with zero external runtime dependencies.
-- 💾 **Thread-Safe Persistence**: Atomically saved JSON data store across restarts.
+DINIS is a lightweight ICMP Echo (ping) network monitoring daemon and web dashboard written in Go. It performs automated subnet discovery across configured CIDR ranges, continuously monitors discovered and static targets with paced ICMP requests, manages outage alerts with operator acknowledgement workflows, and serves a self-contained real-time web interface.
 
 ---
 
-## Quickstart
+## Features
 
-### 1. Build from Source
-Ensure you have Go (1.20+) installed:
+- **Paced Probing**: Distributes ICMP probes across the configured monitor interval to avoid burst packet storms on network switches and gateway routers.
+- **CIDR Subnet Discovery**: Sweeps entire CIDR blocks on a configurable schedule (default: every 4 hours) and automatically enrolls responsive hosts into continuous monitoring.
+- **Exclusion Rules**: Supports IP and CIDR exclusions with user-defined reasons to ignore broadcast domains, gateways, or non-monitored ranges.
+- **Incident & Alert Lifecycle**: Tracks consecutive packet drops, triggers outage alerts when a host reaches the failure threshold, supports operator acknowledgements with notes, and automatically resolves alerts upon host recovery.
+- **Embedded Web Dashboard**: Real-time updates via Server-Sent Events (SSE), live latency sparklines, grid and table views, on-demand manual pinging, and sound notifications. Single binary with all HTML, CSS, and JS assets embedded via `embed.FS`.
+- **Atomic Persistence**: Persists configuration, discovered hosts, metadata, and settings to a JSON data store using atomic write operations.
+
+---
+
+## Requirements
+
+- **Linux** with unprivileged ICMP datagram sockets enabled (`net.ipv4.ping_group_range`) or `CAP_NET_RAW` capabilities.
+- **Go 1.20+** (for building from source).
+
+To enable unprivileged ICMP sockets on Linux:
+```bash
+sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+```
+
+---
+
+## Building & Running
+
+### Build
 
 ```bash
 go build -o dinis main.go
 ```
 
-### 2. Run the Application
-Start the monitoring service on port `8080`:
+### Run
 
 ```bash
 ./dinis -port 8080 -data data/dinis.json
 ```
 
-Then open your browser and navigate to:
-```
-http://localhost:8080
-```
+Open `http://localhost:8080` in a browser to access the dashboard.
 
 ---
 
-## CLI Options
+## CLI Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `-port` | `8080` | HTTP Web UI and REST API listening port |
-| `-host` | `0.0.0.0` | Listen host address |
-| `-data` | `data/dinis.json` | Path to persistent storage JSON file |
-| `-static` | `""` | Optional path to static web directory (for live UI development) |
-| `-version` | `false` | Display version and exit |
+| `-port` | `8080` | HTTP listen port for the web dashboard and REST API |
+| `-host` | `0.0.0.0` | HTTP listen address |
+| `-data` | `data/dinis.json` | Path to persistent JSON storage file |
+| `-static` | `""` | Optional filesystem path to web assets (overrides embedded assets for local development) |
+| `-version` | `false` | Print application version and exit |
 
 ---
 
-## REST API Reference
+## Default Configuration
 
-| Method | Endpoint | Description |
+| Setting | Default | Description |
 |---|---|---|
-| `GET` | `/api/summary` | Get aggregated monitoring metrics and health rates |
-| `GET` | `/api/hosts` | List all monitored hosts with live latency & state |
-| `GET` | `/api/hosts/{ip}` | Get detailed metrics and RTT history for a host |
-| `POST` | `/api/hosts/{ip}/ping` | Trigger an immediate on-demand manual probe |
-| `PUT` | `/api/hosts/{ip}/meta` | Update host alias or operator notes |
-| `GET` | `/api/cidrs` | List all configured CIDR subnets |
-| `POST` | `/api/cidrs` | Add or update a CIDR range |
-| `DELETE` | `/api/cidrs?cidr=...` | Remove a CIDR subnet from monitoring |
-| `GET` | `/api/exclusions` | List active host/subnet exclusion rules |
-| `POST` | `/api/exclusions` | Add an exclusion rule |
-| `DELETE` | `/api/exclusions?rule=...`| Remove an exclusion rule |
-| `GET` | `/api/alerts` | List all active firing and acknowledged alerts |
-| `GET` | `/api/alerts/history` | List resolved historical incidents |
-| `POST` | `/api/alerts/acknowledge` | Acknowledge an outage alert with note |
-| `POST` | `/api/alerts/acknowledge-all` | Bulk acknowledge all active outages |
-| `GET` | `/api/settings` | Get probe intervals, timeouts, and concurrency |
-| `PUT` | `/api/settings` | Update settings live without restarting |
-| `GET` | `/api/stream` | Server-Sent Events (SSE) real-time event stream |
+| `intervalSec` | `60.0` | Probing frequency for monitored hosts (seconds) |
+| `discoveryIntervalMin` | `240` | Scheduled CIDR subnet discovery interval (minutes, `0` = manual only) |
+| `timeoutMs` | `1000` | ICMP Echo Reply receive timeout (milliseconds) |
+| `failThreshold` | `2` | Consecutive failed probes required to mark a host `DOWN` and trigger an alert |
+| `concurrency` | `100` | Maximum parallel worker goroutines for probing and discovery |
+| `autoDiscovery` | `true` | Enable automated periodic subnet discovery sweeps |
+| `soundAlerts` | `true` | Enable browser audio chime on state transitions |
+
+Settings can be changed at runtime via the Web UI Settings modal or via `PUT /api/settings`.
 
 ---
 
-## Project Structure
+## REST API
+
+### Monitoring & Hosts
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/summary` | Aggregated metrics, reachability rate, active alert counts, and pacing rates |
+| `GET` | `/api/hosts` | List all monitored hosts with status, latency history, and packet loss |
+| `GET` | `/api/hosts/{ip}` | Detailed host state, latency metrics, and metadata |
+| `POST` | `/api/hosts/{ip}/ping` | Execute an immediate on-demand ICMP probe against a host |
+| `PUT` | `/api/hosts/{ip}/meta` | Update custom alias and operator notes for a host |
+| `DELETE` | `/api/hosts/{ip}/enrollment` | Un-enroll a host from active monitoring |
+| `POST` | `/api/hosts/{ip}/promote` | Promote a discovered dynamic host to a static target |
+
+### Subnets & Exclusions
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/cidrs` | List configured CIDR blocks |
+| `POST` | `/api/cidrs` | Add or update a CIDR block (`{"cidr": "192.168.1.0/24", "description": "LAN", ...}`) |
+| `DELETE` | `/api/cidrs?cidr={cidr}` | Remove a CIDR block and prune associated non-static hosts |
+| `GET` | `/api/exclusions` | List active exclusion rules |
+| `POST` | `/api/exclusions` | Add an exclusion rule (`{"rule": "192.168.1.1", "reason": "Gateway"}`) |
+| `DELETE` | `/api/exclusions?rule={rule}` | Remove an exclusion rule |
+
+### Discovery & Alerts
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/discovery/status` | Current discovery state, scan counts, capacity, and next run timestamp |
+| `POST` | `/api/discovery/run` | Trigger an immediate discovery sweep (`?cidr={cidr}` optional) |
+| `GET` | `/api/alerts` | List all active firing and acknowledged alerts |
+| `GET` | `/api/alerts/history` | List resolved historical alert incidents |
+| `POST` | `/api/alerts/acknowledge` | Acknowledge an outage alert (`{"ip": "...", "ackBy": "...", "note": "..."}`) |
+| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active firing alerts |
+
+### Configuration & Real-Time Stream
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/settings` | Get current application settings |
+| `PUT` | `/api/settings` | Update settings live without restarting |
+| `GET` | `/api/stream` | Server-Sent Events (SSE) stream for real-time state updates |
+
+---
+
+## Directory Structure
 
 ```
 dinis/
-├── main.go                     # Entrypoint & CLI flag orchestration
+├── main.go                     # Application entrypoint & CLI orchestration
 ├── go.mod                      # Go module definition
+├── verify_e2e.py               # E2E integration test suite
 ├── pkg/
-│   ├── network/                # CIDR parsing, expansion, and exclusion engine
+│   ├── network/                # CIDR calculation and exclusion matching
 │   │   ├── cidr.go
 │   │   └── cidr_test.go
-│   ├── pinger/                 # High-throughput ICMP sockets & async worker engine
+│   ├── pinger/                 # Raw/DGRAM ICMP sockets, pacing, and probe engine
 │   │   ├── icmp.go
 │   │   ├── icmp_test.go
 │   │   ├── engine.go
 │   │   └── engine_test.go
-│   ├── alerts/                 # Alert state transitions, incident logs & acknowledgements
+│   ├── alerts/                 # Incident management, transitions, and history
 │   │   ├── manager.go
 │   │   └── manager_test.go
-│   ├── store/                  # Thread-safe atomic persistent JSON store
+│   ├── store/                  # Atomic JSON file persistence
 │   │   ├── store.go
 │   │   └── store_test.go
-│   └── server/                 # REST API, SSE broadcaster, and embedded web server
+│   └── server/                 # HTTP server, REST handlers, SSE, and embedded frontend
 │       ├── server.go
 │       └── web_dist/           # Embedded dashboard assets
 │           ├── index.html
 │           ├── style.css
 │           └── app.js
-└── data/                       # Persistent JSON data directory
+└── data/                       # Persistent JSON storage directory
 ```
 
 ---
 
-## Running Tests
+## Testing
 
-Execute the unit test suite:
+Run the unit test suite with race detection:
 ```bash
-go test -v ./...
+go test -race -v ./...
 ```
 
-Execute end-to-end integration tests:
+Run the end-to-end integration test suite:
 ```bash
+# Start server in background, then run:
 python3 verify_e2e.py
 ```
