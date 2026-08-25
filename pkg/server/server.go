@@ -33,13 +33,13 @@ type DiscoveryStatus struct {
 
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
 type Coordinator struct {
-	mu           sync.RWMutex
-	store        *store.Store
-	pinger       *pinger.Engine
-	alerts       *alerts.Manager
-	clientsMu    sync.RWMutex
-	sseClients   map[chan []byte]bool
-	stopChan     chan struct{}
+	mu         sync.RWMutex
+	store      *store.Store
+	pinger     *pinger.Engine
+	alerts     *alerts.Manager
+	clientsMu  sync.RWMutex
+	sseClients map[chan []byte]bool
+	stopChan   chan struct{}
 
 	discMu          sync.RWMutex
 	discoveryStatus DiscoveryStatus
@@ -462,7 +462,8 @@ func (c *Coordinator) discoveryLoop() {
 }
 
 func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatus pinger.HostStatus) {
-	if newStatus == pinger.StatusDown {
+	switch newStatus {
+	case pinger.StatusDown:
 		alt := c.alerts.Trigger(h.IP, h.Alias, h.CIDR, h.LastError)
 		h.AlertActive = true
 		h.AlertID = alt.ID
@@ -472,7 +473,7 @@ func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatu
 		h.AlertAckAt = alt.AcknowledgedAt
 		h.AlertStartedAt = &alt.StartedAt
 		c.pinger.SetHostAlertState(h.IP, true, alt.ID, alt.Acknowledged, alt.AcknowledgedBy, alt.AckNote, alt.AcknowledgedAt, &alt.StartedAt)
-	} else if newStatus == pinger.StatusUp || newStatus == pinger.StatusExcluded {
+	case pinger.StatusUp, pinger.StatusExcluded:
 		c.alerts.Resolve(h.IP)
 		h.AlertActive = false
 		h.AlertAcknowledged = false
@@ -1031,10 +1032,10 @@ func (s *Server) handleAlertAcknowledge(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
-		IP     string `json:"ip"`
-		ID     string `json:"id"`
-		AckBy  string `json:"ackBy"`
-		Note   string `json:"note"`
+		IP    string `json:"ip"`
+		ID    string `json:"id"`
+		AckBy string `json:"ackBy"`
+		Note  string `json:"note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid JSON payload")
