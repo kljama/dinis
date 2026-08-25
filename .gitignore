@@ -1,0 +1,195 @@
+# ==============================================================================
+# SECURITY & SECRETS (Prevent Credential, Token, Key & Env Leaks)
+# ==============================================================================
+# Environment variable files and local secrets
+.env
+.env.*
+!.env.example
+!.env.template
+*.env
+*.secret
+*.secrets
+*.token
+*.auth
+
+# Cryptographic Keys, Certificates & Keystores
+*.pem
+*.key
+*.pkcs12
+*.pfx
+*.p12
+*.cer
+*.crt
+*.der
+*.keystore
+*.jks
+*.kdb
+*.csr
+
+# SSH & GPG Keys
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+id_ecdsa
+id_ecdsa.pub
+id_dsa
+id_dsa.pub
+known_hosts
+authorized_keys
+*.gpg
+*.asc
+secring.*
+pubring.*
+
+# Cloud Provider & Service Credentials
+.aws/
+.gcp/
+.azure/
+.kube/
+kubeconfig
+*kubeconfig*
+*service-account*.json
+*service_account*.json
+*credentials*.json
+client_secret*.json
+google-services.json
+firebase.json
+
+# Infrastructure as Code & Terraform Secrets
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local Configuration Overrides & Developer Overrides
+*.local
+*.local.*
+config.local.*
+local.json
+local_settings.py
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# ==============================================================================
+# RUNTIME DATA & PERSISTENCE
+# ==============================================================================
+# Local runtime databases, network scan dumps, and active state
+data/*.json
+!data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.rdb
+*.dump
+*.sql
+*.sql.gz
+
+# ==============================================================================
+# COMPILED BINARIES, PACKAGES & ARTIFACTS
+# ==============================================================================
+/dinis
+/dinis.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+build/
+pkg/dist/
+target/
+
+# Test binaries, profiles & coverage reports
+*.test
+*.out
+*.prof
+*.pprof
+coverage.txt
+coverage.html
+profile.out
+cpu.pprof
+mem.pprof
+
+# ==============================================================================
+# SYSTEM, PROCESS & RUNTIME FILES
+# ==============================================================================
+*.log
+*.log.*
+*.tmp
+*.temp
+tmp/
+temp/
+*.pid
+*.sock
+*.socket
+core
+core.*
+*.dmp
+*.crash
+
+# Archive files & Local backups
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+*~
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+*.gz
+
+# ==============================================================================
+# PYTHON & SCRIPTS ARTIFACTS (Test & Diagnostic Suites)
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+ENV/
+env/
+
+# ==============================================================================
+# OPERATING SYSTEM METADATA
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# ==============================================================================
+# IDE, EDITORS & TOOLING
+# ==============================================================================
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+.classpath
+*.iml
+.history/
+.gemini/
+.agents/

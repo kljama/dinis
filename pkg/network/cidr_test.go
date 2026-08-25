@@ -1,0 +1,89 @@
+package network
+
+import (
+	"testing"
+)
+
+func TestParseCIDR(t *testing.T) {
+	// Test single IP
+	info, err := ParseCIDR("192.168.1.1", false)
+	if err != nil {
+		t.Fatalf("unexpected error for single IP: %v", err)
+	}
+	if info.TotalHosts != 1 || info.IPs[0] != "192.168.1.1" {
+		t.Errorf("expected 1 host 192.168.1.1, got %v", info)
+	}
+
+	// Test /30 without net/broadcast
+	info, err = ParseCIDR("192.168.1.0/30", false)
+	if err != nil {
+		t.Fatalf("unexpected error for /30: %v", err)
+	}
+	if info.TotalHosts != 2 {
+		t.Errorf("expected 2 hosts for /30 without net/bcast, got %d", info.TotalHosts)
+	}
+	if info.IPs[0] != "192.168.1.1" || info.IPs[1] != "192.168.1.2" {
+		t.Errorf("unexpected IPs: %v", info.IPs)
+	}
+
+	// Test /30 with net/broadcast
+	info, err = ParseCIDR("192.168.1.0/30", true)
+	if err != nil {
+		t.Fatalf("unexpected error for /30 with net/bcast: %v", err)
+	}
+	if info.TotalHosts != 4 {
+		t.Errorf("expected 4 hosts for /30 with net/bcast, got %d", info.TotalHosts)
+	}
+
+	// Test /31
+	info, err = ParseCIDR("10.0.0.0/31", false)
+	if err != nil {
+		t.Fatalf("unexpected error for /31: %v", err)
+	}
+	if info.TotalHosts != 2 {
+		t.Errorf("expected 2 hosts for /31, got %d", info.TotalHosts)
+	}
+
+	// Test /32
+	info, err = ParseCIDR("10.0.0.5/32", false)
+	if err != nil {
+		t.Fatalf("unexpected error for /32: %v", err)
+	}
+	if info.TotalHosts != 1 || info.IPs[0] != "10.0.0.5" {
+		t.Errorf("expected 1 host for /32, got %v", info)
+	}
+}
+
+func TestExclusionMatcher(t *testing.T) {
+	matcher := NewExclusionMatcher()
+	if err := matcher.AddExclusion("192.168.1.50", "Gateway server"); err != nil {
+		t.Fatalf("error adding exact IP: %v", err)
+	}
+	if err := matcher.AddExclusion("10.0.0.0/24", "Maintenance range"); err != nil {
+		t.Fatalf("error adding CIDR: %v", err)
+	}
+
+	// Test exact IP match
+	matched, rule, reason := matcher.Matches("192.168.1.50")
+	if !matched || reason != "Gateway server" {
+		t.Errorf("expected match for 192.168.1.50, got %v, %s, %s", matched, rule, reason)
+	}
+
+	// Test non-match in same /24
+	matched, _, _ = matcher.Matches("192.168.1.51")
+	if matched {
+		t.Errorf("expected no match for 192.168.1.51")
+	}
+
+	// Test subnet match
+	matched, rule, reason = matcher.Matches("10.0.0.42")
+	if !matched || rule != "10.0.0.0/24" || reason != "Maintenance range" {
+		t.Errorf("expected subnet match for 10.0.0.42, got %v, %s, %s", matched, rule, reason)
+	}
+
+	// Test non-match outside subnet
+	matched, _, _ = matcher.Matches("10.0.1.42")
+	if matched {
+		t.Errorf("expected no match for 10.0.1.42")
+	}
+}
