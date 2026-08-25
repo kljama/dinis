@@ -6,23 +6,63 @@ DINIS is a lightweight ICMP Echo (ping) network monitoring daemon and web dashbo
 
 ## Features
 
-- **Paced Probing**: Distributes ICMP probes across the configured monitor interval to avoid burst packet storms on network switches and gateway routers.
-- **CIDR Subnet Discovery**: Sweeps entire CIDR blocks on a configurable schedule (default: every 4 hours) and automatically enrolls responsive hosts into continuous monitoring.
-- **Exclusion Rules**: Supports IP and CIDR exclusions with user-defined reasons to ignore broadcast domains, gateways, or non-monitored ranges.
-- **Incident & Alert Lifecycle**: Tracks consecutive packet drops, triggers outage alerts when a host reaches the failure threshold, supports operator acknowledgements with notes, and automatically resolves alerts upon host recovery.
-- **Embedded Web Dashboard**: Real-time updates via Server-Sent Events (SSE), live latency sparklines, grid and table views, on-demand manual pinging, and sound notifications. Single binary with all HTML, CSS, and JS assets embedded via `embed.FS`.
-- **Atomic Persistence**: Persists configuration, discovered hosts, metadata, and settings to a JSON data store using atomic write operations.
+- **Subnet Discovery**: Scans configured CIDR ranges on a schedule and enrolls responsive hosts.
+- **ICMP Monitoring**: Probes active hosts at regular intervals with distributed probe pacing.
+- **Exclusions**: Excludes specific IPs or subnets from discovery and monitoring.
+- **Outage Alerting**: Triggers alerts after consecutive failed probes and supports operator acknowledgements.
+- **Web Dashboard**: Embedded real-time UI with live status updates (SSE), latency history, and manual pinging.
+- **JSON Storage**: Persists targets, exclusions, host metadata, and settings to a local file.
 
 ---
 
-## Requirements
+## Requirements & Dependencies
 
-- **Linux** with unprivileged ICMP datagram sockets enabled (`net.ipv4.ping_group_range`) or `CAP_NET_RAW` capabilities.
-- **Go 1.20+** (for building from source).
+### Required Packages
 
-To enable unprivileged ICMP sockets on Linux:
+| Purpose | Debian / Ubuntu | RHEL / Fedora / Rocky | Arch Linux | Alpine Linux |
+|---|---|---|---|---|
+| **Build Compiler** | `golang-go` (1.20+) | `golang` | `go` | `go` |
+| **ICMP Ping Fallback** | `iputils-ping` | `iputils` | `iputils` | `iputils` |
+| **E2E Test Suite** | `python3` | `python3` | `python` | `python3` |
+
+### Package Installation
+
+**Debian / Ubuntu**:
 ```bash
+sudo apt update && sudo apt install -y golang-go iputils-ping python3
+```
+
+**RHEL / Fedora / Rocky Linux**:
+```bash
+sudo dnf install -y golang iputils python3
+```
+
+**Arch Linux**:
+```bash
+sudo pacman -S --needed go iputils python
+```
+
+**Alpine Linux**:
+```bash
+apk add --no-cache go iputils python3
+```
+
+### Kernel Socket Permissions
+
+DINIS uses native Linux unprivileged ICMP sockets (`SOCK_DGRAM`) and falls back to `SOCK_RAW` / system `ping`. Ensure unprivileged ICMP sockets are enabled:
+
+```bash
+# Enable for the current session:
 sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+# Persist across reboots:
+echo "net.ipv4.ping_group_range = 0 2147483647" | sudo tee /etc/sysctl.d/99-ping-group.conf
+sudo sysctl --system
+```
+
+Alternatively, grant raw network capabilities to the compiled binary:
+```bash
+sudo setcap cap_net_raw+ep dinis
 ```
 
 ---
@@ -85,7 +125,7 @@ Settings can be changed at runtime via the Web UI Settings modal or via `PUT /ap
 | `POST` | `/api/hosts/{ip}/ping` | Execute an immediate on-demand ICMP probe against a host |
 | `PUT` | `/api/hosts/{ip}/meta` | Update custom alias and operator notes for a host |
 | `DELETE` | `/api/hosts/{ip}/enrollment` | Un-enroll a host from active monitoring |
-| `POST` | `/api/hosts/{ip}/promote` | Promote a discovered dynamic host to a static target |
+| `POST` | `/api/hosts/{ip}/promote` | Promote a dynamic host to a permanent static target (prevents pruning if parent CIDR is deleted) |
 
 ### Subnets & Exclusions
 
