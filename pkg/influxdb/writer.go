@@ -131,7 +131,7 @@ func (w *Writer) flush() {
 	w.count = 0
 	w.mu.Unlock()
 
-	endpoint := fmt.Sprintf("%s/api/v3/write?bucket=%s", w.url, w.bucket)
+	endpoint := fmt.Sprintf("%s/api/v3/write_lp?db=%s", w.url, w.bucket)
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("[INFLUXDB] Failed to create request: %v", err)
