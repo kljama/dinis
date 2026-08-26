@@ -39,6 +39,11 @@ type DiscoveryStatus struct {
 	IntervalMin         int        `json:"intervalMin"`
 }
 
+const (
+	defaultMaxSSEClients       = 256
+	discoveryRateLimitInterval = 30 * time.Second
+)
+
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
 type Coordinator struct {
 	rebuildMu  sync.Mutex
@@ -79,7 +84,7 @@ func NewCoordinator(st *store.Store) *Coordinator {
 		alerts:        altMgr,
 		sseClients:    make(map[chan []byte]bool),
 		stopChan:      make(chan struct{}),
-		maxSSEClients: 256,
+		maxSSEClients: defaultMaxSSEClients,
 		discoveryStatus: DiscoveryStatus{
 			IntervalMin: settings.DiscoveryIntervalMin,
 		},
@@ -931,9 +936,9 @@ func (s *Server) handleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate-limit: allow at most one manual discovery trigger per 30 seconds
+	// Rate-limit: allow at most one manual discovery trigger per interval
 	s.coord.discMu.Lock()
-	if time.Since(s.coord.discoveryLastTriggered) < 30*time.Second {
+	if time.Since(s.coord.discoveryLastTriggered) < discoveryRateLimitInterval {
 		s.coord.discMu.Unlock()
 		writeError(w, http.StatusTooManyRequests, "Discovery rate limited. Try again later.")
 		return
