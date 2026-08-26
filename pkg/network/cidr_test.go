@@ -100,6 +100,21 @@ func TestExclusionMatcher(t *testing.T) {
 	if matched {
 		t.Errorf("expected no match for 10.0.1.42")
 	}
+
+	// Test normalized IPv4-mapped IPv6 matching exact IPv4 rule
+	matched, rule, reason = matcher.Matches("::ffff:192.168.1.50")
+	if !matched || reason != "Gateway server" || rule != "192.168.1.50" {
+		t.Errorf("expected normalized match for ::ffff:192.168.1.50, got %v, %s, %s", matched, rule, reason)
+	}
+
+	// Test IPv4-mapped IPv6 exclusion rule matching plain IPv4 query
+	if err := matcher.AddExclusion("::ffff:172.16.0.1", "Mapped rule"); err != nil {
+		t.Fatalf("error adding mapped rule: %v", err)
+	}
+	matched, rule, reason = matcher.Matches("172.16.0.1")
+	if !matched || reason != "Mapped rule" || rule != "172.16.0.1" {
+		t.Errorf("expected match for 172.16.0.1 against mapped rule, got %v, %s, %s", matched, rule, reason)
+	}
 }
 
 func TestExclusionMatcherConcurrent(t *testing.T) {

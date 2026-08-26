@@ -148,6 +148,9 @@ func (m *ExclusionMatcher) AddExclusion(rule string, reason string) error {
 		if ip == nil {
 			return fmt.Errorf("invalid IP address: %s", rule)
 		}
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
 		m.mu.Lock()
 		m.exactIPs[ip.String()] = reason
 		m.mu.Unlock()
@@ -175,6 +178,7 @@ func (m *ExclusionMatcher) Matches(ipStr string) (bool, string, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// Fast path: exact raw string match
 	if reason, ok := m.exactIPs[ipStr]; ok {
 		return true, ipStr, reason
 	}
@@ -182,6 +186,16 @@ func (m *ExclusionMatcher) Matches(ipStr string) (bool, string, string) {
 	parsed := net.ParseIP(ipStr)
 	if parsed == nil {
 		return false, "", ""
+	}
+
+	// Normalized exact match (handles non-canonical formatting & IPv4-mapped IPv6)
+	normIP := parsed.String()
+	if v4 := parsed.To4(); v4 != nil {
+		normIP = v4.String()
+	}
+
+	if reason, ok := m.exactIPs[normIP]; ok {
+		return true, normIP, reason
 	}
 
 	for _, sub := range m.subnets {

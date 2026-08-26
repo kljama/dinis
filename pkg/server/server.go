@@ -132,7 +132,6 @@ func (c *Coordinator) RebuildTargetList() {
 	exclusions := c.store.GetExclusions()
 	discovered := c.store.GetDiscoveredHosts()
 	allMeta := c.store.GetAllHostMeta()
-	activeAlerts := c.alerts.GetActiveAlertsMap()
 
 	matcher := network.NewExclusionMatcher()
 	for _, excl := range exclusions {
@@ -238,44 +237,20 @@ func (c *Coordinator) RebuildTargetList() {
 			status = pinger.StatusExcluded
 		}
 
-		// Check if existing alert is active
-		var isAlertActive, isAck bool
-		var alertID, ackBy, ackNote string
-		var ackAt, startAt *time.Time
-
-		if !matched {
-			if alt, hasAlt := activeAlerts[ip]; hasAlt {
-				isAlertActive = true
-				alertID = alt.ID
-				isAck = alt.Acknowledged
-				ackBy = alt.AcknowledgedBy
-				ackNote = alt.AckNote
-				ackAt = alt.AcknowledgedAt
-				startAt = &alt.StartedAt
-			}
-		}
-
 		discAt := disc.DiscoveredAt
 		lastDisc := disc.LastDiscovered
 
 		hostMap[ip] = &pinger.HostState{
-			IP:                ip,
-			Alias:             alias,
-			CIDR:              hostCIDR,
-			Status:            status,
-			IsExcluded:        matched,
-			ExclusionReason:   reason,
-			DiscoveredAt:      &discAt,
-			LastDiscovered:    &lastDisc,
-			IsStatic:          disc.IsStatic,
-			AlertActive:       isAlertActive,
-			AlertID:           alertID,
-			AlertAcknowledged: isAck,
-			AlertAckBy:        ackBy,
-			AlertAckNote:      ackNote,
-			AlertAckAt:        ackAt,
-			AlertStartedAt:    startAt,
-			LatencyHistory:    make([]float64, 0, 25),
+			IP:              ip,
+			Alias:           alias,
+			CIDR:            hostCIDR,
+			Status:          status,
+			IsExcluded:      matched,
+			ExclusionReason: reason,
+			DiscoveredAt:    &discAt,
+			LastDiscovered:  &lastDisc,
+			IsStatic:        disc.IsStatic,
+			LatencyHistory:  make([]float64, 0, 25),
 		}
 	}
 
@@ -373,6 +348,7 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 	}
 
 	prober := pinger.NewSingleProber()
+	defer prober.Close()
 	concurrency := settings.Concurrency
 	if concurrency <= 0 {
 		concurrency = 100
@@ -400,14 +376,20 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 					now := time.Now()
 					discoveredMu.Lock()
 					discoveredOnline++
-					if _, exists := existingDiscovered[cand.ip]; !exists {
+					discAt := now
+					isStatic := false
+					if existing, exists := existingDiscovered[cand.ip]; exists {
+						discAt = existing.DiscoveredAt
+						isStatic = existing.IsStatic
+					} else {
 						newDiscovered++
 					}
 					discoveredBatch = append(discoveredBatch, store.DiscoveredHost{
 						IP:             cand.ip,
 						CIDR:           cand.cidr,
-						DiscoveredAt:   now,
+						DiscoveredAt:   discAt,
 						LastDiscovered: now,
+						IsStatic:       isStatic,
 					})
 					discoveredMu.Unlock()
 				}
@@ -596,7 +578,19 @@ func (c *Coordinator) broadcastEvent(eventType string, data interface{}) {
 		select {
 		case ch <- msgBytes:
 		default:
-			// Client channel full or slow, skip
+			// Client channel is full/slow. Drain stale queued messages and queue a desync event
+			// so the client knows it fell behind and needs a full state refresh.
+			for len(ch) > 0 {
+				select {
+				case <-ch:
+				default:
+				}
+			}
+			desyncMsg := []byte("event: desync\ndata: {\"reason\":\"buffer_overflow\",\"message\":\"Client fell behind; refresh required\"}\n\n")
+			select {
+			case ch <- desyncMsg:
+			default:
+			}
 		}
 	}
 }
@@ -691,6 +685,9 @@ func (s *Server) isAllowedOrigin(origin, reqHost string) bool {
 // maxRequestBodyBytes limits incoming request JSON bodies to 1 MB to prevent memory exhaustion DoS attacks.
 const maxRequestBodyBytes = 1 << 20 // 1 MB (1,048,576 bytes)
 
+// maxPaginationLimit defines the maximum allowable limit parameter for paged endpoints.
+const maxPaginationLimit = 500
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Standard Security Headers
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -783,12 +780,11 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// decodeJSON decodes a JSON request body bounded by maxRequestBodyBytes.
-func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
+// decodeJSON decodes a JSON request body.
+func decodeJSON(r *http.Request, v interface{}) error {
 	if r.Body == nil {
 		return fmt.Errorf("empty request body")
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
@@ -796,6 +792,10 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("Request body exceeds %d byte limit", maxRequestBodyBytes))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
 		return
 	}
 	writeError(w, http.StatusBadRequest, "Invalid JSON payload")
@@ -876,7 +876,7 @@ func (s *Server) handleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
 		CIDR string `json:"cidr"`
 	}
 	if r.Body != nil {
-		_ = decodeJSON(w, r, &req)
+		_ = decodeJSON(r, &req)
 	}
 
 	s.coord.TriggerDiscovery(req.CIDR)
@@ -1047,6 +1047,9 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	if limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
 			limit = l
+			if limit > maxPaginationLimit {
+				limit = maxPaginationLimit
+			}
 		}
 	}
 
@@ -1145,6 +1148,9 @@ func (s *Server) handleOutliers(w http.ResponseWriter, r *http.Request) {
 	if lStr := r.URL.Query().Get("limit"); lStr != "" {
 		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
 			limit = l
+			if limit > maxPaginationLimit {
+				limit = maxPaginationLimit
+			}
 		}
 	}
 
@@ -1238,8 +1244,14 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 		now := time.Now()
 		cidr := ip + "/32"
 		discovered := s.coord.store.GetDiscoveredHosts()
-		if existing, ok := discovered[ip]; ok && existing.CIDR != "" && existing.CIDR != "Static" {
-			cidr = existing.CIDR
+		discAt := now
+		if existing, ok := discovered[ip]; ok {
+			if existing.CIDR != "" && existing.CIDR != "Static" {
+				cidr = existing.CIDR
+			}
+			if !existing.DiscoveredAt.IsZero() {
+				discAt = existing.DiscoveredAt
+			}
 		} else {
 			cidrs := s.coord.store.GetCIDRs()
 			for _, c := range cidrs {
@@ -1257,7 +1269,7 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 		if err := s.coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
 			IP:             ip,
 			CIDR:           cidr,
-			DiscoveredAt:   now,
+			DiscoveredAt:   discAt,
 			LastDiscovered: now,
 			IsStatic:       true,
 		}); err != nil {
@@ -1277,7 +1289,7 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			Alias string `json:"alias"`
 			Notes string `json:"notes"`
 		}
-		if err := decodeJSON(w, r, &req); err != nil {
+		if err := decodeJSON(r, &req); err != nil {
 			writeDecodeError(w, err)
 			return
 		}
@@ -1314,7 +1326,7 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 			Enabled            *bool  `json:"enabled"`
 			IncludeNetAndBcast bool   `json:"includeNetAndBcast"`
 		}
-		if err := decodeJSON(w, r, &req); err != nil {
+		if err := decodeJSON(r, &req); err != nil {
 			writeDecodeError(w, err)
 			return
 		}
@@ -1363,7 +1375,7 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 			var body struct {
 				CIDR string `json:"cidr"`
 			}
-			_ = decodeJSON(w, r, &body)
+			_ = decodeJSON(r, &body)
 			cidr = body.CIDR
 		}
 		if cidr == "" {
@@ -1396,7 +1408,7 @@ func (s *Server) handleExclusions(w http.ResponseWriter, r *http.Request) {
 			Reason  string `json:"reason"`
 			Enabled *bool  `json:"enabled"`
 		}
-		if err := decodeJSON(w, r, &req); err != nil {
+		if err := decodeJSON(r, &req); err != nil {
 			writeDecodeError(w, err)
 			return
 		}
@@ -1440,7 +1452,7 @@ func (s *Server) handleExclusions(w http.ResponseWriter, r *http.Request) {
 			var body struct {
 				Rule string `json:"rule"`
 			}
-			_ = decodeJSON(w, r, &body)
+			_ = decodeJSON(r, &body)
 			rule = body.Rule
 		}
 		if rule == "" {
@@ -1491,7 +1503,7 @@ func (s *Server) handleAlertAcknowledge(w http.ResponseWriter, r *http.Request) 
 		AckBy string `json:"ackBy"`
 		Note  string `json:"note"`
 	}
-	if err := decodeJSON(w, r, &req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeDecodeError(w, err)
 		return
 	}
@@ -1531,7 +1543,7 @@ func (s *Server) handleAlertAcknowledgeAll(w http.ResponseWriter, r *http.Reques
 		Note  string `json:"note"`
 	}
 	if r.Body != nil {
-		_ = decodeJSON(w, r, &req)
+		_ = decodeJSON(r, &req)
 	}
 
 	ackAlerts := s.coord.alerts.AcknowledgeAll(req.AckBy, req.Note)
@@ -1553,7 +1565,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut, http.MethodPost:
 		var req store.AppSettings
-		if err := decodeJSON(w, r, &req); err != nil {
+		if err := decodeJSON(r, &req); err != nil {
 			writeDecodeError(w, err)
 			return
 		}

@@ -49,3 +49,17 @@ func TestChecksum(t *testing.T) {
 	}
 }
 
+func TestSingleProberSocketPool(t *testing.T) {
+	prober := NewSingleProber()
+	defer prober.Close()
+
+	// Run multiple sequential and concurrent probes reusing the pooled sockets
+	for i := 0; i < 5; i++ {
+		res := prober.Probe(context.Background(), "127.0.0.1", 1*time.Second)
+		if !res.Success {
+			t.Fatalf("expected ping #%d to 127.0.0.1 to succeed, got: %s", i, res.Error)
+		}
+	}
+}
+
+

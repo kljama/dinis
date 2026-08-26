@@ -168,7 +168,7 @@ func (e *Engine) SetHosts(hosts map[string]*HostState) {
 	newMap := make(map[string]*HostState, len(hosts))
 	for ip, newH := range hosts {
 		if oldH, exists := e.hosts[ip]; exists {
-			// Keep existing metrics and history, but update metadata and authoritative alert state
+			// Keep existing metrics and history, but update metadata
 			oldH.Alias = newH.Alias
 			oldH.CIDR = newH.CIDR
 			oldH.IsExcluded = newH.IsExcluded
@@ -178,14 +178,14 @@ func (e *Engine) SetHosts(hosts map[string]*HostState) {
 			oldH.IsStatic = newH.IsStatic
 			if newH.IsExcluded {
 				oldH.Status = StatusExcluded
+				oldH.AlertActive = false
+				oldH.AlertAcknowledged = false
+				oldH.AlertID = ""
+				oldH.AlertAckBy = ""
+				oldH.AlertAckNote = ""
+				oldH.AlertAckAt = nil
+				oldH.AlertStartedAt = nil
 			}
-			oldH.AlertActive = newH.AlertActive
-			oldH.AlertID = newH.AlertID
-			oldH.AlertAcknowledged = newH.AlertAcknowledged
-			oldH.AlertAckBy = newH.AlertAckBy
-			oldH.AlertAckNote = newH.AlertAckNote
-			oldH.AlertAckAt = newH.AlertAckAt
-			oldH.AlertStartedAt = newH.AlertStartedAt
 
 			newMap[ip] = oldH
 		} else {
@@ -336,7 +336,7 @@ func (e *Engine) Start() {
 	go e.runLoop()
 }
 
-// Stop stops the background polling loop.
+// Stop stops the background polling loop and closes prober socket resources.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if e.cancel != nil {
@@ -348,6 +348,10 @@ func (e *Engine) Stop() {
 	e.mu.Unlock()
 
 	e.wg.Wait()
+
+	if e.prober != nil {
+		e.prober.Close()
+	}
 }
 
 // PingSingle immediately probes a single host and updates its state.
@@ -620,8 +624,10 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 			}
 		}
 		h.PacketLoss = math.Round((float64(lostCount)/float64(len(h.LatencyHistory)))*1000) / 10
-	} else if h.SentPackets > 0 {
+	} else if h.SentPackets > 0 && h.SentPackets >= h.RecvPackets {
 		lost := float64(h.SentPackets - h.RecvPackets)
 		h.PacketLoss = math.Round((lost/float64(h.SentPackets))*1000) / 10
+	} else {
+		h.PacketLoss = 0
 	}
 }

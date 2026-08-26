@@ -57,9 +57,6 @@ type Store struct {
 	minuteSeries map[string]*RollupSeries
 	hourSeries   map[string]*RollupSeries
 
-	lastMinuteRollup time.Time
-	lastHourRollup   time.Time
-
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -313,8 +310,8 @@ func (s *Store) rollupLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	s.lastMinuteRollup = time.Now()
-	s.lastHourRollup = time.Now()
+	lastMinuteRollup := time.Now()
+	lastHourRollup := time.Now()
 
 	for {
 		select {
@@ -322,15 +319,15 @@ func (s *Store) rollupLoop() {
 			return
 		case now := <-ticker.C:
 			// Check if 1-minute downsampling is due
-			if now.Sub(s.lastMinuteRollup) >= 1*time.Minute {
+			if now.Sub(lastMinuteRollup) >= 1*time.Minute {
 				s.computeMinuteRollups(now)
-				s.lastMinuteRollup = now
+				lastMinuteRollup = now
 			}
 
 			// Check if 1-hour downsampling is due
-			if now.Sub(s.lastHourRollup) >= 1*time.Hour {
+			if now.Sub(lastHourRollup) >= 1*time.Hour {
 				s.computeHourRollups(now)
-				s.lastHourRollup = now
+				lastHourRollup = now
 			}
 		}
 	}

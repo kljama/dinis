@@ -4,11 +4,11 @@ import (
 	"context"
 	crand "crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,15 +38,22 @@ type PingResult struct {
 	Timestamp time.Time
 }
 
-// SingleProber performs individual ICMP echo requests using native Linux ICMP datagram/raw sockets,
-// with graceful fallback to ping executable if needed.
-type SingleProber struct {
-	seq uint64
-	id  uint16
-	mu  sync.Mutex
+type probeSocket struct {
+	fd    int
+	isRaw bool
 }
 
-// NewSingleProber creates a new prober with cryptographically random ID and sequence counter.
+// SingleProber performs individual ICMP echo requests using native Linux ICMP datagram/raw sockets,
+// with graceful fallback to ping executable if needed. Sockets are pooled across probe requests
+// to eliminate kernel sock_alloc / inode / FD churn under high probe concurrency.
+type SingleProber struct {
+	seq    uint64
+	id     uint16
+	pool   chan *probeSocket
+	closed int32
+}
+
+// NewSingleProber creates a new prober with cryptographically random ID, sequence counter, and socket pool.
 func NewSingleProber() *SingleProber {
 	var buf [10]byte
 	if _, err := crand.Read(buf[:]); err != nil {
@@ -62,9 +69,83 @@ func NewSingleProber() *SingleProber {
 	seq := binary.BigEndian.Uint64(buf[2:10])
 
 	return &SingleProber{
-		id:  id,
-		seq: seq,
+		id:   id,
+		seq:  seq,
+		pool: make(chan *probeSocket, 128),
 	}
+}
+
+func (p *SingleProber) newSocket() (*probeSocket, error) {
+	isRaw := false
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMP)
+	if err != nil {
+		fd, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+		if err != nil {
+			return nil, err
+		}
+		isRaw = true
+	}
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 65536)
+	return &probeSocket{
+		fd:    fd,
+		isRaw: isRaw,
+	}, nil
+}
+
+func (p *SingleProber) getSocket() (*probeSocket, error) {
+	if atomic.LoadInt32(&p.closed) == 1 {
+		return nil, fmt.Errorf("prober is closed")
+	}
+
+	select {
+	case sock := <-p.pool:
+		return sock, nil
+	default:
+		return p.newSocket()
+	}
+}
+
+func (p *SingleProber) putSocket(sock *probeSocket, isFatal bool) {
+	if sock == nil || sock.fd < 0 {
+		return
+	}
+	if isFatal || atomic.LoadInt32(&p.closed) == 1 {
+		_ = syscall.Close(sock.fd)
+		return
+	}
+
+	select {
+	case p.pool <- sock:
+	default:
+		// Pool is full, close excess socket
+		_ = syscall.Close(sock.fd)
+	}
+}
+
+// Close releases all pooled ICMP sockets.
+func (p *SingleProber) Close() {
+	if atomic.CompareAndSwapInt32(&p.closed, 0, 1) {
+		for {
+			select {
+			case sock := <-p.pool:
+				if sock != nil && sock.fd >= 0 {
+					_ = syscall.Close(sock.fd)
+				}
+			default:
+				return
+			}
+		}
+	}
+}
+
+func isFatalSocketError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno == syscall.EBADF || errno == syscall.ENOTSOCK || errno == syscall.EPIPE
+	}
+	return false
 }
 
 // Probe probes an IP address once with the specified timeout.
@@ -80,52 +161,27 @@ func (p *SingleProber) Probe(ctx context.Context, ipStr string, timeout time.Dur
 	}
 
 	result, err := p.nativeProbe(parsedIP, timeout)
-	if err == nil && result.Success {
-		return result
-	}
-
-	// If native probe timed out, retry once after a short 25ms backoff to eliminate single-packet jitter
-	if ctx.Err() == nil {
-		time.Sleep(25 * time.Millisecond)
-		retryRes, retryErr := p.nativeProbe(parsedIP, timeout)
-		if retryErr == nil && retryRes.Success {
-			return retryRes
-		}
-
-		// Fallback to system ping as authoritative verification
-		execRes := p.execProbe(ctx, ipStr, timeout)
-		if execRes.Success {
-			return execRes
-		}
-	}
-
 	if err == nil {
 		return result
 	}
 
-	// Fallback to system ping if native socket fails (e.g. restricted environment)
+	// Fallback to system ping only if native socket creation fails (e.g. restricted environment)
 	return p.execProbe(ctx, ipStr, timeout)
 }
 
 func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult, error) {
-	// Try SOCK_DGRAM (unprivileged) first, then SOCK_RAW.
-	// We must track which type succeeded because SOCK_RAW includes the IP
-	// header in received packets while SOCK_DGRAM strips it.
-	isRaw := false
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMP)
+	sock, err := p.getSocket()
 	if err != nil {
-		fd, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
-		if err != nil {
-			return PingResult{}, err
-		}
-		isRaw = true
+		return PingResult{}, err
 	}
-	defer syscall.Close(fd)
+	isFatal := false
+	defer func() {
+		p.putSocket(sock, isFatal)
+	}()
 
 	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
-	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
-	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv)
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 65536)
+	_ = syscall.SetsockoptTimeval(sock.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+	_ = syscall.SetsockoptTimeval(sock.fd, syscall.SOL_SOCKET, syscall.SO_SNDTIMEO, &tv)
 
 	var dest [4]byte
 	copy(dest[:], ip)
@@ -159,8 +215,11 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 	cs := checksum(pkt)
 	binary.BigEndian.PutUint16(pkt[2:4], cs)
 
-	err = syscall.Sendto(fd, pkt, 0, sa)
+	err = syscall.Sendto(sock.fd, pkt, 0, sa)
 	if err != nil {
+		if isFatalSocketError(err) {
+			isFatal = true
+		}
 		return PingResult{
 			IP:        ip.String(),
 			Success:   false,
@@ -173,9 +232,12 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 	// The socket receive timeout bounds this loop so it cannot spin forever.
 	buf := make([]byte, 512)
 	for {
-		n, from, err := syscall.Recvfrom(fd, buf, 0)
+		n, from, err := syscall.Recvfrom(sock.fd, buf, 0)
 		recvTime := time.Now()
 		if err != nil {
+			if isFatalSocketError(err) {
+				isFatal = true
+			}
 			return PingResult{
 				IP:        ip.String(),
 				Success:   false,
@@ -188,7 +250,7 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 		// SOCK_RAW: buf = [IP header][ICMP data...], IHL field gives IP header length.
 		// SOCK_DGRAM: buf = [ICMP data...], kernel strips the IP header.
 		icmpOffset := 0
-		if isRaw {
+		if sock.isRaw {
 			if n < 20 {
 				continue // Too short for an IP header
 			}
@@ -238,7 +300,7 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 		// Only checked for SOCK_RAW: with SOCK_DGRAM, the kernel rewrites
 		// the identifier with its own socket-bound value and filters replies
 		// by that value, so we cannot (and don't need to) match on expectedID.
-		if isRaw {
+		if sock.isRaw {
 			replyID := binary.BigEndian.Uint16(icmpData[4:6])
 			if replyID != expectedID {
 				continue

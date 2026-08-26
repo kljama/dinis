@@ -103,6 +103,23 @@ func TestServerEndpoints(t *testing.T) {
 		t.Errorf("expected total >= 2 and limit 1 host, got total=%d len=%d", pagedResp.Total, len(pagedResp.Hosts))
 	}
 
+	// 2b. Test GET /api/hosts with excessive limit clamped to max (500)
+	req = httptest.NewRequest(http.MethodGet, "/api/hosts?page=1&limit=999999", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var clampedResp struct {
+		Limit int `json:"limit"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&clampedResp); err != nil {
+		t.Fatalf("failed to decode clamped response: %v", err)
+	}
+	if clampedResp.Limit != 500 {
+		t.Errorf("expected limit clamped to 500, got %d", clampedResp.Limit)
+	}
+
 	// 3. Test GET /api/subnets/matrix
 	req = httptest.NewRequest(http.MethodGet, "/api/subnets/matrix", nil)
 	rec = httptest.NewRecorder()
@@ -464,6 +481,37 @@ func TestSSEStreamShutdownConcurrentWithStop(t *testing.T) {
 	wg.Wait()
 }
 
+func TestSSEClientBufferOverflowDesync(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	clientChan := make(chan []byte, 5)
+	coord.clientsMu.Lock()
+	coord.sseClients[clientChan] = true
+	coord.clientsMu.Unlock()
+
+	// Fill the client's channel to capacity
+	for i := 0; i < 5; i++ {
+		coord.broadcastEvent("fill_event", map[string]int{"seq": i})
+	}
+	if len(clientChan) != 5 {
+		t.Fatalf("expected channel to have 5 messages, got %d", len(clientChan))
+	}
+
+	// Next broadcast will trigger buffer overflow -> drain stale messages -> push desync event
+	coord.broadcastEvent("overflow_event", map[string]string{"foo": "bar"})
+
+	// Verify the channel now contains the desync event
+	if len(clientChan) != 1 {
+		t.Fatalf("expected 1 desync message in channel, got %d", len(clientChan))
+	}
+
+	msg := string(<-clientChan)
+	if !strings.Contains(msg, "event: desync") || !strings.Contains(msg, "buffer_overflow") {
+		t.Errorf("expected desync event payload, got %q", msg)
+	}
+}
+
 func TestHostDetailOrActionInvalidIPValidation(t *testing.T) {
 	srv, _, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -527,7 +575,19 @@ func TestRequestBodySizeLimit(t *testing.T) {
 	srv, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	// Create a payload larger than 1MB (1.5MB)
+	// 1. Valid payload under 1MB should succeed
+	validPadding := strings.Repeat("a", 500*1024)
+	validBody := fmt.Sprintf(`{"alias":"valid-host","notes":"%s"}`, validPadding)
+
+	reqValid := httptest.NewRequest(http.MethodPost, "/api/hosts/127.0.0.1/meta", bytes.NewBufferString(validBody))
+	recValid := httptest.NewRecorder()
+	srv.ServeHTTP(recValid, reqValid)
+
+	if recValid.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for valid 500KB payload, got %d", recValid.Code)
+	}
+
+	// 2. Create a payload larger than 1MB (1.5MB) which should be rejected
 	largePadding := strings.Repeat("x", 1500*1024)
 	largeBody := fmt.Sprintf(`{"alias":"bad","notes":"%s"}`, largePadding)
 
@@ -537,6 +597,28 @@ func TestRequestBodySizeLimit(t *testing.T) {
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("expected 413 Request Entity Too Large, got %d", rec.Code)
+	}
+}
+
+func TestJSONDecodeErrorDetails(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Malformed JSON (syntax error)
+	req := httptest.NewRequest(http.MethodPost, "/api/hosts/127.0.0.1/meta", bytes.NewBufferString(`{"alias": "broken",`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !strings.HasPrefix(resp["error"], "Invalid JSON payload: ") {
+		t.Errorf("expected error to contain detailed decode message, got %q", resp["error"])
 	}
 }
 
@@ -591,6 +673,75 @@ func TestHostsFilterPendingAndMatrixPendingCount(t *testing.T) {
 		t.Errorf("expected total PendingCount %d in matrix, got %d", len(coord.pinger.GetAllHosts()), totalPending)
 	}
 }
+
+func TestConcurrentRebuildAndStateChange(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	coord.Start()
+
+	// Seed some initial hosts
+	for i := 1; i <= 20; i++ {
+		ip := fmt.Sprintf("192.168.1.%d", i)
+		_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+			IP:             ip,
+			CIDR:           "192.168.1.0/24",
+			DiscoveredAt:   time.Now(),
+			LastDiscovered: time.Now(),
+		})
+	}
+	coord.RebuildTargetList()
+
+	const numWorkers = 12
+	const iterations = 30
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		workerID := w
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				ip := fmt.Sprintf("192.168.1.%d", (workerID+i)%20+1)
+				switch (workerID + i) % 6 {
+				case 0:
+					// Simulate host transitioning to Down
+					h, ok := coord.pinger.GetHost(ip)
+					if ok {
+						coord.handleStateChange(h, pinger.StatusUp, pinger.StatusDown)
+					}
+				case 1:
+					// Simulate host transitioning to Up
+					h, ok := coord.pinger.GetHost(ip)
+					if ok {
+						coord.handleStateChange(h, pinger.StatusDown, pinger.StatusUp)
+					}
+				case 2:
+					// Trigger RebuildTargetList
+					coord.RebuildTargetList()
+				case 3:
+					// Trigger Alert Acknowledge
+					_ = coord.alerts.AcknowledgeAll("Operator", "Batch test ack")
+				case 4:
+					// Add/update exclusion and rebuild
+					_ = coord.store.AddOrUpdateExclusion(store.ExclusionConfig{
+						Rule:    ip,
+						Reason:  "Flapping test",
+						Enabled: i%2 == 0,
+					})
+					coord.RebuildTargetList()
+				case 5:
+					// Wake / TriggerSweep
+					coord.pinger.TriggerSweep()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	_ = srv
+}
+
 
 
 
