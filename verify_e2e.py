@@ -39,8 +39,7 @@ def run_tests():
             "failThreshold": 2,
             "concurrency": 100,
             "discoveryIntervalMin": 15,
-            "autoDiscovery": True,
-            "soundAlerts": True
+            "autoDiscovery": True
         })
     except Exception as e:
         print(f"Warning setting settings: {e}")
@@ -175,7 +174,6 @@ def run_tests():
         "timeoutMs": 800,
         "failThreshold": 2,
         "concurrency": 150,
-        "soundAlerts": True,
         "discoveryIntervalMin": 10,
         "autoDiscovery": True
     })

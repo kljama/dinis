@@ -3,10 +3,14 @@ package server
 import (
 	"context"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +19,7 @@ import (
 	"dinis/pkg/network"
 	"dinis/pkg/pinger"
 	"dinis/pkg/store"
+	"dinis/pkg/timeseries"
 )
 
 //go:embed web_dist/*
@@ -510,10 +515,14 @@ func (c *Coordinator) handleHostUpdated(h *pinger.HostState) {
 		h.AlertStartedAt = nil
 		c.pinger.SetHostAlertState(h.IP, false, "", false, "", "", nil, nil)
 	}
-	c.broadcastEvent("host_update", h)
+	// Per-packet SSE broadcasting is decoupled to enable 20,000+ host scalability.
+	// State transitions are broadcasted immediately via handleStateChange.
 }
 
 func (c *Coordinator) handleCycleComplete(summary *pinger.CycleSummary) {
+	c.discMu.RLock()
+	summary.SubnetCapacity = c.discoveryStatus.SubnetCapacity
+	c.discMu.RUnlock()
 	c.broadcastEvent("summary_update", summary)
 }
 
@@ -617,6 +626,12 @@ func (s *Server) routes() {
 	// Hosts
 	s.mux.HandleFunc("/api/hosts", s.handleHosts)
 	s.mux.HandleFunc("/api/hosts/", s.handleHostDetailOrAction)
+
+	// Subnet Matrix & Heatmap
+	s.mux.HandleFunc("/api/subnets/matrix", s.handleSubnetsMatrix)
+
+	// Outlier & degraded host queue
+	s.mux.HandleFunc("/api/outliers", s.handleOutliers)
 
 	// CIDRs
 	s.mux.HandleFunc("/api/cidrs", s.handleCIDRs)
@@ -743,13 +758,255 @@ func (s *Server) handleGetSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, summary)
 }
 
+func ipToUint32(ipStr string) uint32 {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip)
+}
+
+func getStatusWeight(h *pinger.HostState) int {
+	if h.IsExcluded || h.Status == pinger.StatusExcluded {
+		return 4
+	}
+	if h.Status == pinger.StatusDown {
+		if h.AlertAcknowledged {
+			return 2
+		}
+		return 1
+	}
+	if h.Status == pinger.StatusUp {
+		return 3
+	}
+	return 5
+}
+
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
+
+	pageStr := r.URL.Query().Get("page")
+	limitStr := r.URL.Query().Get("limit")
+	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
+	status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	sortField := r.URL.Query().Get("sort")
+	lightweight := r.URL.Query().Get("lightweight") == "true"
+
+	allHosts := s.coord.pinger.GetAllHosts()
+
+	// If no query parameters, maintain legacy response format (raw slice) for backward compatibility
+	if pageStr == "" && limitStr == "" && search == "" && status == "" && sortField == "" {
+		if lightweight {
+			for _, h := range allHosts {
+				h.LatencyHistory = nil
+			}
+		}
+		writeJSON(w, http.StatusOK, allHosts)
+		return
+	}
+
+	var filtered []*pinger.HostState
+	for _, h := range allHosts {
+		// Search filter
+		if search != "" {
+			matchIP := strings.Contains(strings.ToLower(h.IP), search)
+			matchAlias := strings.Contains(strings.ToLower(h.Alias), search)
+			matchCIDR := strings.Contains(strings.ToLower(h.CIDR), search)
+			matchExcl := strings.Contains(strings.ToLower(h.ExclusionReason), search)
+			if !matchIP && !matchAlias && !matchCIDR && !matchExcl {
+				continue
+			}
+		}
+
+		// Status filter
+		if status != "" && status != "all" {
+			switch status {
+			case "down":
+				if h.Status != pinger.StatusDown || h.AlertAcknowledged || h.IsExcluded {
+					continue
+				}
+			case "ack":
+				if h.Status != pinger.StatusDown || !h.AlertAcknowledged || h.IsExcluded {
+					continue
+				}
+			case "up":
+				if h.Status != pinger.StatusUp || h.IsExcluded {
+					continue
+				}
+			case "excluded":
+				if !h.IsExcluded && h.Status != pinger.StatusExcluded {
+					continue
+				}
+			}
+		}
+
+		if lightweight {
+			cpy := *h
+			cpy.LatencyHistory = nil
+			filtered = append(filtered, &cpy)
+		} else {
+			filtered = append(filtered, h)
+		}
+	}
+
+	// Sort
+	if sortField != "" {
+		sort.Slice(filtered, func(i, j int) bool {
+			a, b := filtered[i], filtered[j]
+			switch sortField {
+			case "ip-asc":
+				return ipToUint32(a.IP) < ipToUint32(b.IP)
+			case "ip-desc":
+				return ipToUint32(a.IP) > ipToUint32(b.IP)
+			case "status":
+				wa, wb := getStatusWeight(a), getStatusWeight(b)
+				if wa != wb {
+					return wa < wb
+				}
+				return ipToUint32(a.IP) < ipToUint32(b.IP)
+			case "latency-desc":
+				return a.LatencyMs > b.LatencyMs
+			case "latency-asc":
+				latA, latB := a.LatencyMs, b.LatencyMs
+				if latA == 0 {
+					latA = 99999
+				}
+				if latB == 0 {
+					latB = 99999
+				}
+				return latA < latB
+			case "loss":
+				return a.PacketLoss > b.PacketLoss
+			default:
+				return ipToUint32(a.IP) < ipToUint32(b.IP)
+			}
+		})
+	}
+
+	total := len(filtered)
+	page := 1
+	limit := 50
+
+	if pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	start := (page - 1) * limit
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+
+	pagedHosts := filtered[start:end]
+	totalPages := 0
+	if limit > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total":      total,
+		"page":       page,
+		"limit":      limit,
+		"totalPages": totalPages,
+		"hosts":      pagedHosts,
+	})
+}
+
+func getSubnetGroupKey(h *pinger.HostState) string {
+	cidr := strings.TrimSpace(h.CIDR)
+	if cidr == "" || cidr == "Static" {
+		return h.IP + "/32"
+	}
+
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil || ipNet == nil {
+		return cidr
+	}
+
+	ones, _ := ipNet.Mask.Size()
+	// If prefix length is 24 or more (e.g. /24, /28, /29, /30, /32), preserve exact subnet
+	if ones >= 24 {
+		return cidr
+	}
+
+	// For large CIDRs (/16, /20, /22), group by /24 sub-blocks
+	ip4 := net.ParseIP(h.IP).To4()
+	if ip4 != nil {
+		return fmt.Sprintf("%d.%d.%d.0/24", ip4[0], ip4[1], ip4[2])
+	}
+	return cidr
+}
+
+func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
 	hosts := s.coord.pinger.GetAllHosts()
-	writeJSON(w, http.StatusOK, hosts)
+	hostsBySubnet := make(map[string][]timeseries.SubnetMatrixCell)
+
+	for _, h := range hosts {
+		subnetKey := getSubnetGroupKey(h)
+
+		parsedIP := net.ParseIP(h.IP).To4()
+		hostIdx := 0
+		if parsedIP != nil {
+			hostIdx = int(parsedIP[3])
+		}
+
+		cell := timeseries.SubnetMatrixCell{
+			IP:            h.IP,
+			HostIndex:     hostIdx,
+			Status:        string(h.Status),
+			LatencyMs:     h.LatencyMs,
+			PacketLossPct: h.PacketLoss,
+			AlertActive:   h.AlertActive,
+			AlertAck:      h.AlertAcknowledged,
+			Alias:         h.Alias,
+		}
+		hostsBySubnet[subnetKey] = append(hostsBySubnet[subnetKey], cell)
+	}
+
+	matrix := timeseries.GenerateSubnetMatrix(hostsBySubnet)
+	writeJSON(w, http.StatusOK, matrix)
+}
+
+func (s *Server) handleOutliers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	tsStore := s.coord.pinger.GetTimeseriesStore()
+	limit := 50
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	outliers := tsStore.GetTopOutliers(limit, func(ip string) (bool, string) {
+		if h, ok := s.coord.pinger.GetHost(ip); ok && !h.IsExcluded {
+			return true, h.CIDR
+		}
+		return false, ""
+	})
+
+	writeJSON(w, http.StatusOK, outliers)
 }
 
 func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request) {
@@ -779,6 +1036,21 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 
 	action := parts[1]
 	switch action {
+	case "history":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		windowStr := r.URL.Query().Get("window")
+		windowDur := 1 * time.Hour
+		if windowStr != "" {
+			if d, err := time.ParseDuration(windowStr); err == nil && d > 0 {
+				windowDur = d
+			}
+		}
+		history := s.coord.pinger.GetTimeseriesStore().GetHostHistory(ip, windowDur)
+		writeJSON(w, http.StatusOK, history)
+
 	case "ping":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")

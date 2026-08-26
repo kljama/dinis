@@ -49,7 +49,6 @@ type AppSettings struct {
 	TimeoutMs            int     `json:"timeoutMs"`
 	FailThreshold        int     `json:"failThreshold"`
 	Concurrency          int     `json:"concurrency"`
-	SoundAlerts          bool    `json:"soundAlerts"`
 	DiscoveryIntervalMin int     `json:"discoveryIntervalMin"` // e.g. 15 mins (0 = manual only)
 	AutoDiscovery        bool    `json:"autoDiscovery"`
 }
@@ -61,7 +60,6 @@ func DefaultSettings() AppSettings {
 		TimeoutMs:            1000,
 		FailThreshold:        2,
 		Concurrency:          100,
-		SoundAlerts:          true,
 		DiscoveryIntervalMin: 240,
 		AutoDiscovery:        true,
 	}

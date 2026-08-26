@@ -5,6 +5,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"dinis/pkg/timeseries"
 )
 
 // Status types for a monitored host.
@@ -76,6 +78,7 @@ type CycleSummary struct {
 	SubnetCapacity int       `json:"subnetCapacity"`
 	UpCount        int       `json:"upCount"`
 	DownCount      int       `json:"downCount"`
+	AckCount       int       `json:"ackCount"`
 	PendingCount   int       `json:"pendingCount"`
 	ExcludedCount  int       `json:"excludedCount"`
 	AlertsActive   int       `json:"alertsActive"`
@@ -92,6 +95,7 @@ type Engine struct {
 	cycleMu sync.Mutex
 	config  EngineConfig
 	prober  *SingleProber
+	tsStore *timeseries.Store
 
 	hosts map[string]*HostState // IP -> HostState
 
@@ -128,9 +132,15 @@ func NewEngine(cfg EngineConfig) *Engine {
 	return &Engine{
 		config:   cfg,
 		prober:   NewSingleProber(),
+		tsStore:  timeseries.NewStore(),
 		hosts:    make(map[string]*HostState),
 		wakeChan: make(chan struct{}, 1),
 	}
+}
+
+// GetTimeseriesStore returns the underlying time-series metric store.
+func (e *Engine) GetTimeseriesStore() *timeseries.Store {
+	return e.tsStore
 }
 
 // Wake signals the background loop to immediately start a cycle.
@@ -186,6 +196,13 @@ func (e *Engine) SetHosts(hosts map[string]*HostState) {
 		}
 	}
 	e.hosts = newMap
+	if e.tsStore != nil {
+		activeIPs := make(map[string]bool, len(newMap))
+		for ip := range newMap {
+			activeIPs[ip] = true
+		}
+		e.tsStore.PruneHosts(activeIPs)
+	}
 }
 
 // GetHost returns a copy of the host state for an IP.
@@ -244,10 +261,15 @@ func (e *Engine) GetSummary() CycleSummary {
 			summary.PendingCount++
 		}
 
-		if !h.IsExcluded && h.Status == StatusDown && h.AlertActive {
-			summary.AlertsActive++
-			if !h.AlertAcknowledged {
-				summary.AlertsUnack++
+		if !h.IsExcluded && h.Status == StatusDown {
+			if h.AlertAcknowledged {
+				summary.AckCount++
+			}
+			if h.AlertActive {
+				summary.AlertsActive++
+				if !h.AlertAcknowledged {
+					summary.AlertsUnack++
+				}
 			}
 		}
 	}
@@ -305,6 +327,9 @@ func (e *Engine) Start() {
 		return
 	}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
+	if e.tsStore != nil {
+		e.tsStore.Start()
+	}
 	e.mu.Unlock()
 
 	e.wg.Add(1)
@@ -316,6 +341,9 @@ func (e *Engine) Stop() {
 	e.mu.Lock()
 	if e.cancel != nil {
 		e.cancel()
+	}
+	if e.tsStore != nil {
+		e.tsStore.Stop()
 	}
 	e.mu.Unlock()
 
@@ -519,6 +547,10 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 	now := time.Now()
 	h.LastChecked = &now
 	h.SentPackets++
+
+	if e.tsStore != nil {
+		e.tsStore.Record(h.IP, now, res.LatencyMs, res.Success)
+	}
 
 	if res.Success {
 		h.RecvPackets++

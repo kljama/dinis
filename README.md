@@ -1,61 +1,37 @@
 # DINIS — ICMP Network Monitor
 
-DINIS is a lightweight ICMP Echo (ping) network monitoring daemon and web dashboard written in Go. It performs automated subnet discovery across configured CIDR ranges, continuously monitors discovered and static targets with paced ICMP requests, manages outage alerts with operator acknowledgement workflows, and serves a self-contained real-time web interface.
+DINIS is an ICMP network monitoring daemon and web dashboard written in Go. It performs automated subnet discovery across configured CIDR ranges, continuously monitors discovered and static targets with paced ICMP Echo requests, calculates time-series metrics and downsampling rollups, manages outage alerts, and serves an embedded web interface.
 
 ---
 
 ## Features
 
-- **Subnet Discovery**: Scans configured CIDR ranges on a schedule and enrolls responsive hosts.
-- **ICMP Monitoring**: Probes active hosts at regular intervals with distributed probe pacing.
-- **Exclusions**: Excludes specific IPs or subnets from discovery and monitoring.
-- **Outage Alerting**: Triggers alerts after consecutive failed probes and supports operator acknowledgements.
-- **Web Dashboard**: Embedded real-time UI with live status updates (SSE), latency history, and manual pinging.
-- **JSON Storage**: Persists targets, exclusions, host metadata, and settings to a local file.
+- **Subnet Discovery**: Scans configured CIDR blocks on a schedule and enrolls responsive hosts.
+- **Paced Probing**: Distributes ICMP probes evenly across the monitoring interval to avoid network bursts.
+- **In-Memory Time-Series & Rollups**: Retains raw probe history and computes 1-minute and 1-hour rollups with P50/P95/P99 latency, jitter, and loss.
+- **Subnet Heatmaps**: Visualizes monitored hosts grouped by prefix with color-coded latency and loss.
+- **Outlier Detection**: Surfaces hosts exhibiting packet loss, latency spikes, or outages.
+- **Outage Alerting**: Tracks host state transitions (`UP`/`DOWN`), fires alerts, and supports operator acknowledgements.
+- **Exclusion Rules**: Prevents specific IPs or subnets from being probed or alerting.
+- **Embedded Web Dashboard**: Single-binary deployment with real-time SSE updates and no external frontend dependencies.
+- **Atomic JSON Persistence**: Saves targets, metadata, exclusions, and settings to disk.
 
 ---
 
-## Requirements & Dependencies
+## Requirements
 
-### Required Packages
+- Go 1.20+
+- Linux kernel with unprivileged ICMP socket support (`net.ipv4.ping_group_range`) or `CAP_NET_RAW` capability.
 
-| Purpose | Debian / Ubuntu | RHEL / Fedora / Rocky | Arch Linux | Alpine Linux |
-|---|---|---|---|---|
-| **Build Compiler** | `golang-go` (1.20+) | `golang` | `go` | `go` |
-| **ICMP Ping Fallback** | `iputils-ping` | `iputils` | `iputils` | `iputils` |
-| **E2E Test Suite** | `python3` | `python3` | `python` | `python3` |
+### Socket Permissions
 
-### Package Installation
-
-**Debian / Ubuntu**:
+Enable unprivileged ICMP sockets (`SOCK_DGRAM`):
 ```bash
-sudo apt update && sudo apt install -y golang-go iputils-ping python3
-```
-
-**RHEL / Fedora / Rocky Linux**:
-```bash
-sudo dnf install -y golang iputils python3
-```
-
-**Arch Linux**:
-```bash
-sudo pacman -S --needed go iputils python
-```
-
-**Alpine Linux**:
-```bash
-apk add --no-cache go iputils python3
-```
-
-### Kernel Socket Permissions
-
-DINIS uses native Linux unprivileged ICMP sockets (`SOCK_DGRAM`) and falls back to `SOCK_RAW` / system `ping`. Ensure unprivileged ICMP sockets are enabled:
-
-```bash
-# Enable for the current session:
 sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+```
 
-# Persist across reboots:
+To persist across reboots:
+```bash
 echo "net.ipv4.ping_group_range = 0 2147483647" | sudo tee /etc/sysctl.d/99-ping-group.conf
 sudo sysctl --system
 ```
@@ -67,21 +43,17 @@ sudo setcap cap_net_raw+ep dinis
 
 ---
 
-## Building & Running
+## Build & Run
 
 ### Build
-
 ```bash
 go build -o dinis main.go
 ```
 
 ### Run
-
 ```bash
 ./dinis -port 8080 -data data/dinis.json
 ```
-
-Open `http://localhost:8080` in a browser to access the dashboard.
 
 ---
 
@@ -92,24 +64,23 @@ Open `http://localhost:8080` in a browser to access the dashboard.
 | `-port` | `8080` | HTTP listen port for the web dashboard and REST API |
 | `-host` | `0.0.0.0` | HTTP listen address |
 | `-data` | `data/dinis.json` | Path to persistent JSON storage file |
-| `-static` | `""` | Optional filesystem path to web assets (overrides embedded assets for local development) |
+| `-static` | `""` | Optional filesystem directory for web assets (overrides embedded assets) |
 | `-version` | `false` | Print application version and exit |
 
 ---
 
-## Default Configuration
+## Configuration Settings
 
 | Setting | Default | Description |
 |---|---|---|
 | `intervalSec` | `60.0` | Probing frequency for monitored hosts (seconds) |
-| `discoveryIntervalMin` | `240` | Scheduled CIDR subnet discovery interval (minutes, `0` = manual only) |
-| `timeoutMs` | `1000` | ICMP Echo Reply receive timeout (milliseconds) |
-| `failThreshold` | `2` | Consecutive failed probes required to mark a host `DOWN` and trigger an alert |
+| `discoveryIntervalMin` | `240` | Periodic CIDR discovery interval (minutes; `0` disables auto-scan) |
+| `timeoutMs` | `1000` | ICMP Echo Reply timeout (milliseconds) |
+| `failThreshold` | `2` | Consecutive failed probes required to mark a host `DOWN` |
 | `concurrency` | `100` | Maximum parallel worker goroutines for probing and discovery |
-| `autoDiscovery` | `true` | Enable automated periodic subnet discovery sweeps |
-| `soundAlerts` | `true` | Enable browser audio chime on state transitions |
+| `autoDiscovery` | `true` | Enable periodic discovery sweeps |
 
-Settings can be changed at runtime via the Web UI Settings modal or via `PUT /api/settings`.
+Settings can be updated at runtime via `PUT /api/settings`.
 
 ---
 
@@ -119,13 +90,21 @@ Settings can be changed at runtime via the Web UI Settings modal or via `PUT /ap
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/summary` | Aggregated metrics, reachability rate, active alert counts, and pacing rates |
-| `GET` | `/api/hosts` | List all monitored hosts with status, latency history, and packet loss |
+| `GET` | `/api/summary` | Aggregated metrics, reachability rate, alert counts, and pacing rate |
+| `GET` | `/api/hosts` | List monitored hosts. Unparameterized returns full array. Supports `?page=1&limit=50&search=...&status=...&sort=...&lightweight=true` |
 | `GET` | `/api/hosts/{ip}` | Detailed host state, latency metrics, and metadata |
-| `POST` | `/api/hosts/{ip}/ping` | Execute an immediate on-demand ICMP probe against a host |
-| `PUT` | `/api/hosts/{ip}/meta` | Update custom alias and operator notes for a host |
+| `GET` | `/api/hosts/{ip}/history?window={1h\|24h\|168h}` | Historical rollup data points for a host |
+| `POST` | `/api/hosts/{ip}/ping` | Run an immediate on-demand ICMP probe against a host |
+| `PUT` | `/api/hosts/{ip}/meta` | Update alias and operator notes (`{"alias": "...", "notes": "..."}`) |
 | `DELETE` | `/api/hosts/{ip}/enrollment` | Un-enroll a host from active monitoring |
-| `POST` | `/api/hosts/{ip}/promote` | Promote a dynamic host to a permanent static target (prevents pruning if parent CIDR is deleted) |
+| `POST` | `/api/hosts/{ip}/promote` | Mark a host as a static target |
+
+### Heatmap & Outliers
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/subnets/matrix` | List subnet blocks and cell status for heatmap visualization |
+| `GET` | `/api/outliers?limit={n}` | List top degraded hosts ranked by packet loss and P95 latency |
 
 ### Subnets & Exclusions
 
@@ -133,7 +112,7 @@ Settings can be changed at runtime via the Web UI Settings modal or via `PUT /ap
 |---|---|---|
 | `GET` | `/api/cidrs` | List configured CIDR blocks |
 | `POST` | `/api/cidrs` | Add or update a CIDR block (`{"cidr": "192.168.1.0/24", "description": "LAN", ...}`) |
-| `DELETE` | `/api/cidrs?cidr={cidr}` | Remove a CIDR block and prune associated non-static hosts |
+| `DELETE` | `/api/cidrs?cidr={cidr}` | Remove a CIDR block and prune associated dynamic hosts |
 | `GET` | `/api/exclusions` | List active exclusion rules |
 | `POST` | `/api/exclusions` | Add an exclusion rule (`{"rule": "192.168.1.1", "reason": "Gateway"}`) |
 | `DELETE` | `/api/exclusions?rule={rule}` | Remove an exclusion rule |
@@ -143,19 +122,19 @@ Settings can be changed at runtime via the Web UI Settings modal or via `PUT /ap
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/discovery/status` | Current discovery state, scan counts, capacity, and next run timestamp |
-| `POST` | `/api/discovery/run` | Trigger an immediate discovery sweep (`?cidr={cidr}` optional) |
-| `GET` | `/api/alerts` | List all active firing and acknowledged alerts |
-| `GET` | `/api/alerts/history` | List resolved historical alert incidents |
-| `POST` | `/api/alerts/acknowledge` | Acknowledge an outage alert (`{"ip": "...", "ackBy": "...", "note": "..."}`) |
-| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active firing alerts |
+| `POST` | `/api/discovery/run` | Trigger an immediate discovery sweep (`{"cidr": "..."}` optional) |
+| `GET` | `/api/alerts` | List active firing and acknowledged alerts |
+| `GET` | `/api/alerts/history` | List resolved alert history |
+| `POST` | `/api/alerts/acknowledge` | Acknowledge an alert (`{"ip": "...", "alertId": "...", "operator": "...", "note": "..."}`) |
+| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active firing alerts (`{"operator": "...", "note": "..."}`) |
 
-### Configuration & Real-Time Stream
+### Settings & Stream
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/settings` | Get current application settings |
-| `PUT` | `/api/settings` | Update settings live without restarting |
-| `GET` | `/api/stream` | Server-Sent Events (SSE) stream for real-time state updates |
+| `PUT` | `/api/settings` | Update settings live without restart |
+| `GET` | `/api/stream` | Server-Sent Events (SSE) stream for real-time state changes |
 
 ---
 
@@ -163,26 +142,32 @@ Settings can be changed at runtime via the Web UI Settings modal or via `PUT /ap
 
 ```
 dinis/
-├── main.go                     # Application entrypoint & CLI orchestration
+├── main.go                     # Entrypoint & CLI orchestration
 ├── go.mod                      # Go module definition
 ├── verify_e2e.py               # E2E integration test suite
 ├── pkg/
-│   ├── network/                # CIDR calculation and exclusion matching
+│   ├── network/                # CIDR expansion and exclusion matching
 │   │   ├── cidr.go
 │   │   └── cidr_test.go
-│   ├── pinger/                 # Raw/DGRAM ICMP sockets, pacing, and probe engine
+│   ├── pinger/                 # ICMP socket operations, pacing, and probe engine
 │   │   ├── icmp.go
 │   │   ├── icmp_test.go
 │   │   ├── engine.go
 │   │   └── engine_test.go
-│   ├── alerts/                 # Incident management, transitions, and history
+│   ├── timeseries/             # In-memory ring buffer, rollups, and outlier detector
+│   │   ├── ring_buffer.go
+│   │   ├── rollup.go
+│   │   ├── store.go
+│   │   └── store_test.go
+│   ├── alerts/                 # Outage alert lifecycle, acknowledgements, and history
 │   │   ├── manager.go
 │   │   └── manager_test.go
 │   ├── store/                  # Atomic JSON file persistence
 │   │   ├── store.go
 │   │   └── store_test.go
-│   └── server/                 # HTTP server, REST handlers, SSE, and embedded frontend
+│   └── server/                 # HTTP routing, REST handlers, SSE, and web server
 │       ├── server.go
+│       ├── server_test.go
 │       └── web_dist/           # Embedded dashboard assets
 │           ├── index.html
 │           ├── style.css
@@ -194,13 +179,13 @@ dinis/
 
 ## Testing
 
-Run the unit test suite with race detection:
+Run unit and benchmark tests:
 ```bash
-go test -race -v ./...
+go test -v -race ./...
 ```
 
-Run the end-to-end integration test suite:
+Run E2E integration tests against a running server:
 ```bash
-# Start server in background, then run:
+./dinis -port 8080 -data data/dinis_test.json &
 python3 verify_e2e.py
 ```

@@ -62,16 +62,6 @@
           <span>Exclusions</span>
         </button>
 
-        <button id="btnToggleSound" class="btn btn-icon-only" title="Toggle audio alerts" aria-label="Toggle Sound">
-          <svg id="soundIconOn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M15.536 8.464a5 5 0 010 7.072M18.364 5.636a9 9 0 010 12.728M11 5L6 9H2v6h4l5 4V5z" />
-          </svg>
-          <svg id="soundIconOff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none;">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-            <path stroke-linecap="round" stroke-linejoin="round" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2" />
-          </svg>
-        </button>
-
         <button id="btnOpenSettings" class="btn btn-icon-only" title="Settings" aria-label="Settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -186,90 +176,183 @@
         </div>
       </div>
 
-      <!-- Toolbar & Controls -->
-      <section class="toolbar-section">
-        <div class="search-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="search-icon">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+      <!-- Master View Navigation Tabs -->
+      <nav class="view-nav-bar">
+        <button class="view-nav-tab active" data-view="matrix" id="tabViewMatrix">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="tab-icon">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
           </svg>
-          <input type="text" id="hostSearchInput" placeholder="Search by IP, alias, subnet CIDR or note..." autocomplete="off">
-          <button id="btnClearSearch" class="btn-clear-search" style="display:none;">&times;</button>
+          <span>Subnet Heatmap (/24 Matrix)</span>
+        </button>
+
+        <button class="view-nav-tab" data-view="outliers" id="tabViewOutliers">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="tab-icon">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
+          <span>Outliers & Exception Board</span>
+          <span class="tab-badge" id="outliersCountBadge" style="display:none;">0</span>
+        </button>
+
+        <button class="view-nav-tab" data-view="explorer" id="tabViewExplorer">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="tab-icon">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+          <span>Host Explorer (List)</span>
+        </button>
+      </nav>
+
+      <!-- VIEW 1: Subnet Heatmap Matrix Section -->
+      <section id="viewMatrixSection" class="view-section active">
+        <div class="matrix-header-bar">
+          <div class="matrix-legend">
+            <span class="legend-title">Density Matrix Scale:</span>
+            <span class="legend-item"><span class="legend-box color-fast"></span> &lt; 5ms</span>
+            <span class="legend-item"><span class="legend-box color-normal"></span> 5–25ms</span>
+            <span class="legend-item"><span class="legend-box color-slow"></span> 25–100ms</span>
+            <span class="legend-item"><span class="legend-box color-degraded"></span> &gt; 100ms / Jitter</span>
+            <span class="legend-item"><span class="legend-box color-down"></span> Down / Loss</span>
+            <span class="legend-item"><span class="legend-box color-excl"></span> Excluded</span>
+          </div>
+          <div class="matrix-actions">
+            <span class="text-xs text-muted" id="matrixSubnetCount">0 Subnets</span>
+          </div>
         </div>
 
-        <div class="filter-chips">
-          <button class="chip active" data-filter="all">All <span class="chip-count" id="countAll">0</span></button>
-          <button class="chip chip-down" data-filter="down">Down <span class="chip-count" id="countDown">0</span></button>
-          <button class="chip chip-ack" data-filter="ack">Acknowledged <span class="chip-count" id="countAck">0</span></button>
-          <button class="chip chip-up" data-filter="up">Up <span class="chip-count" id="countUp">0</span></button>
-          <button class="chip chip-excl" data-filter="excluded">Excluded <span class="chip-count" id="countExcluded">0</span></button>
-        </div>
-
-        <div class="toolbar-right">
-          <div class="sort-select-wrapper">
-            <label for="sortSelect" class="sort-label">Sort:</label>
-            <select id="sortSelect" class="custom-select">
-              <option value="ip-asc">IP Address (Asc)</option>
-              <option value="ip-desc">IP Address (Desc)</option>
-              <option value="status">Status (Down First)</option>
-              <option value="latency-desc">Latency (Highest)</option>
-              <option value="latency-asc">Latency (Lowest)</option>
-              <option value="loss">Packet Loss %</option>
-            </select>
-          </div>
-
-          <div class="view-toggle">
-            <button id="btnViewGrid" class="btn-view active" title="Grid Card View" aria-label="Grid View">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
-              </svg>
-            </button>
-            <button id="btnViewTable" class="btn-view" title="High-Density Table View" aria-label="Table View">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" />
-              </svg>
-            </button>
-          </div>
+        <div id="matrixGridContainer" class="matrix-blocks-grid">
+          <!-- Dynamically populated by JS -->
         </div>
       </section>
 
-      <!-- Host Container -->
-      <section class="host-display-container">
-        <!-- Grid View -->
-        <div id="hostsGrid" class="hosts-grid">
-          <!-- Dynamically populated by JS -->
+      <!-- VIEW 2: Outliers & Exception Board Section -->
+      <section id="viewOutliersSection" class="view-section" style="display:none;">
+        <div class="outliers-header-card">
+          <div>
+            <h3>Exception & Degraded Host Queue</h3>
+            <p>Hosts experiencing packet loss, anomalous latency spikes, or active outages. Silence means health.</p>
+          </div>
+          <button id="btnRefreshOutliers" class="btn btn-sm btn-outline">Refresh Outliers</button>
         </div>
 
-        <!-- Table View -->
-        <div id="hostsTableWrapper" class="table-container" style="display:none;">
-          <table class="hosts-table">
+        <div class="table-container">
+          <table class="hosts-table outliers-table">
             <thead>
               <tr>
-                <th class="col-status">Status</th>
-                <th class="col-ip">Host / IP</th>
-                <th class="col-cidr">CIDR Scope</th>
-                <th class="col-latency">Current RTT</th>
-                <th class="col-sparkline">Latency Trend</th>
-                <th class="col-stats">Loss / Uptime</th>
-                <th class="col-seen">Last Check</th>
-                <th class="col-actions">Actions</th>
+                <th>Severity</th>
+                <th>Target IP</th>
+                <th>Subnet Scope</th>
+                <th>Packet Loss</th>
+                <th>Avg RTT</th>
+                <th>P95 Latency</th>
+                <th>Samples</th>
+                <th>Actions</th>
               </tr>
             </thead>
-            <tbody id="hostsTableBody">
+            <tbody id="outliersTableBody">
               <!-- Dynamically populated by JS -->
             </tbody>
           </table>
         </div>
+      </section>
 
-        <!-- Empty State -->
-        <div id="emptyState" class="empty-state" style="display:none;">
-          <div class="empty-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <!-- VIEW 3: Host Explorer Section -->
+      <section id="viewExplorerSection" class="view-section" style="display:none;">
+        <!-- Toolbar & Controls -->
+        <section class="toolbar-section">
+          <div class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="search-icon">
               <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
+            <input type="text" id="hostSearchInput" placeholder="Search by IP, alias, subnet CIDR or note..." autocomplete="off">
+            <button id="btnClearSearch" class="btn-clear-search" style="display:none;">&times;</button>
           </div>
-          <h3>No hosts match your criteria</h3>
-          <p id="emptyStateDesc">Try adjusting your search or active filter chips.</p>
-        </div>
+
+          <div class="filter-chips">
+            <button class="chip active" data-filter="all">All <span class="chip-count" id="countAll">0</span></button>
+            <button class="chip chip-down" data-filter="down">Down <span class="chip-count" id="countDown">0</span></button>
+            <button class="chip chip-ack" data-filter="ack">Acknowledged <span class="chip-count" id="countAck">0</span></button>
+            <button class="chip chip-up" data-filter="up">Up <span class="chip-count" id="countUp">0</span></button>
+            <button class="chip chip-excl" data-filter="excluded">Excluded <span class="chip-count" id="countExcluded">0</span></button>
+          </div>
+
+          <div class="toolbar-right">
+            <div class="sort-select-wrapper">
+              <label for="sortSelect" class="sort-label">Sort:</label>
+              <select id="sortSelect" class="custom-select">
+                <option value="ip-asc">IP Address (Asc)</option>
+                <option value="ip-desc">IP Address (Desc)</option>
+                <option value="status">Status (Down First)</option>
+                <option value="latency-desc">Latency (Highest)</option>
+                <option value="latency-asc">Latency (Lowest)</option>
+                <option value="loss">Packet Loss %</option>
+              </select>
+            </div>
+
+            <div class="view-toggle">
+              <button id="btnViewGrid" class="btn-view active" title="Grid Card View" aria-label="Grid View">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                </svg>
+              </button>
+              <button id="btnViewTable" class="btn-view" title="High-Density Table View" aria-label="Table View">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Host Container -->
+        <section class="host-display-container">
+          <!-- Grid View -->
+          <div id="hostsGrid" class="hosts-grid">
+            <!-- Dynamically populated by JS -->
+          </div>
+
+          <!-- Table View -->
+          <div id="hostsTableWrapper" class="table-container" style="display:none;">
+            <table class="hosts-table">
+              <thead>
+                <tr>
+                  <th class="col-status">Status</th>
+                  <th class="col-ip">Host / IP</th>
+                  <th class="col-cidr">CIDR Scope</th>
+                  <th class="col-latency">Current RTT</th>
+                  <th class="col-sparkline">Latency Trend</th>
+                  <th class="col-stats">Loss / Uptime</th>
+                  <th class="col-seen">Last Check</th>
+                  <th class="col-actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="hostsTableBody">
+                <!-- Dynamically populated by JS -->
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Empty State -->
+          <div id="emptyState" class="empty-state" style="display:none;">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+            </div>
+            <h3>No hosts match your criteria</h3>
+            <p id="emptyStateDesc">Try adjusting your search or active filter chips.</p>
+          </div>
+
+          <!-- Server Pagination Controls -->
+          <div class="pagination-bar" id="paginationBar" style="display:none;">
+            <div class="pagination-info">
+              Showing <strong id="pageRangeStart">1</strong>–<strong id="pageRangeEnd">50</strong> of <strong id="pageTotalCount">0</strong> monitored hosts
+            </div>
+            <div class="pagination-controls">
+              <button id="btnPrevPage" class="btn btn-sm btn-outline">&larr; Previous</button>
+              <span class="pagination-page-label">Page <strong id="currentPageNum">1</strong> of <strong id="totalPageCount">1</strong></span>
+              <button id="btnNextPage" class="btn btn-sm btn-outline">Next &rarr;</button>
+            </div>
+          </div>
+        </section>
       </section>
 
     </main>
@@ -505,14 +588,24 @@
         </div>
 
         <div class="modal-body">
-          <!-- Real-time Sparkline / Latency Chart -->
+          <!-- Time-Series Latency & Loss Chart -->
           <div class="detail-chart-card">
             <div class="chart-header">
-              <span class="chart-title">Real-Time ICMP Round-Trip Latency (Last 25 Probes)</span>
-              <span class="chart-current-rtt" id="detailCurrentRTT">-- ms</span>
+              <div class="d-flex align-center gap-2">
+                <span class="chart-title" id="detailChartTitle">Round-Trip Latency & Trends</span>
+              </div>
+              <div class="chart-header-right">
+                <div class="chart-window-tabs" id="detailWindowTabs">
+                  <button class="chart-tab active" data-window="realtime">Live (25)</button>
+                  <button class="chart-tab" data-window="1h">1 Hour (1m)</button>
+                  <button class="chart-tab" data-window="24h">24 Hours (1m)</button>
+                  <button class="chart-tab" data-window="168h">7 Days (1h)</button>
+                </div>
+                <span class="chart-current-rtt" id="detailCurrentRTT">-- ms</span>
+              </div>
             </div>
             <div class="chart-canvas-wrapper">
-              <canvas id="detailSparklineCanvas" width="600" height="120"></canvas>
+              <canvas id="detailSparklineCanvas" width="600" height="130"></canvas>
             </div>
           </div>
 
@@ -527,12 +620,20 @@
               <span class="d-val font-mono" id="detailAvgRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
+              <span class="d-label">P95 Latency</span>
+              <span class="d-val font-mono" id="detailP95RTT">-- ms</span>
+            </div>
+            <div class="detail-metric-box">
               <span class="d-label">Max Latency</span>
               <span class="d-val font-mono" id="detailMaxRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
               <span class="d-label">Packet Loss</span>
               <span class="d-val font-mono" id="detailLoss">0%</span>
+            </div>
+            <div class="detail-metric-box">
+              <span class="d-label">Jitter / Variance</span>
+              <span class="d-val font-mono" id="detailJitter">-- ms</span>
             </div>
             <div class="detail-metric-box">
               <span class="d-label">Packets Sent/Recv</span>

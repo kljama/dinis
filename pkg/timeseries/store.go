@@ -1,0 +1,470 @@
+package timeseries
+
+import (
+	"context"
+	"encoding/binary"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// OutlierHost represents a monitored endpoint showing degraded performance, packet loss, or high jitter.
+type OutlierHost struct {
+	IP            string  `json:"ip"`
+	Subnet        string  `json:"subnet"`
+	AvgLatencyMs  float64 `json:"avgLatencyMs"`
+	P95LatencyMs  float64 `json:"p95LatencyMs"`
+	PacketLossPct float64 `json:"packetLossPct"`
+	JitterMs      float64 `json:"jitterMs"`
+	SampleCount   int     `json:"sampleCount"`
+	Severity      string  `json:"severity"` // "CRITICAL", "WARNING", "DEGRADED"
+}
+
+// SubnetMatrixCell represents a single IP inside a /24 subnet block.
+type SubnetMatrixCell struct {
+	IP            string  `json:"ip"`
+	HostIndex     int     `json:"hostIndex"` // 0 to 255
+	Status        string  `json:"status"`    // "UP", "DOWN", "EXCLUDED", "PENDING"
+	LatencyMs     float64 `json:"latencyMs"`
+	PacketLossPct float64 `json:"packetLossPct"`
+	AlertActive   bool    `json:"alertActive"`
+	AlertAck      bool    `json:"alertAck"`
+	Alias         string  `json:"alias,omitempty"`
+}
+
+// SubnetMatrixBlock represents a /24 subnet containing up to 256 cells and aggregate statistics.
+type SubnetMatrixBlock struct {
+	CIDR           string             `json:"cidr"`
+	TotalHosts     int                `json:"totalHosts"`
+	OnlineCount    int                `json:"onlineCount"`
+	OfflineCount   int                `json:"offlineCount"`
+	ExcludedCount  int                `json:"excludedCount"`
+	AvgLatencyMs   float64            `json:"avgLatencyMs"`
+	P95LatencyMs   float64            `json:"p95LatencyMs"`
+	HealthPct      float64            `json:"healthPct"`
+	Cells          []SubnetMatrixCell `json:"cells"`
+}
+
+// Store manages in-memory multi-tier time-series metric retention and rollups for all IPs.
+type Store struct {
+	mu           sync.RWMutex
+	rawBuffers   map[string]*HostRingBuffer
+	minuteSeries map[string]*RollupSeries
+	hourSeries   map[string]*RollupSeries
+
+	lastMinuteRollup time.Time
+	lastHourRollup   time.Time
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+// NewStore creates a new time-series metric store.
+func NewStore() *Store {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Store{
+		rawBuffers:   make(map[string]*HostRingBuffer),
+		minuteSeries: make(map[string]*RollupSeries),
+		hourSeries:   make(map[string]*RollupSeries),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
+// Start launches the background automated downsampling ticker.
+func (s *Store) Start() {
+	s.wg.Add(1)
+	go s.rollupLoop()
+}
+
+// Stop gracefully stops background downsampling routines.
+func (s *Store) Stop() {
+	s.cancel()
+	s.wg.Wait()
+}
+
+func (s *Store) getOrCreateRawBuffer(ip string) *HostRingBuffer {
+	s.mu.RLock()
+	rb, ok := s.rawBuffers[ip]
+	s.mu.RUnlock()
+	if ok {
+		return rb
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rb, ok := s.rawBuffers[ip]; ok {
+		return rb
+	}
+	rb = NewHostRingBuffer(120) // ~10-20 min raw memory window
+	s.rawBuffers[ip] = rb
+	return rb
+}
+
+func (s *Store) getOrCreateMinuteSeries(ip string) *RollupSeries {
+	s.mu.RLock()
+	rs, ok := s.minuteSeries[ip]
+	s.mu.RUnlock()
+	if ok {
+		return rs
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rs, ok := s.minuteSeries[ip]; ok {
+		return rs
+	}
+	rs = NewRollupSeries(1440) // 24 hours of 1-minute rollups
+	s.minuteSeries[ip] = rs
+	return rs
+}
+
+func (s *Store) getOrCreateHourSeries(ip string) *RollupSeries {
+	s.mu.RLock()
+	rs, ok := s.hourSeries[ip]
+	s.mu.RUnlock()
+	if ok {
+		return rs
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rs, ok := s.hourSeries[ip]; ok {
+		return rs
+	}
+	rs = NewRollupSeries(720) // 30 days of 1-hour rollups
+	s.hourSeries[ip] = rs
+	return rs
+}
+
+// Record inserts a new raw probe sample into the time-series store in O(1) time.
+func (s *Store) Record(ip string, timestamp time.Time, latencyMs float64, success bool) {
+	rb := s.getOrCreateRawBuffer(ip)
+	rb.Push(timestamp, latencyMs, success)
+}
+
+// RemoveHost removes all stored metric series for an IP.
+func (s *Store) RemoveHost(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.rawBuffers, ip)
+	delete(s.minuteSeries, ip)
+	delete(s.hourSeries, ip)
+}
+
+// GetRecentRawSamples returns the most recent raw samples for an IP.
+func (s *Store) GetRecentRawSamples(ip string, count int) []RawSample {
+	s.mu.RLock()
+	rb, ok := s.rawBuffers[ip]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	all := rb.GetAll()
+	if count > 0 && len(all) > count {
+		return all[len(all)-count:]
+	}
+	return all
+}
+
+// GetHostHistory returns historical time-series rollups for an IP based on the requested time window.
+func (s *Store) GetHostHistory(ip string, window time.Duration) []RollupPoint {
+	if window <= 2*time.Hour {
+		// Use 1-minute rollups for windows up to 2 hours
+		s.mu.RLock()
+		ms, ok := s.minuteSeries[ip]
+		s.mu.RUnlock()
+		if !ok {
+			return nil
+		}
+		cutoff := time.Now().Add(-window)
+		return ms.GetSince(cutoff)
+	}
+
+	// Use 1-hour rollups for longer windows
+	s.mu.RLock()
+	hs, ok := s.hourSeries[ip]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	cutoff := time.Now().Add(-window)
+	return hs.GetSince(cutoff)
+}
+
+// PruneHosts removes time-series metric buffers and rollups for hosts that are no longer monitored.
+func (s *Store) PruneHosts(activeIPs map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for ip := range s.rawBuffers {
+		if !activeIPs[ip] {
+			delete(s.rawBuffers, ip)
+			delete(s.minuteSeries, ip)
+			delete(s.hourSeries, ip)
+		}
+	}
+}
+
+// GetTopOutliers returns hosts exhibiting high packet loss, latency spikes, or severe jitter.
+func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, string)) []OutlierHost {
+	s.mu.RLock()
+	ips := make([]string, 0, len(s.rawBuffers))
+	for ip := range s.rawBuffers {
+		ips = append(ips, ip)
+	}
+	s.mu.RUnlock()
+
+	var outliers []OutlierHost
+	for _, ip := range ips {
+		subnet := ""
+		if isValidHostFn != nil {
+			valid, sub := isValidHostFn(ip)
+			if !valid {
+				continue
+			}
+			subnet = sub
+		}
+
+		s.mu.RLock()
+		rb, ok := s.rawBuffers[ip]
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		avgLat, _, _, p95Lat, lossRatio, count := rb.ComputeSummary()
+		if count < 2 {
+			continue
+		}
+
+		lossPct := lossRatio * 100.0
+
+		// Identify outliers: packet loss > 0% or latency > 100ms
+		if lossPct > 0.0 || avgLat > 100.0 || p95Lat > 150.0 {
+			var severity string
+			if lossPct >= 50.0 {
+				severity = "CRITICAL"
+			} else if lossPct > 0.0 || p95Lat > 250.0 {
+				severity = "WARNING"
+			} else {
+				severity = "DEGRADED"
+			}
+
+			outliers = append(outliers, OutlierHost{
+				IP:            ip,
+				Subnet:        subnet,
+				AvgLatencyMs:  avgLat,
+				P95LatencyMs:  p95Lat,
+				PacketLossPct: lossPct,
+				SampleCount:   count,
+				Severity:      severity,
+			})
+		}
+	}
+
+	// Sort outliers by severity / packet loss descending, then P95 latency descending
+	sort.Slice(outliers, func(i, j int) bool {
+		if outliers[i].PacketLossPct != outliers[j].PacketLossPct {
+			return outliers[i].PacketLossPct > outliers[j].PacketLossPct
+		}
+		return outliers[i].P95LatencyMs > outliers[j].P95LatencyMs
+	})
+
+	if limit > 0 && len(outliers) > limit {
+		return outliers[:limit]
+	}
+	return outliers
+}
+
+// Background Downsampling Routine
+func (s *Store) rollupLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	s.lastMinuteRollup = time.Now()
+	s.lastHourRollup = time.Now()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case now := <-ticker.C:
+			// Check if 1-minute downsampling is due
+			if now.Sub(s.lastMinuteRollup) >= 1*time.Minute {
+				s.computeMinuteRollups(now)
+				s.lastMinuteRollup = now
+			}
+
+			// Check if 1-hour downsampling is due
+			if now.Sub(s.lastHourRollup) >= 1*time.Hour {
+				s.computeHourRollups(now)
+				s.lastHourRollup = now
+			}
+		}
+	}
+}
+
+func (s *Store) computeMinuteRollups(now time.Time) {
+	s.mu.RLock()
+	ips := make([]string, 0, len(s.rawBuffers))
+	for ip := range s.rawBuffers {
+		ips = append(ips, ip)
+	}
+	s.mu.RUnlock()
+
+	cutoff := now.Add(-1 * time.Minute)
+	for _, ip := range ips {
+		s.mu.RLock()
+		rb, ok := s.rawBuffers[ip]
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		samples := rb.GetSince(cutoff)
+		if len(samples) > 0 {
+			rollup := ComputeRollup(now, 1*time.Minute, samples)
+			ms := s.getOrCreateMinuteSeries(ip)
+			ms.Append(rollup)
+		}
+	}
+}
+
+func (s *Store) computeHourRollups(now time.Time) {
+	s.mu.RLock()
+	ips := make([]string, 0, len(s.minuteSeries))
+	for ip := range s.minuteSeries {
+		ips = append(ips, ip)
+	}
+	s.mu.RUnlock()
+
+	cutoff := now.Add(-1 * time.Hour)
+	for _, ip := range ips {
+		s.mu.RLock()
+		ms, ok := s.minuteSeries[ip]
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		minuteRollups := ms.GetSince(cutoff)
+		if len(minuteRollups) > 0 {
+			// Aggregate 1-minute rollups into an hour rollup
+			var sumAvg float64
+			var sumLoss float64
+			var sumUpRatio float64
+			var totalSamples int
+			minLat := minuteRollups[0].MinLatencyMs
+			maxLat := minuteRollups[0].MaxLatencyMs
+
+			for _, mr := range minuteRollups {
+				sumAvg += mr.AvgLatencyMs
+				sumLoss += mr.PacketLossPct
+				sumUpRatio += mr.UpRatio
+				totalSamples += mr.SampleCount
+				if mr.MinLatencyMs < minLat && mr.MinLatencyMs > 0 {
+					minLat = mr.MinLatencyMs
+				}
+				if mr.MaxLatencyMs > maxLat {
+					maxLat = mr.MaxLatencyMs
+				}
+			}
+
+			count := float64(len(minuteRollups))
+			hourPoint := RollupPoint{
+				Timestamp:      now,
+				BucketDuration: 1 * time.Hour,
+				MinLatencyMs:   minLat,
+				MaxLatencyMs:   maxLat,
+				AvgLatencyMs:   sumAvg / count,
+				PacketLossPct:  sumLoss / count,
+				UpRatio:        sumUpRatio / count,
+				SampleCount:    totalSamples,
+			}
+
+			hs := s.getOrCreateHourSeries(ip)
+			hs.Append(hourPoint)
+		}
+	}
+}
+
+// GenerateSubnetMatrix builds matrix blocks only for subnets with monitored/discovered hosts.
+func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetMatrixBlock {
+	blocks := make([]SubnetMatrixBlock, 0, len(hostsBySubnet))
+
+	for cidr, cells := range hostsBySubnet {
+		if len(cells) == 0 {
+			continue
+		}
+
+		var online, offline, excluded int
+		var sumLat float64
+		var latencies []float64
+
+		for _, c := range cells {
+			switch c.Status {
+			case "UP":
+				online++
+				if c.LatencyMs > 0 {
+					sumLat += c.LatencyMs
+					latencies = append(latencies, c.LatencyMs)
+				}
+			case "DOWN":
+				offline++
+			case "EXCLUDED":
+				excluded++
+			}
+		}
+
+		totalActive := online + offline
+		var healthPct float64
+		if totalActive > 0 {
+			healthPct = (float64(online) / float64(totalActive)) * 100.0
+		} else {
+			healthPct = 100.0
+		}
+
+		var avgLat, p95Lat float64
+		if len(latencies) > 0 {
+			avgLat = sumLat / float64(len(latencies))
+			sort.Float64s(latencies)
+			p95Lat = getPercentile(latencies, 0.95)
+		}
+
+		// Sort cells by IP numerically
+		sort.Slice(cells, func(i, j int) bool {
+			ipA := net.ParseIP(cells[i].IP).To4()
+			ipB := net.ParseIP(cells[j].IP).To4()
+			if ipA != nil && ipB != nil {
+				return binary.BigEndian.Uint32(ipA) < binary.BigEndian.Uint32(ipB)
+			}
+			return cells[i].IP < cells[j].IP
+		})
+
+		blocks = append(blocks, SubnetMatrixBlock{
+			CIDR:          cidr,
+			TotalHosts:    len(cells),
+			OnlineCount:   online,
+			OfflineCount:  offline,
+			ExcludedCount: excluded,
+			AvgLatencyMs:  avgLat,
+			P95LatencyMs:  p95Lat,
+			HealthPct:     healthPct,
+			Cells:         cells,
+		})
+	}
+
+	// Sort blocks by CIDR string
+	sort.Slice(blocks, func(i, j int) bool {
+		return strings.Compare(blocks[i].CIDR, blocks[j].CIDR) < 0
+	})
+
+	return blocks
+}
