@@ -39,6 +39,11 @@ type DiscoveryStatus struct {
 	IntervalMin         int        `json:"intervalMin"`
 }
 
+const (
+	defaultMaxSSEClients       = 256
+	discoveryRateLimitInterval = 30 * time.Second
+)
+
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
 type Coordinator struct {
 	rebuildMu  sync.Mutex
@@ -54,6 +59,9 @@ type Coordinator struct {
 
 	discMu          sync.RWMutex
 	discoveryStatus DiscoveryStatus
+
+	discoveryLastTriggered time.Time // rate-limit manual discovery
+	maxSSEClients          int
 }
 
 // NewCoordinator creates and wires the entire monitoring subsystem.
@@ -71,11 +79,12 @@ func NewCoordinator(st *store.Store) *Coordinator {
 	altMgr := alerts.NewManager(500)
 
 	c := &Coordinator{
-		store:      st,
-		pinger:     p,
-		alerts:     altMgr,
-		sseClients: make(map[chan []byte]bool),
-		stopChan:   make(chan struct{}),
+		store:         st,
+		pinger:        p,
+		alerts:        altMgr,
+		sseClients:    make(map[chan []byte]bool),
+		stopChan:      make(chan struct{}),
+		maxSSEClients: defaultMaxSSEClients,
 		discoveryStatus: DiscoveryStatus{
 			IntervalMin: settings.DiscoveryIntervalMin,
 		},
@@ -871,6 +880,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	clientChan := make(chan []byte, 100)
 
 	s.coord.clientsMu.Lock()
+	if len(s.coord.sseClients) >= s.coord.maxSSEClients {
+		s.coord.clientsMu.Unlock()
+		http.Error(w, "Too many SSE clients", http.StatusServiceUnavailable)
+		return
+	}
 	s.coord.sseClients[clientChan] = true
 	s.coord.clientsMu.Unlock()
 
@@ -921,6 +935,16 @@ func (s *Server) handleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
+
+	// Rate-limit: allow at most one manual discovery trigger per interval
+	s.coord.discMu.Lock()
+	if time.Since(s.coord.discoveryLastTriggered) < discoveryRateLimitInterval {
+		s.coord.discMu.Unlock()
+		writeError(w, http.StatusTooManyRequests, "Discovery rate limited. Try again later.")
+		return
+	}
+	s.coord.discoveryLastTriggered = time.Now()
+	s.coord.discMu.Unlock()
 
 	var req struct {
 		CIDR string `json:"cidr"`
@@ -1623,14 +1647,26 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.IntervalSec < 0.5 {
 			req.IntervalSec = 0.5
 		}
+		if req.IntervalSec > 3600 {
+			req.IntervalSec = 3600
+		}
 		if req.TimeoutMs <= 0 {
 			req.TimeoutMs = 1000
+		}
+		if req.TimeoutMs > 30000 {
+			req.TimeoutMs = 30000
 		}
 		if req.FailThreshold <= 0 {
 			req.FailThreshold = 2
 		}
+		if req.FailThreshold > 100 {
+			req.FailThreshold = 100
+		}
 		if req.Concurrency <= 0 {
 			req.Concurrency = 100
+		}
+		if req.Concurrency > 1024 {
+			req.Concurrency = 1024
 		}
 		if req.DiscoveryIntervalMin < 0 {
 			req.DiscoveryIntervalMin = 0

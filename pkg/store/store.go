@@ -176,9 +176,23 @@ func (s *Store) saveUnsafe() error {
 	}
 
 	tmpFile := s.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, raw, 0644); err != nil {
+	f, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to create tmp file: %w", err)
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
 		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to write tmp file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to fsync tmp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to close tmp file: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, s.filePath); err != nil {
