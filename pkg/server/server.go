@@ -143,6 +143,12 @@ func (c *Coordinator) Stop() {
 	})
 }
 
+// SetProbeExporter registers a callback that is invoked for every ICMP probe result,
+// enabling export to external stores such as InfluxDB.
+func (c *Coordinator) SetProbeExporter(fn func(ip string, latencyMs float64, success bool, ts time.Time)) {
+	c.pinger.OnProbeRecorded = fn
+}
+
 // RebuildTargetList recalculates the list of active target hosts based on discovered hosts, configured CIDRs, and exclusions.
 func (c *Coordinator) RebuildTargetList() {
 	c.rebuildMu.Lock()

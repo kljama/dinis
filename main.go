@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"dinis/pkg/influxdb"
 	"dinis/pkg/server"
 	"dinis/pkg/store"
 )
@@ -23,6 +24,9 @@ func main() {
 	hostFlag := flag.String("host", "0.0.0.0", "HTTP listen host address")
 	dataFlag := flag.String("data", "data/dinis.json", "Path to persistent JSON database file")
 	staticFlag := flag.String("static", "", "Optional path to static web assets directory (overrides embedded assets)")
+	influxURLFlag := flag.String("influxdb-url", "", "InfluxDB 3 Core URL (e.g. http://localhost:8181). Empty disables InfluxDB export.")
+	influxBucketFlag := flag.String("influxdb-bucket", "dinis", "InfluxDB bucket/database name")
+	influxTokenFlag := flag.String("influxdb-token", "", "InfluxDB auth token (optional)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -48,8 +52,26 @@ func main() {
 
 	// Initialize coordinator (ICMP Engine, Alerts, CIDR manager)
 	coord := server.NewCoordinator(st)
+
+	// Wire optional InfluxDB exporter
+	var influxWriter *influxdb.Writer
+	if *influxURLFlag != "" {
+		influxWriter = influxdb.NewWriter(influxdb.Config{
+			URL:    *influxURLFlag,
+			Bucket: *influxBucketFlag,
+			Token:  *influxTokenFlag,
+		})
+		coord.SetProbeExporter(func(ip string, latencyMs float64, success bool, ts time.Time) {
+			influxWriter.WriteProbe(ip, "", "", latencyMs, success, ts)
+		})
+		log.Printf("[DINIS] InfluxDB export enabled -> %s (bucket: %s)", *influxURLFlag, *influxBucketFlag)
+	}
+
 	coord.Start()
 	defer coord.Stop()
+	if influxWriter != nil {
+		defer influxWriter.Stop()
+	}
 
 	// Initialize HTTP server
 	srvHandler := server.NewServer(coord, *staticFlag)

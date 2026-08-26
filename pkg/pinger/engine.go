@@ -104,6 +104,7 @@ type Engine struct {
 	OnHostUpdated     func(host *HostState)
 	OnStateChange     func(host *HostState, oldStatus, newStatus HostStatus)
 	OnCycleComplete   func(summary *CycleSummary)
+	OnProbeRecorded   func(ip string, latencyMs float64, success bool, ts time.Time)
 
 	wakeChan chan struct{}
 
@@ -562,6 +563,10 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 
 	if e.tsStore != nil {
 		e.tsStore.Record(h.IP, now, res.LatencyMs, res.Success)
+	}
+
+	if e.OnProbeRecorded != nil {
+		e.OnProbeRecorded(h.IP, res.LatencyMs, res.Success, now)
 	}
 
 	if res.Success {

@@ -1,0 +1,49 @@
+services:
+  influxdb3:
+    image: influxdb:3-core
+    container_name: dinis-influxdb3
+    ports:
+      - "8181:8181"
+    volumes:
+      - influxdb3-data:/var/lib/influxdb3
+    environment:
+      - INFLUXDB3_NODE_ID=dinis-node
+    restart: unless-stopped
+
+  dinis:
+    build: .
+    container_name: dinis
+    cap_add:
+      - NET_RAW
+    ports:
+      - "8080:8080"
+    volumes:
+      - dinis-data:/data
+    environment:
+      - INFLUXDB3_URL=http://influxdb3:8181
+      - INFLUXDB3_BUCKET=dinis
+    command:
+      - --data=/data/dinis.json
+      - --influxdb-url=http://influxdb3:8181
+      - --influxdb-bucket=dinis
+    depends_on:
+      - influxdb3
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: dinis-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - influxdb3
+    restart: unless-stopped
+
+volumes:
+  influxdb3-data:
+  dinis-data:
+  grafana-data:
