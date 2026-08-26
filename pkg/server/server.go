@@ -235,11 +235,10 @@ func (c *Coordinator) RebuildTargetList() {
 	}
 
 	// Clean up any active alerts for hosts that are no longer monitored or are now excluded
-	for _, a := range c.alerts.GetActiveAlerts() {
-		if h, exists := hostMap[a.IP]; !exists || h.IsExcluded {
-			c.alerts.Resolve(a.IP)
-		}
-	}
+	c.alerts.ResolveIf(func(a *alerts.Alert) bool {
+		h, exists := hostMap[a.IP]
+		return !exists || h.IsExcluded
+	})
 
 	c.pinger.SetHosts(hostMap)
 	c.pinger.Wake()
