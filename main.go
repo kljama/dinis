@@ -68,10 +68,10 @@ func main() {
 	}
 
 	coord.Start()
-	defer coord.Stop()
 	if influxWriter != nil {
 		defer influxWriter.Stop()
 	}
+	defer coord.Stop()
 
 	// Initialize HTTP server
 	srvHandler := server.NewServer(coord, *staticFlag)
