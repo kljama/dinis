@@ -63,7 +63,7 @@ func NewWriter(cfg Config) *Writer {
 }
 
 // WriteProbe enqueues a single ICMP probe result for batch writing.
-func (w *Writer) WriteProbe(ip string, subnet string, alias string, latencyMs float64, success bool, ts time.Time) {
+func (w *Writer) WriteProbe(ip string, alias string, subnet string, latencyMs float64, success bool, ts time.Time) {
 	// Build line-protocol line:
 	// icmp_probe,ip=x.x.x.x,subnet=y.y.y.y/z latency_ms=1.23,success=1i <timestamp_ns>
 	var line strings.Builder

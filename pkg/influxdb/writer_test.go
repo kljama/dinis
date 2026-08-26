@@ -29,11 +29,11 @@ func TestEscapeTag(t *testing.T) {
 }
 
 func TestWriteProbeLineProtocol(t *testing.T) {
-	var received string
+	receivedCh := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		buf := new(strings.Builder)
 		io.Copy(buf, r.Body)
-		received = buf.String()
+		receivedCh <- buf.String()
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -48,10 +48,14 @@ func TestWriteProbeLineProtocol(t *testing.T) {
 	defer w.Stop()
 
 	ts := time.Unix(0, 1000000000)
-	w.WriteProbe("1.2.3.4", "10.0.0.0/24", "myhost", 12.3456, true, ts)
+	w.WriteProbe("1.2.3.4", "myhost", "10.0.0.0/24", 12.3456, true, ts)
 
-	// Allow the async flush goroutine to complete.
-	time.Sleep(100 * time.Millisecond)
+	var received string
+	select {
+	case received = <-receivedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flush")
+	}
 
 	if !strings.Contains(received, "icmp_probe,ip=1.2.3.4,subnet=10.0.0.0/24,alias=myhost") {
 		t.Errorf("unexpected line-protocol output: %q", received)
@@ -68,11 +72,11 @@ func TestWriteProbeLineProtocol(t *testing.T) {
 }
 
 func TestWriteProbeNoSubnetNoAlias(t *testing.T) {
-	var received string
+	receivedCh := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		buf := new(strings.Builder)
 		io.Copy(buf, r.Body)
-		received = buf.String()
+		receivedCh <- buf.String()
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -89,7 +93,12 @@ func TestWriteProbeNoSubnetNoAlias(t *testing.T) {
 	ts := time.Unix(0, 2000000000)
 	w.WriteProbe("5.6.7.8", "", "", 0.5, false, ts)
 
-	time.Sleep(100 * time.Millisecond)
+	var received string
+	select {
+	case received = <-receivedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flush")
+	}
 
 	if !strings.HasPrefix(received, "icmp_probe,ip=5.6.7.8 ") {
 		t.Errorf("unexpected measurement/tags: %q", received)
@@ -103,10 +112,12 @@ func TestWriteProbeNoSubnetNoAlias(t *testing.T) {
 }
 
 func TestWriteProbeEndpoint(t *testing.T) {
-	var gotPath, gotQuery string
+	type reqInfo struct {
+		path, query string
+	}
+	infoCh := make(chan reqInfo, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotQuery = r.URL.RawQuery
+		infoCh <- reqInfo{r.URL.Path, r.URL.RawQuery}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -121,12 +132,18 @@ func TestWriteProbeEndpoint(t *testing.T) {
 	defer w.Stop()
 
 	w.WriteProbe("1.1.1.1", "", "", 1.0, true, time.Now())
-	time.Sleep(100 * time.Millisecond)
 
-	if gotPath != "/api/v3/write_lp" {
-		t.Errorf("expected path /api/v3/write_lp, got %q", gotPath)
+	var info reqInfo
+	select {
+	case info = <-infoCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for flush")
 	}
-	if gotQuery != "db=mydb" {
-		t.Errorf("expected query db=mydb, got %q", gotQuery)
+
+	if info.path != "/api/v3/write_lp" {
+		t.Errorf("expected path /api/v3/write_lp, got %q", info.path)
+	}
+	if info.query != "db=mydb" {
+		t.Errorf("expected query db=mydb, got %q", info.query)
 	}
 }
