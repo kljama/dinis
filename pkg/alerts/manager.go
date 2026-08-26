@@ -192,6 +192,37 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	return &cpy, true
 }
 
+// ResolveIf evaluates active alerts directly under lock and resolves any matching alerts without creating intermediate slices of all active alerts.
+func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var resolved []*Alert
+	now := time.Now()
+
+	for ip, alert := range m.activeAlerts {
+		if predicate(alert) {
+			delete(m.activeAlerts, ip)
+			alert.ResolvedAt = &now
+			alert.State = AlertStateResolved
+			alert.DurationSec = int64(now.Sub(alert.StartedAt).Seconds())
+
+			m.history = append([]*Alert{alert}, m.history...)
+			if len(m.history) > m.maxHistory {
+				m.history = m.history[:m.maxHistory]
+			}
+
+			cpy := *alert
+			resolved = append(resolved, &cpy)
+			if m.OnAlertResolved != nil {
+				go m.OnAlertResolved(&cpy)
+			}
+		}
+	}
+
+	return resolved
+}
+
 // GetActiveAlerts returns all currently active (firing or acknowledged) alerts.
 func (m *Manager) GetActiveAlerts() []*Alert {
 	m.mu.RLock()
