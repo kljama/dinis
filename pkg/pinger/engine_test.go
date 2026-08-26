@@ -118,3 +118,63 @@ func TestEngineMinMaxAvgLatencyProgression(t *testing.T) {
 	}
 }
 
+func TestEngineBeforeStateChangeHook(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.FailThreshold = 1
+	engine := NewEngine(cfg)
+
+	hosts := map[string]*HostState{
+		"127.0.0.1": {
+			IP:     "127.0.0.1",
+			CIDR:   "127.0.0.1/32",
+			Status: StatusPending,
+		},
+	}
+	engine.SetHosts(hosts)
+
+	var beforeCalled, afterCalled bool
+	var beforeOldStatus, beforeNewStatus HostStatus
+	var observedAlertInAfter bool
+
+	engine.BeforeStateChange = func(host *HostState, oldStatus, newStatus HostStatus) {
+		beforeCalled = true
+		beforeOldStatus = oldStatus
+		beforeNewStatus = newStatus
+		if newStatus == StatusUp {
+			host.AlertActive = false
+			host.AlertID = "custom-id"
+		}
+	}
+
+	engine.OnStateChange = func(host *HostState, oldStatus, newStatus HostStatus) {
+		afterCalled = true
+		if host.AlertID == "custom-id" {
+			observedAlertInAfter = true
+		}
+	}
+
+	// 1st probe: Pending -> Up
+	res := engine.PingSingle(context.Background(), "127.0.0.1")
+	if !res.Success {
+		t.Fatalf("expected probe success")
+	}
+
+	if !beforeCalled {
+		t.Errorf("expected BeforeStateChange to be called")
+	}
+	if beforeOldStatus != StatusPending || beforeNewStatus != StatusUp {
+		t.Errorf("expected Pending->Up, got %v->%v", beforeOldStatus, beforeNewStatus)
+	}
+	if !afterCalled {
+		t.Errorf("expected OnStateChange to be called")
+	}
+	if !observedAlertInAfter {
+		t.Errorf("expected mutations from BeforeStateChange to be visible in OnStateChange")
+	}
+
+	h, ok := engine.GetHost("127.0.0.1")
+	if !ok || h.AlertID != "custom-id" {
+		t.Errorf("expected GetHost to return canonical state updated by BeforeStateChange, got %+v", h)
+	}
+}
+

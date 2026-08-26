@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -512,6 +514,73 @@ func TestSSEClientBufferOverflowDesync(t *testing.T) {
 	}
 }
 
+func TestConcurrentBroadcastEventBufferOverflow(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Register 5 clients with tiny buffers
+	const numClients = 5
+	clients := make([]chan []byte, numClients)
+	coord.clientsMu.Lock()
+	for i := 0; i < numClients; i++ {
+		clients[i] = make(chan []byte, 3)
+		coord.sseClients[clients[i]] = true
+	}
+	coord.clientsMu.Unlock()
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// Spawn 10 concurrent broadcasting goroutines hammering events
+	for w := 0; w < 10; w++ {
+		workerID := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			seq := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				seq++
+				coord.broadcastEvent("concurrent_event", map[string]interface{}{
+					"worker": workerID,
+					"seq":    seq,
+				})
+			}
+		}()
+	}
+
+	// Concurrently read from some clients slowly
+	for i := 0; i < numClients; i++ {
+		ch := clients[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case msg, ok := <-ch:
+					if !ok {
+						return
+					}
+					if len(msg) == 0 {
+						t.Errorf("received empty message from SSE client channel")
+					}
+					time.Sleep(1 * time.Millisecond)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+
 func TestHostDetailOrActionInvalidIPValidation(t *testing.T) {
 	srv, _, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -741,6 +810,216 @@ func TestConcurrentRebuildAndStateChange(t *testing.T) {
 	wg.Wait()
 	_ = srv
 }
+
+func TestHostStateChangeAlertConsistency(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	_ = srv
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:    "10.10.0.0/24",
+		Enabled: true,
+	})
+
+	var hosts []store.DiscoveredHost
+	now := time.Now()
+	for i := 1; i <= 20; i++ {
+		hosts = append(hosts, store.DiscoveredHost{
+			IP:             fmt.Sprintf("10.10.0.%d", i),
+			CIDR:           "10.10.0.0/24",
+			DiscoveredAt:   now,
+			LastDiscovered: now,
+		})
+	}
+	_ = coord.store.AddOrUpdateDiscoveredHostsBatch(hosts)
+	coord.RebuildTargetList()
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var inconsistencyCount int64
+
+	// Concurrent writers simulating state transitions
+	for w := 0; w < 4; w++ {
+		workerID := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			i := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				i++
+				ip := fmt.Sprintf("10.10.0.%d", (workerID+i)%20+1)
+				if i%2 == 0 {
+					// Simulate transition to Down
+					h, ok := coord.pinger.GetHost(ip)
+					if ok {
+						coord.handleStateChange(h, pinger.StatusUp, pinger.StatusDown)
+					}
+				} else {
+					// Simulate transition to Up
+					h, ok := coord.pinger.GetHost(ip)
+					if ok {
+						coord.handleStateChange(h, pinger.StatusDown, pinger.StatusUp)
+					}
+				}
+			}
+		}()
+	}
+
+	// Concurrent readers inspecting state consistency
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				allHosts := coord.pinger.GetAllHosts()
+				for _, h := range allHosts {
+					if h.Status == pinger.StatusDown && !h.AlertActive {
+						atomic.AddInt64(&inconsistencyCount, 1)
+					}
+					if h.Status == pinger.StatusUp && h.AlertActive {
+						atomic.AddInt64(&inconsistencyCount, 1)
+					}
+				}
+
+				summary := coord.pinger.GetSummary()
+				if summary.DownCount > 0 && summary.AlertsActive == 0 {
+					atomic.AddInt64(&inconsistencyCount, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if inconsistencyCount > 0 {
+		t.Fatalf("Detected %d inconsistent host/alert state reads during concurrent state changes", inconsistencyCount)
+	}
+}
+
+func TestCoordinatorStopPersistsPartialDiscovery(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	_ = srv
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:    "127.0.0.0/24",
+		Enabled: true,
+	})
+
+	coord.Start()
+
+	// Trigger async discovery sweep
+	coord.TriggerDiscovery("127.0.0.0/24")
+
+	// Wait briefly for discovery to start and probe some hosts
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop coordinator in the middle of discovery sweep
+	coord.Stop()
+
+	// Verify discovery scanning status is reset to false
+	status := coord.GetDiscoveryStatus()
+	if status.IsScanning {
+		t.Errorf("expected IsScanning to be false after Stop(), got true")
+	}
+
+	// Verify store can be read and any discovered hosts were persisted
+	discovered := coord.store.GetDiscoveredHosts()
+	// Loopback 127.0.0.1 responds to ICMP and should be discovered
+	if host, exists := discovered["127.0.0.1"]; exists {
+		if host.IP != "127.0.0.1" {
+			t.Errorf("unexpected host IP: %v", host.IP)
+		}
+	}
+}
+
+func TestAlertHistoryEndpointAndLifecycle(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Initial history should be empty
+	req := httptest.NewRequest(http.MethodGet, "/api/alerts/history", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+	var hist []map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&hist); err != nil {
+		t.Fatalf("failed to decode alert history JSON: %v", err)
+	}
+	if len(hist) != 0 {
+		t.Fatalf("expected 0 initial alert history, got %d", len(hist))
+	}
+
+	// Trigger alert by setting host 10.0.0.5 to DOWN
+	h := &pinger.HostState{
+		IP:     "10.0.0.5",
+		CIDR:   "10.0.0.0/24",
+		Status: pinger.StatusDown,
+	}
+	coord.handleStateChange(h, pinger.StatusUp, pinger.StatusDown)
+
+	// Verify active alerts
+	wActive := httptest.NewRecorder()
+	srv.mux.ServeHTTP(wActive, httptest.NewRequest(http.MethodGet, "/api/alerts", nil))
+	var active []map[string]interface{}
+	_ = json.NewDecoder(wActive.Body).Decode(&active)
+	if len(active) != 1 || active[0]["ip"] != "10.0.0.5" {
+		t.Fatalf("expected 1 active alert for 10.0.0.5, got %+v", active)
+	}
+
+	// Resolve alert by setting host 10.0.0.5 back to UP
+	hUp := &pinger.HostState{
+		IP:     "10.0.0.5",
+		CIDR:   "10.0.0.0/24",
+		Status: pinger.StatusUp,
+	}
+	coord.handleStateChange(hUp, pinger.StatusDown, pinger.StatusUp)
+
+	// Verify history now contains the resolved incident
+	wHist := httptest.NewRecorder()
+	srv.mux.ServeHTTP(wHist, httptest.NewRequest(http.MethodGet, "/api/alerts/history", nil))
+	if wHist.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", wHist.Code)
+	}
+	if err := json.NewDecoder(wHist.Body).Decode(&hist); err != nil {
+		t.Fatalf("failed to decode alert history JSON: %v", err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("expected 1 resolved alert in history, got %d", len(hist))
+	}
+	if hist[0]["ip"] != "10.0.0.5" {
+		t.Errorf("expected IP 10.0.0.5, got %v", hist[0]["ip"])
+	}
+	if hist[0]["state"] != "RESOLVED" {
+		t.Errorf("expected state RESOLVED, got %v", hist[0]["state"])
+	}
+	if hist[0]["resolvedAt"] == nil {
+		t.Errorf("expected non-nil resolvedAt")
+	}
+
+	// Method Not Allowed test
+	wPost := httptest.NewRecorder()
+	srv.mux.ServeHTTP(wPost, httptest.NewRequest(http.MethodPost, "/api/alerts/history", nil))
+	if wPost.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 Method Not Allowed, got %d", wPost.Code)
+	}
+}
+
 
 
 

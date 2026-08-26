@@ -100,9 +100,10 @@ type Engine struct {
 	hosts map[string]*HostState // IP -> HostState
 
 	// Callbacks
-	OnHostUpdated   func(host *HostState)
-	OnStateChange   func(host *HostState, oldStatus, newStatus HostStatus)
-	OnCycleComplete func(summary *CycleSummary)
+	BeforeStateChange func(host *HostState, oldStatus, newStatus HostStatus)
+	OnHostUpdated     func(host *HostState)
+	OnStateChange     func(host *HostState, oldStatus, newStatus HostStatus)
+	OnCycleComplete   func(summary *CycleSummary)
 
 	wakeChan chan struct{}
 
@@ -373,6 +374,9 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 		e.applyResult(h, res)
 		if h.Status != oldStatus {
 			statusChanged = true
+			if e.BeforeStateChange != nil {
+				e.BeforeStateChange(h, oldStatus, h.Status)
+			}
 		}
 		cpy := *h
 		cpy.LatencyHistory = append([]float64(nil), h.LatencyHistory...)
@@ -500,6 +504,10 @@ func (e *Engine) runCycle() {
 				e.applyResult(h, res)
 				newStatus := h.Status
 				statusChanged := (oldStatus != newStatus)
+
+				if statusChanged && e.BeforeStateChange != nil {
+					e.BeforeStateChange(h, oldStatus, newStatus)
+				}
 
 				cpy := *h
 				cpy.LatencyHistory = append([]float64(nil), h.LatencyHistory...)

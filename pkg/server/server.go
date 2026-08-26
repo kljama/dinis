@@ -44,11 +44,13 @@ type Coordinator struct {
 	rebuildMu  sync.Mutex
 	store      *store.Store
 	pinger     *pinger.Engine
-	alerts     *alerts.Manager
-	clientsMu  sync.RWMutex
-	sseClients map[chan []byte]bool
-	stopChan   chan struct{}
-	stopOnce   sync.Once
+	alerts      *alerts.Manager
+	broadcastMu sync.Mutex
+	clientsMu   sync.RWMutex
+	sseClients  map[chan []byte]bool
+	stopChan    chan struct{}
+	stopOnce    sync.Once
+	wg          sync.WaitGroup
 
 	discMu          sync.RWMutex
 	discoveryStatus DiscoveryStatus
@@ -80,6 +82,7 @@ func NewCoordinator(st *store.Store) *Coordinator {
 	}
 
 	// Wire engine callbacks
+	p.BeforeStateChange = c.handleBeforeStateChange
 	p.OnStateChange = c.handleStateChange
 	p.OnHostUpdated = c.handleHostUpdated
 	p.OnCycleComplete = c.handleCycleComplete
@@ -104,15 +107,23 @@ func NewCoordinator(st *store.Store) *Coordinator {
 // Start begins background monitoring and heartbeat routines.
 func (c *Coordinator) Start() {
 	c.pinger.Start()
-	go c.heartbeatLoop()
-	go c.discoveryLoop()
+	c.wg.Add(2)
+	go func() {
+		defer c.wg.Done()
+		c.heartbeatLoop()
+	}()
+	go func() {
+		defer c.wg.Done()
+		c.discoveryLoop()
+	}()
 }
 
-// Stop gracefully terminates all subsystems.
+// Stop gracefully terminates all subsystems and persists all state.
 func (c *Coordinator) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopChan)
 		c.pinger.Stop()
+		c.wg.Wait()
 
 		c.clientsMu.Lock()
 		for ch := range c.sseClients {
@@ -407,17 +418,23 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 		}
 	}
 
+	aborted := false
+feeder:
 	for _, t := range targets {
 		select {
 		case <-c.stopChan:
-			close(workChan)
-			wg.Wait()
-			return 0, 0, nil
+			aborted = true
+			break feeder
 		case workChan <- t:
 		}
 
 		if discPace > 0 {
-			time.Sleep(discPace)
+			select {
+			case <-c.stopChan:
+				aborted = true
+				break feeder
+			case <-time.After(discPace):
+			}
 		}
 	}
 	close(workChan)
@@ -425,11 +442,18 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 	wg.Wait()
 
 	// Batch-write all discovered hosts to disk in a single atomic operation,
-	// instead of N individual writes during the sweep.
+	// ensuring any partially-discovered hosts are persisted even during shutdown.
 	if len(discoveredBatch) > 0 {
 		if err := c.store.AddOrUpdateDiscoveredHostsBatch(discoveredBatch); err != nil {
 			log.Printf("[DINIS] Error persisting discovered hosts batch to disk: %v", err)
 		}
+	}
+
+	if aborted {
+		c.discMu.Lock()
+		c.discoveryStatus.IsScanning = false
+		c.discMu.Unlock()
+		return discoveredOnline, newDiscovered, nil
 	}
 
 	// Rebuild target list so newly discovered hosts are immediately monitored
@@ -463,7 +487,9 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 
 // TriggerDiscovery initiates a discovery sweep asynchronously.
 func (c *Coordinator) TriggerDiscovery(specificCIDR string) {
+	c.wg.Add(1)
 	go func() {
+		defer c.wg.Done()
 		if _, _, err := c.RunDiscovery(specificCIDR); err != nil {
 			log.Printf("[DINIS] Triggered discovery sweep error: %v", err)
 		}
@@ -479,7 +505,11 @@ func (c *Coordinator) GetDiscoveryStatus() DiscoveryStatus {
 
 func (c *Coordinator) discoveryLoop() {
 	// Run initial discovery sweep on startup after a 500ms warmup
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-c.stopChan:
+		return
+	case <-time.After(500 * time.Millisecond):
+	}
 	settings := c.store.GetSettings()
 	if settings.AutoDiscovery {
 		if _, _, err := c.RunDiscovery(""); err != nil {
@@ -518,7 +548,7 @@ func (c *Coordinator) discoveryLoop() {
 	}
 }
 
-func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatus pinger.HostStatus) {
+func (c *Coordinator) handleBeforeStateChange(h *pinger.HostState, oldStatus, newStatus pinger.HostStatus) {
 	switch newStatus {
 	case pinger.StatusDown:
 		alt := c.alerts.Trigger(h.IP, h.Alias, h.CIDR, h.LastError)
@@ -529,7 +559,6 @@ func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatu
 		h.AlertAckNote = alt.AckNote
 		h.AlertAckAt = alt.AcknowledgedAt
 		h.AlertStartedAt = &alt.StartedAt
-		c.pinger.SetHostAlertState(h.IP, true, alt.ID, alt.Acknowledged, alt.AcknowledgedBy, alt.AckNote, alt.AcknowledgedAt, &alt.StartedAt)
 	case pinger.StatusUp, pinger.StatusExcluded:
 		c.alerts.Resolve(h.IP)
 		h.AlertActive = false
@@ -539,7 +568,20 @@ func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatu
 		h.AlertAckNote = ""
 		h.AlertAckAt = nil
 		h.AlertStartedAt = nil
-		c.pinger.SetHostAlertState(h.IP, false, "", false, "", "", nil, nil)
+	}
+}
+
+func (c *Coordinator) hasActiveAlert(ip string) bool {
+	_, exists := c.alerts.GetAlertForIP(ip)
+	return exists
+}
+
+func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatus pinger.HostStatus) {
+	// If called standalone outside the engine probe cycle (e.g. in manual calls/tests),
+	// ensure alert manager and engine host state are synchronized.
+	if (newStatus == pinger.StatusDown && !h.AlertActive) || ((newStatus == pinger.StatusUp || newStatus == pinger.StatusExcluded) && (h.AlertActive || c.hasActiveAlert(h.IP))) {
+		c.handleBeforeStateChange(h, oldStatus, newStatus)
+		c.pinger.SetHostAlertState(h.IP, h.AlertActive, h.AlertID, h.AlertAcknowledged, h.AlertAckBy, h.AlertAckNote, h.AlertAckAt, h.AlertStartedAt)
 	}
 
 	c.broadcastEvent("host_state_change", map[string]interface{}{
@@ -571,22 +613,28 @@ func (c *Coordinator) broadcastEvent(eventType string, data interface{}) {
 	msg := fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, string(payload))
 	msgBytes := []byte(msg)
 
+	c.broadcastMu.Lock()
+	defer c.broadcastMu.Unlock()
+
 	c.clientsMu.RLock()
 	defer c.clientsMu.RUnlock()
+
+	desyncMsg := []byte("event: desync\ndata: {\"reason\":\"buffer_overflow\",\"message\":\"Client fell behind; refresh required\"}\n\n")
 
 	for ch := range c.sseClients {
 		select {
 		case ch <- msgBytes:
 		default:
-			// Client channel is full/slow. Drain stale queued messages and queue a desync event
-			// so the client knows it fell behind and needs a full state refresh.
-			for len(ch) > 0 {
+			// Client channel is full/slow. Drain stale queued messages until channel is empty.
+		drainLoop:
+			for {
 				select {
 				case <-ch:
 				default:
+					break drainLoop
 				}
 			}
-			desyncMsg := []byte("event: desync\ndata: {\"reason\":\"buffer_overflow\",\"message\":\"Client fell behind; refresh required\"}\n\n")
+			// Queue a single desync event so the client knows it fell behind and needs a full state refresh.
 			select {
 			case ch <- desyncMsg:
 			default:
@@ -605,6 +653,7 @@ func (c *Coordinator) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			pingMsg := []byte(": keepalive\n\n")
+			c.broadcastMu.Lock()
 			c.clientsMu.RLock()
 			for ch := range c.sseClients {
 				select {
@@ -613,6 +662,7 @@ func (c *Coordinator) heartbeatLoop() {
 				}
 			}
 			c.clientsMu.RUnlock()
+			c.broadcastMu.Unlock()
 		}
 	}
 }

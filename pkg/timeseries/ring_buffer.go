@@ -29,7 +29,7 @@ func NewHostRingBuffer(capacity int) *HostRingBuffer {
 		capacity = 120 // Default ~10-20 minutes of samples at standard probe intervals
 	}
 	return &HostRingBuffer{
-		samples:  make([]RawSample, capacity),
+		samples:  make([]RawSample, 0, 8),
 		capacity: capacity,
 	}
 }
@@ -39,11 +39,20 @@ func (rb *HostRingBuffer) Push(timestamp time.Time, latencyMs float64, success b
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	rb.samples[rb.head] = RawSample{
+	sample := RawSample{
 		Timestamp: timestamp,
 		LatencyMs: latencyMs,
 		Success:   success,
 	}
+
+	if len(rb.samples) < rb.capacity {
+		rb.samples = append(rb.samples, sample)
+		rb.count = len(rb.samples)
+		rb.head = (rb.head + 1) % rb.capacity
+		return
+	}
+
+	rb.samples[rb.head] = sample
 	rb.head = (rb.head + 1) % rb.capacity
 	if rb.count < rb.capacity {
 		rb.count++
@@ -55,13 +64,13 @@ func (rb *HostRingBuffer) GetAll() []RawSample {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 
-	if rb.count == 0 {
+	if len(rb.samples) == 0 {
 		return nil
 	}
 
-	result := make([]RawSample, rb.count)
-	if rb.count < rb.capacity {
-		copy(result, rb.samples[:rb.count])
+	result := make([]RawSample, len(rb.samples))
+	if len(rb.samples) < rb.capacity {
+		copy(result, rb.samples)
 		return result
 	}
 

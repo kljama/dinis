@@ -196,4 +196,39 @@ func TestStoreNullJSONDeserialization(t *testing.T) {
 	}
 }
 
+func TestSaveUnsafeTmpFileCleanupOnRenameError(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dinis_rename_fail_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "data.json")
+	s, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	// Remove original file and create a non-empty directory with the same name,
+	// causing os.Rename(tmpFile, dbPath) to fail.
+	_ = os.Remove(dbPath)
+	if err := os.Mkdir(dbPath, 0755); err != nil {
+		t.Fatalf("failed to create directory in place of file: %v", err)
+	}
+	// Add a dummy file inside dbPath so it's a non-empty directory (ensures EISDIR / ENOTEMPTY on rename)
+	_ = os.WriteFile(filepath.Join(dbPath, "dummy"), []byte("data"), 0644)
+
+	// Attempt saveUnsafe, which will fail during Rename
+	err = s.saveUnsafe()
+	if err == nil {
+		t.Fatalf("expected saveUnsafe to fail when renaming file onto a non-empty directory")
+	}
+
+	// Verify that the .tmp file was deleted and not left orphaned
+	tmpFile := dbPath + ".tmp"
+	if _, statErr := os.Stat(tmpFile); !os.IsNotExist(statErr) {
+		t.Errorf("expected tmp file %s to be cleaned up, but it still exists (statErr=%v)", tmpFile, statErr)
+	}
+}
+
 

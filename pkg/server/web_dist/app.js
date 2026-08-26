@@ -374,11 +374,12 @@
         tab.classList.add('active');
         const tabName = tab.dataset.tab;
         if (tabName === 'activeAlerts') {
-          el.activeAlertsList.style.display = 'flex';
-          el.alertHistoryList.style.display = 'none';
+          if (el.tabActiveAlerts) el.tabActiveAlerts.style.display = 'block';
+          if (el.tabAlertHistory) el.tabAlertHistory.style.display = 'none';
+          fetchAlerts();
         } else {
-          el.activeAlertsList.style.display = 'none';
-          el.alertHistoryList.style.display = 'flex';
+          if (el.tabActiveAlerts) el.tabActiveAlerts.style.display = 'none';
+          if (el.tabAlertHistory) el.tabAlertHistory.style.display = 'block';
           fetchAlertHistory();
         }
       });
@@ -529,6 +530,7 @@
 
     sse.addEventListener('alert_resolved', () => {
       fetchAlerts();
+      fetchAlertHistory();
       fetchOutliers();
       fetchSummary();
     });
@@ -1519,7 +1521,17 @@
 
   function openAlertsDrawer() {
     el.alertsDrawer.style.display = 'flex';
-    renderAlertsDrawer();
+    const activeTab = document.querySelector('.drawer-tab.active');
+    const tabName = activeTab ? activeTab.dataset.tab : 'activeAlerts';
+    if (tabName === 'alertHistory') {
+      if (el.tabActiveAlerts) el.tabActiveAlerts.style.display = 'none';
+      if (el.tabAlertHistory) el.tabAlertHistory.style.display = 'block';
+      fetchAlertHistory();
+    } else {
+      if (el.tabActiveAlerts) el.tabActiveAlerts.style.display = 'block';
+      if (el.tabAlertHistory) el.tabAlertHistory.style.display = 'none';
+      renderAlertsDrawer();
+    }
   }
 
   function closeAlertsDrawer() {
@@ -1579,7 +1591,7 @@
 
   function renderAlertHistory() {
     el.alertHistoryList.innerHTML = '';
-    if (state.alertHistory.length === 0) {
+    if (!state.alertHistory || state.alertHistory.length === 0) {
       el.alertHistoryList.innerHTML = `
         <div class="empty-state" style="padding: 2rem 0;">
           <p>No past incident history recorded yet.</p>
@@ -1598,8 +1610,10 @@
           <span class="status-pill pill-up">RESOLVED</span>
         </div>
         <div class="alert-meta">
+          <span>Target: <strong>${escapeHtml(alt.alias || alt.cidr || 'Single IP')}</strong></span>
           <span>Outage Duration: <strong>${formatDuration(alt.durationSec)}</strong></span>
           <span>Resolved At: <strong>${alt.resolvedAt ? new Date(alt.resolvedAt).toLocaleTimeString() : 'Recently'}</strong></span>
+          <span>Reason: <span class="text-down">${escapeHtml(alt.lastError || 'ICMP Request timeout')}</span></span>
         </div>
       `;
       el.alertHistoryList.appendChild(item);

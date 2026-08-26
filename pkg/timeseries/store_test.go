@@ -1,6 +1,7 @@
 package timeseries
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -321,6 +322,156 @@ func BenchmarkStoreRecord(b *testing.B) {
 
 	for b.Loop() {
 		st.Record("192.168.1.50", now, 5.2, true)
+	}
+}
+
+func TestHostRingBufferDynamicGrowthAndWrap(t *testing.T) {
+	rb := NewHostRingBuffer(5)
+	if rb.GetAll() != nil {
+		t.Fatalf("expected nil for empty buffer")
+	}
+
+	now := time.Now()
+	// Push 1
+	rb.Push(now, 10.0, true)
+	if len(rb.GetAll()) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(rb.GetAll()))
+	}
+	if rb.GetAll()[0].LatencyMs != 10.0 {
+		t.Errorf("expected 10.0, got %f", rb.GetAll()[0].LatencyMs)
+	}
+
+	// Push up to capacity 5
+	for i := 2; i <= 5; i++ {
+		rb.Push(now.Add(time.Duration(i)*time.Second), float64(i*10), true)
+	}
+	samples := rb.GetAll()
+	if len(samples) != 5 {
+		t.Fatalf("expected 5 samples, got %d", len(samples))
+	}
+	for i, s := range samples {
+		expected := float64((i + 1) * 10)
+		if s.LatencyMs != expected {
+			t.Errorf("samples[%d] expected %f, got %f", i, expected, s.LatencyMs)
+		}
+	}
+
+	// Push 6th sample (overwrites oldest 10.0 with 60.0)
+	rb.Push(now.Add(6*time.Second), 60.0, true)
+	samples = rb.GetAll()
+	if len(samples) != 5 {
+		t.Fatalf("expected 5 samples after wrap, got %d", len(samples))
+	}
+	if samples[0].LatencyMs != 20.0 {
+		t.Errorf("expected oldest sample 20.0, got %f", samples[0].LatencyMs)
+	}
+	if samples[4].LatencyMs != 60.0 {
+		t.Errorf("expected newest sample 60.0, got %f", samples[4].LatencyMs)
+	}
+}
+
+func TestRollupSeriesDynamicGrowthAndWrap(t *testing.T) {
+	rs := NewRollupSeries(3)
+	if rs.GetAll() != nil {
+		t.Fatalf("expected nil for empty series")
+	}
+
+	now := time.Now()
+	rs.Append(RollupPoint{Timestamp: now, AvgLatencyMs: 1.0})
+	if len(rs.GetAll()) != 1 {
+		t.Fatalf("expected 1 point, got %d", len(rs.GetAll()))
+	}
+
+	rs.Append(RollupPoint{Timestamp: now.Add(time.Minute), AvgLatencyMs: 2.0})
+	rs.Append(RollupPoint{Timestamp: now.Add(2 * time.Minute), AvgLatencyMs: 3.0})
+
+	pts := rs.GetAll()
+	if len(pts) != 3 {
+		t.Fatalf("expected 3 points, got %d", len(pts))
+	}
+	if pts[0].AvgLatencyMs != 1.0 || pts[2].AvgLatencyMs != 3.0 {
+		t.Errorf("unexpected points: %+v", pts)
+	}
+
+	// Append 4th point (circular wrap)
+	rs.Append(RollupPoint{Timestamp: now.Add(3 * time.Minute), AvgLatencyMs: 4.0})
+	pts = rs.GetAll()
+	if len(pts) != 3 {
+		t.Fatalf("expected 3 points after wrap, got %d", len(pts))
+	}
+	if pts[0].AvgLatencyMs != 2.0 || pts[1].AvgLatencyMs != 3.0 || pts[2].AvgLatencyMs != 4.0 {
+		t.Errorf("unexpected points after wrap: %+v", pts)
+	}
+}
+
+func TestStoreLRUEvictionAndMaxHostsLimit(t *testing.T) {
+	st := NewStoreWithLimit(3)
+	now := time.Now()
+
+	// Insert host 1, 2, 3
+	st.Record("10.0.0.1", now, 1.0, true)
+	st.Record("10.0.0.2", now, 2.0, true)
+	st.Record("10.0.0.3", now, 3.0, true)
+
+	// Access host 1 to make it most recently used (LRU order becomes: 2, 3, 1)
+	st.Record("10.0.0.1", now.Add(time.Second), 1.5, true)
+
+	// Insert host 4 -> host 2 should be evicted
+	st.Record("10.0.0.4", now, 4.0, true)
+
+	if len(st.GetRecentRawSamples("10.0.0.2", 10)) != 0 {
+		t.Errorf("expected 10.0.0.2 to be evicted by LRU")
+	}
+	if len(st.GetRecentRawSamples("10.0.0.1", 10)) != 2 {
+		t.Errorf("expected 10.0.0.1 to remain in store with 2 samples")
+	}
+	if len(st.GetRecentRawSamples("10.0.0.3", 10)) != 1 {
+		t.Errorf("expected 10.0.0.3 to remain in store")
+	}
+	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 1 {
+		t.Errorf("expected 10.0.0.4 to be present in store")
+	}
+
+	// RemoveHost
+	st.RemoveHost("10.0.0.3")
+	if len(st.GetRecentRawSamples("10.0.0.3", 10)) != 0 {
+		t.Errorf("expected 10.0.0.3 to be removed")
+	}
+
+	// PruneHosts
+	st.PruneHosts(map[string]bool{"10.0.0.4": true})
+	if len(st.GetRecentRawSamples("10.0.0.1", 10)) != 0 {
+		t.Errorf("expected 10.0.0.1 to be pruned")
+	}
+	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 1 {
+		t.Errorf("expected 10.0.0.4 to remain after pruning")
+	}
+}
+
+func TestStoreMassiveHostIngestionBoundedMemory(t *testing.T) {
+	st := NewStoreWithLimit(100)
+	now := time.Now()
+
+	// Ingest 5000 distinct hosts
+	for i := 1; i <= 5000; i++ {
+		ip := fmt.Sprintf("172.16.%d.%d", (i/256)%256, i%256)
+		st.Record(ip, now, 5.0, true)
+	}
+
+	st.mu.RLock()
+	rawLen := len(st.rawBuffers)
+	lruLen := st.lruList.Len()
+	indexLen := len(st.lruIndex)
+	st.mu.RUnlock()
+
+	if rawLen != 100 {
+		t.Errorf("expected rawBuffers capped at 100, got %d", rawLen)
+	}
+	if lruLen != 100 {
+		t.Errorf("expected lruList length 100, got %d", lruLen)
+	}
+	if indexLen != 100 {
+		t.Errorf("expected lruIndex length 100, got %d", indexLen)
 	}
 }
 

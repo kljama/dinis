@@ -198,7 +198,7 @@ func NewRollupSeries(capacity int) *RollupSeries {
 		capacity = 1440 // e.g. 24 hours of 1-minute rollups
 	}
 	return &RollupSeries{
-		points:   make([]RollupPoint, capacity),
+		points:   make([]RollupPoint, 0, 8),
 		capacity: capacity,
 	}
 }
@@ -207,6 +207,13 @@ func NewRollupSeries(capacity int) *RollupSeries {
 func (rs *RollupSeries) Append(point RollupPoint) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+
+	if len(rs.points) < rs.capacity {
+		rs.points = append(rs.points, point)
+		rs.count = len(rs.points)
+		rs.head = (rs.head + 1) % rs.capacity
+		return
+	}
 
 	rs.points[rs.head] = point
 	rs.head = (rs.head + 1) % rs.capacity
@@ -220,13 +227,13 @@ func (rs *RollupSeries) GetAll() []RollupPoint {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 
-	if rs.count == 0 {
+	if len(rs.points) == 0 {
 		return nil
 	}
 
-	result := make([]RollupPoint, rs.count)
-	if rs.count < rs.capacity {
-		copy(result, rs.points[:rs.count])
+	result := make([]RollupPoint, len(rs.points))
+	if len(rs.points) < rs.capacity {
+		copy(result, rs.points)
 		return result
 	}
 

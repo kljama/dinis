@@ -177,10 +177,12 @@ func (s *Store) saveUnsafe() error {
 
 	tmpFile := s.filePath + ".tmp"
 	if err := os.WriteFile(tmpFile, raw, 0644); err != nil {
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to write tmp file: %w", err)
 	}
 
 	if err := os.Rename(tmpFile, s.filePath); err != nil {
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to atomic rename tmp file: %w", err)
 	}
 

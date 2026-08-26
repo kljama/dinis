@@ -1,6 +1,7 @@
 package timeseries
 
 import (
+	"container/list"
 	"context"
 	"encoding/binary"
 	"math"
@@ -50,24 +51,40 @@ type SubnetMatrixBlock struct {
 	Cells         []SubnetMatrixCell `json:"cells"`
 }
 
+const DefaultMaxHosts = 5000
+
 // Store manages in-memory multi-tier time-series metric retention and rollups for all IPs.
 type Store struct {
 	mu           sync.RWMutex
+	maxHosts     int
 	rawBuffers   map[string]*HostRingBuffer
 	minuteSeries map[string]*RollupSeries
 	hourSeries   map[string]*RollupSeries
+	lruList      *list.List
+	lruIndex     map[string]*list.Element
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-// NewStore creates a new time-series metric store.
+// NewStore creates a new time-series metric store with default host limit (5,000 hosts).
 func NewStore() *Store {
+	return NewStoreWithLimit(DefaultMaxHosts)
+}
+
+// NewStoreWithLimit creates a new time-series metric store with a custom max host capacity.
+func NewStoreWithLimit(maxHosts int) *Store {
+	if maxHosts <= 0 {
+		maxHosts = DefaultMaxHosts
+	}
 	return &Store{
+		maxHosts:     maxHosts,
 		rawBuffers:   make(map[string]*HostRingBuffer),
 		minuteSeries: make(map[string]*RollupSeries),
 		hourSeries:   make(map[string]*RollupSeries),
+		lruList:      list.New(),
+		lruIndex:     make(map[string]*list.Element),
 	}
 }
 
@@ -101,19 +118,30 @@ func (s *Store) Stop() {
 }
 
 func (s *Store) getOrCreateRawBuffer(ip string) *HostRingBuffer {
-	s.mu.RLock()
-	rb, ok := s.rawBuffers[ip]
-	s.mu.RUnlock()
-	if ok {
-		return rb
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if rb, ok := s.rawBuffers[ip]; ok {
-		return rb
+
+	if elem, ok := s.lruIndex[ip]; ok {
+		s.lruList.MoveToFront(elem)
+		return s.rawBuffers[ip]
 	}
-	rb = NewHostRingBuffer(120) // ~10-20 min raw memory window
+
+	// Evict least-recently-used host if at capacity
+	if s.lruList.Len() >= s.maxHosts {
+		oldest := s.lruList.Back()
+		if oldest != nil {
+			oldestIP := oldest.Value.(string)
+			s.lruList.Remove(oldest)
+			delete(s.lruIndex, oldestIP)
+			delete(s.rawBuffers, oldestIP)
+			delete(s.minuteSeries, oldestIP)
+			delete(s.hourSeries, oldestIP)
+		}
+	}
+
+	elem := s.lruList.PushFront(ip)
+	s.lruIndex[ip] = elem
+	rb := NewHostRingBuffer(120) // ~10-20 min raw memory window
 	s.rawBuffers[ip] = rb
 	return rb
 }
@@ -164,6 +192,10 @@ func (s *Store) Record(ip string, timestamp time.Time, latencyMs float64, succes
 func (s *Store) RemoveHost(ip string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if elem, ok := s.lruIndex[ip]; ok {
+		s.lruList.Remove(elem)
+		delete(s.lruIndex, ip)
+	}
 	delete(s.rawBuffers, ip)
 	delete(s.minuteSeries, ip)
 	delete(s.hourSeries, ip)
@@ -217,8 +249,22 @@ func (s *Store) PruneHosts(activeIPs map[string]bool) {
 
 	for ip := range s.rawBuffers {
 		if !activeIPs[ip] {
+			if elem, ok := s.lruIndex[ip]; ok {
+				s.lruList.Remove(elem)
+				delete(s.lruIndex, ip)
+			}
 			delete(s.rawBuffers, ip)
 			delete(s.minuteSeries, ip)
+			delete(s.hourSeries, ip)
+		}
+	}
+	for ip := range s.minuteSeries {
+		if !activeIPs[ip] {
+			delete(s.minuteSeries, ip)
+		}
+	}
+	for ip := range s.hourSeries {
+		if !activeIPs[ip] {
 			delete(s.hourSeries, ip)
 		}
 	}

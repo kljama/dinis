@@ -133,6 +133,7 @@ body {
   letter-spacing: 0.05em;
   background: linear-gradient(90deg, #fff, #93c5fd);
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 
@@ -1313,6 +1314,11 @@ body {
 
 .alert-item.acknowledged {
   border-color: rgba(245, 158, 11, 0.3);
+}
+
+.alert-item.resolved {
+  border-color: rgba(34, 197, 94, 0.3);
+  background: linear-gradient(90deg, rgba(34, 197, 94, 0.05) 0%, rgba(16, 25, 44, 0.8) 100%);
 }
 
 .alert-item-header {
