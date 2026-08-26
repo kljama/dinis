@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 )
 
 // CIDRInfo contains parsed details about a CIDR block.
@@ -68,7 +69,7 @@ func ParseCIDR(input string, includeNetAndBcast bool) (*CIDRInfo, error) {
 	start := binary.BigEndian.Uint32(ip4)
 	mask := binary.BigEndian.Uint32(net.IP(ipNet.Mask).To4())
 	broadcast := start | ^mask
-	total := int(broadcast - start + 1)
+	total := uint64(broadcast) - uint64(start) + 1
 
 	// Safety check to prevent allocating millions of IPs at once
 	if total > 65536 {
@@ -76,11 +77,12 @@ func ParseCIDR(input string, includeNetAndBcast bool) (*CIDRInfo, error) {
 	}
 
 	var ips []string
-	if ones == 32 {
+	switch ones {
+	case 32:
 		ips = append(ips, ip.String())
-	} else if ones == 31 {
+	case 31:
 		ips = append(ips, intToIP(start).String(), intToIP(broadcast).String())
-	} else {
+	default:
 		// For /30 or larger
 		first := start
 		last := broadcast
@@ -89,8 +91,10 @@ func ParseCIDR(input string, includeNetAndBcast bool) (*CIDRInfo, error) {
 			last = broadcast - 1
 		}
 		if first <= last {
-			for cur := first; cur <= last; cur++ {
-				ips = append(ips, intToIP(cur).String())
+			count := int(last - first + 1)
+			ips = make([]string, 0, count)
+			for i := 0; i < count; i++ {
+				ips = append(ips, intToIP(first+uint32(i)).String())
 			}
 		}
 	}
@@ -111,8 +115,9 @@ func intToIP(n uint32) net.IP {
 	return ip
 }
 
-// ExclusionMatcher checks whether a given IP matches any exclusion rules.
+// ExclusionMatcher checks whether a given IP matches any exclusion rules in a thread-safe manner.
 type ExclusionMatcher struct {
+	mu       sync.RWMutex
 	exactIPs map[string]string // ip -> reason
 	subnets  []subnetExclusion
 }
@@ -143,7 +148,9 @@ func (m *ExclusionMatcher) AddExclusion(rule string, reason string) error {
 		if ip == nil {
 			return fmt.Errorf("invalid IP address: %s", rule)
 		}
+		m.mu.Lock()
 		m.exactIPs[ip.String()] = reason
+		m.mu.Unlock()
 		return nil
 	}
 
@@ -152,17 +159,22 @@ func (m *ExclusionMatcher) AddExclusion(rule string, reason string) error {
 		return fmt.Errorf("invalid exclusion CIDR: %w", err)
 	}
 
+	m.mu.Lock()
 	m.subnets = append(m.subnets, subnetExclusion{
 		net:    ipNet,
 		reason: reason,
 		raw:    rule,
 	})
+	m.mu.Unlock()
 	return nil
 }
 
 // Matches checks if the given IP string matches any exclusion.
 // Returns matched bool, matchedRule, and reason.
 func (m *ExclusionMatcher) Matches(ipStr string) (bool, string, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	if reason, ok := m.exactIPs[ipStr]; ok {
 		return true, ipStr, reason
 	}

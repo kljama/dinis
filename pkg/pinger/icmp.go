@@ -2,8 +2,8 @@ package pinger
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/binary"
-	"math/rand"
 	"net"
 	"os/exec"
 	"strconv"
@@ -41,16 +41,29 @@ type PingResult struct {
 // SingleProber performs individual ICMP echo requests using native Linux ICMP datagram/raw sockets,
 // with graceful fallback to ping executable if needed.
 type SingleProber struct {
-	seq uint32
+	seq uint64
 	id  uint16
 	mu  sync.Mutex
 }
 
-// NewSingleProber creates a new prober.
+// NewSingleProber creates a new prober with cryptographically random ID and sequence counter.
 func NewSingleProber() *SingleProber {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var buf [10]byte
+	if _, err := crand.Read(buf[:]); err != nil {
+		now := time.Now().UnixNano()
+		binary.BigEndian.PutUint16(buf[0:2], uint16(now))
+		binary.BigEndian.PutUint64(buf[2:10], uint64(now))
+	}
+
+	id := binary.BigEndian.Uint16(buf[0:2])
+	if id == 0 {
+		id = 1
+	}
+	seq := binary.BigEndian.Uint64(buf[2:10])
+
 	return &SingleProber{
-		id: uint16(r.Intn(65535)),
+		id:  id,
+		seq: seq,
 	}
 }
 
@@ -121,8 +134,10 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 		Addr: dest,
 	}
 
-	seq := atomic.AddUint32(&p.seq, 1)
-	expectedSeq := uint16(seq)
+	seq := atomic.AddUint64(&p.seq, 1)
+	expectedID := uint16(p.id + uint16(seq>>16))
+	expectedSeq := uint16(seq & 0xffff)
+	probeToken := (uint64(p.id) << 48) | (seq & 0x0000FFFFFFFFFFFF)
 
 	// Standard 64-byte ICMP packet (8 bytes header + 56 bytes payload) matching standard Linux ping.
 	// Prevents firewalls / NAT middleboxes from dropping undersized packets.
@@ -131,11 +146,13 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 	pkt[1] = 0 // Code
 	pkt[2] = 0 // Checksum placeholder
 	pkt[3] = 0
-	binary.BigEndian.PutUint16(pkt[4:6], p.id)
+	binary.BigEndian.PutUint16(pkt[4:6], expectedID)
 	binary.BigEndian.PutUint16(pkt[6:8], expectedSeq)
 	sendTime := time.Now()
-	binary.BigEndian.PutUint64(pkt[8:16], uint64(sendTime.UnixNano()))
-	for i := 16; i < 64; i++ {
+	sendNano := uint64(sendTime.UnixNano())
+	binary.BigEndian.PutUint64(pkt[8:16], sendNano)
+	binary.BigEndian.PutUint64(pkt[16:24], probeToken)
+	for i := 24; i < 64; i++ {
 		pkt[i] = byte(i & 0xff)
 	}
 
@@ -210,13 +227,20 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 			continue
 		}
 
-		// Validate ICMP identifier matches our prober ID.
+		// Validate source IP strictly matches the target we pinged.
+		// Reject if from is nil, wrong type, or IP address does not match target.
+		sa4, ok := from.(*syscall.SockaddrInet4)
+		if !ok || !net.IP(sa4.Addr[:]).Equal(ip) {
+			continue
+		}
+
+		// Validate ICMP identifier matches our probe ID.
 		// Only checked for SOCK_RAW: with SOCK_DGRAM, the kernel rewrites
 		// the identifier with its own socket-bound value and filters replies
-		// by that value, so we cannot (and don't need to) match on p.id.
+		// by that value, so we cannot (and don't need to) match on expectedID.
 		if isRaw {
 			replyID := binary.BigEndian.Uint16(icmpData[4:6])
-			if replyID != p.id {
+			if replyID != expectedID {
 				continue
 			}
 		}
@@ -227,13 +251,21 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 			continue
 		}
 
-		// Validate source IP matches the target we pinged.
-		if from != nil {
-			if sa4, ok := from.(*syscall.SockaddrInet4); ok {
-				if !net.IP(sa4.Addr[:]).Equal(ip) {
-					continue
-				}
-			}
+		// Validate payload timestamp and probe token.
+		// On SOCK_DGRAM, the kernel rewrites the ICMP header ID field, but the
+		// ICMP payload (timestamp and probe token) is preserved end-to-end.
+		// Requiring matching timestamp and probe token prevents any cross-host
+		// or cross-probe collision regardless of socket pooling or ID recycling.
+		if len(icmpData) < 24 {
+			continue
+		}
+		replyNano := binary.BigEndian.Uint64(icmpData[8:16])
+		if replyNano != sendNano {
+			continue
+		}
+		replyToken := binary.BigEndian.Uint64(icmpData[16:24])
+		if replyToken != probeToken {
+			continue
 		}
 
 		rtt := recvTime.Sub(sendTime)

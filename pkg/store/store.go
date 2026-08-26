@@ -86,10 +86,11 @@ func NewStore(filePath string) (*Store, error) {
 	s := &Store{
 		filePath: filePath,
 		data: StoreData{
-			CIDRs:      make([]CIDRConfig, 0),
-			Exclusions: make([]ExclusionConfig, 0),
-			HostMeta:   make(map[string]HostMeta),
-			Settings:   DefaultSettings(),
+			CIDRs:           make([]CIDRConfig, 0),
+			Exclusions:      make([]ExclusionConfig, 0),
+			HostMeta:        make(map[string]HostMeta),
+			DiscoveredHosts: make(map[string]DiscoveredHost),
+			Settings:        DefaultSettings(),
 		},
 	}
 
@@ -143,6 +144,12 @@ func (s *Store) load() error {
 		return fmt.Errorf("failed to parse data file %s: %w", s.filePath, err)
 	}
 
+	if data.CIDRs == nil {
+		data.CIDRs = make([]CIDRConfig, 0)
+	}
+	if data.Exclusions == nil {
+		data.Exclusions = make([]ExclusionConfig, 0)
+	}
 	if data.HostMeta == nil {
 		data.HostMeta = make(map[string]HostMeta)
 	}
@@ -344,6 +351,7 @@ func (s *Store) RemoveDiscoveredHost(ip string) error {
 }
 
 // PruneDiscoveredHosts removes discovered hosts that no longer belong to any configured enabled CIDR.
+// Static hosts (IsStatic == true) are preserved.
 func (s *Store) PruneDiscoveredHosts(validCIDRs map[string]bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -354,7 +362,7 @@ func (s *Store) PruneDiscoveredHosts(validCIDRs map[string]bool) error {
 
 	changed := false
 	for ip, h := range s.data.DiscoveredHosts {
-		if !validCIDRs[h.CIDR] {
+		if !h.IsStatic && !validCIDRs[h.CIDR] {
 			delete(s.data.DiscoveredHosts, ip)
 			changed = true
 		}
@@ -372,6 +380,17 @@ func (s *Store) GetHostMeta(ip string) (HostMeta, bool) {
 	defer s.mu.RUnlock()
 	meta, ok := s.data.HostMeta[ip]
 	return meta, ok
+}
+
+// GetAllHostMeta returns a snapshot copy of all host metadata.
+func (s *Store) GetAllHostMeta() map[string]HostMeta {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]HostMeta, len(s.data.HostMeta))
+	for ip, m := range s.data.HostMeta {
+		res[ip] = m
+	}
+	return res
 }
 
 // SetHostMeta sets alias or notes for an IP.

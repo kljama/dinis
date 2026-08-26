@@ -91,3 +91,30 @@ func TestEnginePacing(t *testing.T) {
 		t.Errorf("expected ~%f ms pace delay, got %f ms", expectedPace, summary.PacedDelayMs)
 	}
 }
+
+func TestEngineMinMaxAvgLatencyProgression(t *testing.T) {
+	engine := NewEngine(DefaultConfig())
+	h := &HostState{
+		IP:     "10.0.0.1",
+		Status: StatusPending,
+	}
+
+	// 1st probe: 20ms
+	engine.applyResult(h, PingResult{Success: true, LatencyMs: 20.0})
+	if h.MinLatencyMs != 20.0 || h.MaxLatencyMs != 20.0 || h.AvgLatencyMs != 20.0 {
+		t.Fatalf("expected min=20, max=20, avg=20 after first probe, got min=%f, max=%f, avg=%f", h.MinLatencyMs, h.MaxLatencyMs, h.AvgLatencyMs)
+	}
+
+	// 2nd probe: 50ms (higher latency -> max should update, min should remain 20ms)
+	engine.applyResult(h, PingResult{Success: true, LatencyMs: 50.0})
+	if h.MinLatencyMs != 20.0 || h.MaxLatencyMs != 50.0 {
+		t.Fatalf("expected min=20, max=50 after higher probe, got min=%f, max=%f", h.MinLatencyMs, h.MaxLatencyMs)
+	}
+
+	// 3rd probe: 5ms (lower latency -> min should update to 5ms, max should remain 50ms)
+	engine.applyResult(h, PingResult{Success: true, LatencyMs: 5.0})
+	if h.MinLatencyMs != 5.0 || h.MaxLatencyMs != 50.0 {
+		t.Fatalf("expected min=5, max=50 after lower probe, got min=%f, max=%f", h.MinLatencyMs, h.MaxLatencyMs)
+	}
+}
+

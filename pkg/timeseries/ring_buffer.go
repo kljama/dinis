@@ -73,27 +73,30 @@ func (rb *HostRingBuffer) GetAll() []RawSample {
 }
 
 // GetSince returns samples recorded at or after the given cutoff time.
+// Robust against clock skew and non-monotonic timestamps.
 func (rb *HostRingBuffer) GetSince(cutoff time.Time) []RawSample {
 	all := rb.GetAll()
 	if len(all) == 0 {
 		return nil
 	}
 
-	idx := sort.Search(len(all), func(i int) bool {
-		return !all[i].Timestamp.Before(cutoff)
-	})
-
-	if idx >= len(all) {
+	result := make([]RawSample, 0, len(all))
+	for _, s := range all {
+		if !s.Timestamp.Before(cutoff) {
+			result = append(result, s)
+		}
+	}
+	if len(result) == 0 {
 		return nil
 	}
-	return all[idx:]
+	return result
 }
 
 // ComputeSummary calculates quick statistical metrics over the current ring buffer window.
-func (rb *HostRingBuffer) ComputeSummary() (avgLatency float64, minLatency float64, maxLatency float64, p95Latency float64, lossRatio float64, totalCount int) {
+func (rb *HostRingBuffer) ComputeSummary() (avgLatency float64, minLatency float64, maxLatency float64, p95Latency float64, lossRatio float64, jitter float64, totalCount int) {
 	samples := rb.GetAll()
 	if len(samples) == 0 {
-		return 0, 0, 0, 0, 0, 0
+		return 0, 0, 0, 0, 0, 0, 0
 	}
 
 	totalCount = len(samples)
@@ -122,6 +125,16 @@ func (rb *HostRingBuffer) ComputeSummary() (avgLatency float64, minLatency float
 
 	if len(successfulLatencies) > 0 {
 		avgLatency = sumLatency / float64(len(successfulLatencies))
+
+		// RFC 3550 standard mean consecutive latency variance calculated before sorting
+		if len(successfulLatencies) > 1 {
+			var sumDiff float64
+			for i := 1; i < len(successfulLatencies); i++ {
+				sumDiff += math.Abs(successfulLatencies[i] - successfulLatencies[i-1])
+			}
+			jitter = math.Round((sumDiff/float64(len(successfulLatencies)-1))*100) / 100
+		}
+
 		sort.Float64s(successfulLatencies)
 		p95Idx := int(math.Ceil(0.95*float64(len(successfulLatencies)))) - 1
 		if p95Idx < 0 {
@@ -135,5 +148,5 @@ func (rb *HostRingBuffer) ComputeSummary() (avgLatency float64, minLatency float
 		minLatency = 0
 	}
 
-	return avgLatency, minLatency, maxLatency, p95Latency, lossRatio, totalCount
+	return avgLatency, minLatency, maxLatency, p95Latency, lossRatio, jitter, totalCount
 }

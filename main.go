@@ -55,11 +55,10 @@ func main() {
 	srvHandler := server.NewServer(coord, *staticFlag)
 	addr := fmt.Sprintf("%s:%d", *hostFlag, *portFlag)
 	httpServer := &http.Server{
-		Addr:         addr,
-		Handler:      srvHandler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              addr,
+		Handler:           srvHandler,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Background HTTP server listener

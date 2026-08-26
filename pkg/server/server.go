@@ -5,10 +5,13 @@ import (
 	"embed"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,13 +41,14 @@ type DiscoveryStatus struct {
 
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
 type Coordinator struct {
-	mu         sync.RWMutex
+	rebuildMu  sync.Mutex
 	store      *store.Store
 	pinger     *pinger.Engine
 	alerts     *alerts.Manager
 	clientsMu  sync.RWMutex
 	sseClients map[chan []byte]bool
 	stopChan   chan struct{}
+	stopOnce   sync.Once
 
 	discMu          sync.RWMutex
 	discoveryStatus DiscoveryStatus
@@ -106,36 +110,43 @@ func (c *Coordinator) Start() {
 
 // Stop gracefully terminates all subsystems.
 func (c *Coordinator) Stop() {
-	close(c.stopChan)
-	c.pinger.Stop()
+	c.stopOnce.Do(func() {
+		close(c.stopChan)
+		c.pinger.Stop()
 
-	c.clientsMu.Lock()
-	for ch := range c.sseClients {
-		close(ch)
-		delete(c.sseClients, ch)
-	}
-	c.clientsMu.Unlock()
+		c.clientsMu.Lock()
+		for ch := range c.sseClients {
+			delete(c.sseClients, ch)
+			close(ch)
+		}
+		c.clientsMu.Unlock()
+	})
 }
 
 // RebuildTargetList recalculates the list of active target hosts based on discovered hosts, configured CIDRs, and exclusions.
 func (c *Coordinator) RebuildTargetList() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
 
 	cidrs := c.store.GetCIDRs()
 	exclusions := c.store.GetExclusions()
 	discovered := c.store.GetDiscoveredHosts()
+	allMeta := c.store.GetAllHostMeta()
+	activeAlerts := c.alerts.GetActiveAlertsMap()
 
 	matcher := network.NewExclusionMatcher()
 	for _, excl := range exclusions {
 		if excl.Enabled {
-			_ = matcher.AddExclusion(excl.Rule, excl.Reason)
+			if err := matcher.AddExclusion(excl.Rule, excl.Reason); err != nil {
+				log.Printf("[DINIS] Warning: invalid exclusion rule %q in store: %v", excl.Rule, err)
+			}
 		}
 	}
 
 	validCIDRs := make(map[string]bool)
 	cidrMap := make(map[string]*network.CIDRInfo)
 	totalCapacity := 0
+	var newStaticHosts []store.DiscoveredHost
 
 	for _, cfg := range cidrs {
 		if !cfg.Enabled {
@@ -161,29 +172,60 @@ func (c *Coordinator) RebuildTargetList() {
 					LastDiscovered: now,
 					IsStatic:       true,
 				}
-				_ = c.store.AddOrUpdateDiscoveredHost(discHost)
+				newStaticHosts = append(newStaticHosts, discHost)
 				discovered[ip] = discHost
 			}
 		}
 	}
 
-	// Prune discovered hosts belonging to deleted CIDRs
-	_ = c.store.PruneDiscoveredHosts(validCIDRs)
+	// Batch persist any newly created single-host targets
+	if len(newStaticHosts) > 0 {
+		if err := c.store.AddOrUpdateDiscoveredHostsBatch(newStaticHosts); err != nil {
+			log.Printf("[DINIS] Error persisting static targets to disk: %v", err)
+		}
+	}
+
+	// Prune discovered hosts belonging to deleted CIDRs (preserves IsStatic hosts)
+	if err := c.store.PruneDiscoveredHosts(validCIDRs); err != nil {
+		log.Printf("[DINIS] Error pruning unmanaged discovered hosts from disk: %v", err)
+	}
 
 	hostMap := make(map[string]*pinger.HostState)
 
 	for ip, disc := range discovered {
-		if !validCIDRs[disc.CIDR] {
+		if !disc.IsStatic && !validCIDRs[disc.CIDR] {
 			continue
 		}
 
+		hostCIDR := disc.CIDR
+		if hostCIDR == "" || hostCIDR == "Static" {
+			parsedIP := net.ParseIP(ip)
+			found := false
+			if parsedIP != nil {
+				for _, cfg := range cidrs {
+					if !cfg.Enabled {
+						continue
+					}
+					_, ipNet, err := net.ParseCIDR(cfg.CIDR)
+					if err == nil && ipNet.Contains(parsedIP) {
+						hostCIDR = cfg.CIDR
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				hostCIDR = ip + "/32"
+			}
+		}
+
 		matched, _, reason := matcher.Matches(ip)
-		meta, _ := c.store.GetHostMeta(ip)
+		meta := allMeta[ip]
 		alias := meta.Alias
 		if alias == "" {
-			if info, ok := cidrMap[disc.CIDR]; ok && info.TotalHosts == 1 {
+			if info, ok := cidrMap[hostCIDR]; ok && info.TotalHosts == 1 {
 				for _, cfg := range cidrs {
-					if cfg.CIDR == disc.CIDR && cfg.Description != "" {
+					if cfg.CIDR == hostCIDR && cfg.Description != "" {
 						alias = cfg.Description
 						break
 					}
@@ -194,8 +236,6 @@ func (c *Coordinator) RebuildTargetList() {
 		status := pinger.StatusPending
 		if matched {
 			status = pinger.StatusExcluded
-			// If host was previously alerting but is now excluded, resolve its alert
-			c.alerts.Resolve(ip)
 		}
 
 		// Check if existing alert is active
@@ -204,7 +244,7 @@ func (c *Coordinator) RebuildTargetList() {
 		var ackAt, startAt *time.Time
 
 		if !matched {
-			if alt, hasAlt := c.alerts.GetAlertForIP(ip); hasAlt {
+			if alt, hasAlt := activeAlerts[ip]; hasAlt {
 				isAlertActive = true
 				alertID = alt.ID
 				isAck = alt.Acknowledged
@@ -221,7 +261,7 @@ func (c *Coordinator) RebuildTargetList() {
 		hostMap[ip] = &pinger.HostState{
 			IP:                ip,
 			Alias:             alias,
-			CIDR:              disc.CIDR,
+			CIDR:              hostCIDR,
 			Status:            status,
 			IsExcluded:        matched,
 			ExclusionReason:   reason,
@@ -305,17 +345,40 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 		}
 	}
 
-	prober := pinger.NewSingleProber()
 	settings := c.store.GetSettings()
+	if len(targets) == 0 {
+		now := time.Now()
+		c.discMu.Lock()
+		c.discoveryStatus.IsScanning = false
+		c.discoveryStatus.LastRun = &now
+		if settings.DiscoveryIntervalMin > 0 {
+			next := now.Add(time.Duration(settings.DiscoveryIntervalMin) * time.Minute)
+			c.discoveryStatus.NextRun = &next
+		} else {
+			c.discoveryStatus.NextRun = nil
+		}
+		c.discoveryStatus.LastScannedCount = 0
+		c.discoveryStatus.LastDiscoveredCount = len(c.store.GetDiscoveredHosts())
+		statusCpy := c.discoveryStatus
+		c.discMu.Unlock()
+
+		c.broadcastEvent("discovery_completed", map[string]interface{}{
+			"status":           statusCpy,
+			"discoveredOnline": 0,
+			"newDiscovered":    0,
+			"scannedCount":     0,
+		})
+
+		return 0, 0, nil
+	}
+
+	prober := pinger.NewSingleProber()
 	concurrency := settings.Concurrency
 	if concurrency <= 0 {
 		concurrency = 100
 	}
 	if concurrency > len(targets) {
 		concurrency = len(targets)
-	}
-	if concurrency <= 0 {
-		concurrency = 1
 	}
 
 	workChan := make(chan candidate, concurrency*2)
@@ -382,7 +445,9 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 	// Batch-write all discovered hosts to disk in a single atomic operation,
 	// instead of N individual writes during the sweep.
 	if len(discoveredBatch) > 0 {
-		_ = c.store.AddOrUpdateDiscoveredHostsBatch(discoveredBatch)
+		if err := c.store.AddOrUpdateDiscoveredHostsBatch(discoveredBatch); err != nil {
+			log.Printf("[DINIS] Error persisting discovered hosts batch to disk: %v", err)
+		}
 	}
 
 	// Rebuild target list so newly discovered hosts are immediately monitored
@@ -417,7 +482,9 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 // TriggerDiscovery initiates a discovery sweep asynchronously.
 func (c *Coordinator) TriggerDiscovery(specificCIDR string) {
 	go func() {
-		_, _, _ = c.RunDiscovery(specificCIDR)
+		if _, _, err := c.RunDiscovery(specificCIDR); err != nil {
+			log.Printf("[DINIS] Triggered discovery sweep error: %v", err)
+		}
 	}()
 }
 
@@ -433,7 +500,9 @@ func (c *Coordinator) discoveryLoop() {
 	time.Sleep(500 * time.Millisecond)
 	settings := c.store.GetSettings()
 	if settings.AutoDiscovery {
-		_, _, _ = c.RunDiscovery("")
+		if _, _, err := c.RunDiscovery(""); err != nil {
+			log.Printf("[DINIS] Initial discovery sweep error: %v", err)
+		}
 	}
 
 	ticker := time.NewTicker(1 * time.Minute)
@@ -459,7 +528,9 @@ func (c *Coordinator) discoveryLoop() {
 			}
 
 			if lastRun == nil || time.Since(*lastRun) >= time.Duration(s.DiscoveryIntervalMin)*time.Minute {
-				_, _, _ = c.RunDiscovery("")
+				if _, _, err := c.RunDiscovery(""); err != nil {
+					log.Printf("[DINIS] Periodic discovery sweep error: %v", err)
+				}
 			}
 		}
 	}
@@ -497,26 +568,9 @@ func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatu
 }
 
 func (c *Coordinator) handleHostUpdated(h *pinger.HostState) {
-	if alt, hasAlt := c.alerts.GetAlertForIP(h.IP); hasAlt {
-		h.AlertActive = true
-		h.AlertID = alt.ID
-		h.AlertAcknowledged = alt.Acknowledged
-		h.AlertAckBy = alt.AcknowledgedBy
-		h.AlertAckNote = alt.AckNote
-		h.AlertAckAt = alt.AcknowledgedAt
-		h.AlertStartedAt = &alt.StartedAt
-	} else {
-		h.AlertActive = false
-		h.AlertID = ""
-		h.AlertAcknowledged = false
-		h.AlertAckBy = ""
-		h.AlertAckNote = ""
-		h.AlertAckAt = nil
-		h.AlertStartedAt = nil
-		c.pinger.SetHostAlertState(h.IP, false, "", false, "", "", nil, nil)
-	}
 	// Per-packet SSE broadcasting is decoupled to enable 20,000+ host scalability.
-	// State transitions are broadcasted immediately via handleStateChange.
+	// State transitions and associated alert lifecycle are handled authoritatively via handleStateChange.
+	// Aggregated metrics are broadcasted at cycle completion via handleCycleComplete.
 }
 
 func (c *Coordinator) handleCycleComplete(summary *pinger.CycleSummary) {
@@ -571,10 +625,11 @@ func (c *Coordinator) heartbeatLoop() {
 
 // Server holds the HTTP handler routing.
 type Server struct {
-	coord      *Coordinator
-	mux        *http.ServeMux
-	distFS     http.FileSystem
-	staticPath string // If provided, serves live directory instead of embedded
+	coord          *Coordinator
+	mux            *http.ServeMux
+	distFS         http.FileSystem
+	staticPath     string // If provided, serves live directory instead of embedded
+	allowedOrigins []string
 }
 
 // NewServer creates a new HTTP server routing all REST APIs and web dashboard assets.
@@ -598,15 +653,72 @@ func NewServer(coord *Coordinator, staticDir string) *Server {
 	return s
 }
 
+// SetAllowedOrigins configures explicit CORS allowed origins.
+func (s *Server) SetAllowedOrigins(origins []string) {
+	s.allowedOrigins = origins
+}
+
+func (s *Server) isAllowedOrigin(origin, reqHost string) bool {
+	if origin == "" {
+		return false
+	}
+
+	for _, ao := range s.allowedOrigins {
+		if ao == "*" || ao == origin {
+			return true
+		}
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	// Match request Host header (same host and port)
+	if strings.EqualFold(u.Host, reqHost) {
+		return true
+	}
+
+	// Allow localhost / 127.0.0.1 / [::1] on any port for local browser administration
+	hostname := u.Hostname()
+	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
+		return true
+	}
+
+	return false
+}
+
+// maxRequestBodyBytes limits incoming request JSON bodies to 1 MB to prevent memory exhaustion DoS attacks.
+const maxRequestBodyBytes = 1 << 20 // 1 MB (1,048,576 bytes)
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Global CORS and security headers
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	// Standard Security Headers
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		if s.isAllowedOrigin(origin, r.Host) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Vary", "Origin")
+		} else if r.Method == http.MethodOptions {
+			// Untrusted cross-origin preflight rejected
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+	}
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
+	}
+
+	// Limit request body size across all incoming HTTP requests to prevent memory exhaustion attacks
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	}
 
 	s.mux.ServeHTTP(w, r)
@@ -660,7 +772,7 @@ func (s *Server) routes() {
 	}
 }
 
-// JSON Helper
+// JSON Helpers
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -671,6 +783,24 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// decodeJSON decodes a JSON request body bounded by maxRequestBodyBytes.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	if r.Body == nil {
+		return fmt.Errorf("empty request body")
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("Request body exceeds %d byte limit", maxRequestBodyBytes))
+		return
+	}
+	writeError(w, http.StatusBadRequest, "Invalid JSON payload")
+}
+
 // SSE Handler
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
@@ -678,6 +808,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Streaming unsupported", http.StatusBadRequest)
 		return
 	}
+
+	// Disable HTTP write deadline for this long-lived SSE streaming connection
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -692,8 +826,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		s.coord.clientsMu.Lock()
-		delete(s.coord.sseClients, clientChan)
-		close(clientChan)
+		if _, ok := s.coord.sseClients[clientChan]; ok {
+			delete(s.coord.sseClients, clientChan)
+			close(clientChan)
+		}
 		s.coord.clientsMu.Unlock()
 	}()
 
@@ -739,7 +875,9 @@ func (s *Server) handleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CIDR string `json:"cidr"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		_ = decodeJSON(w, r, &req)
+	}
 
 	s.coord.TriggerDiscovery(req.CIDR)
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -768,7 +906,7 @@ func ipToUint32(ipStr string) uint32 {
 
 func getStatusWeight(h *pinger.HostState) int {
 	if h.IsExcluded || h.Status == pinger.StatusExcluded {
-		return 4
+		return 5
 	}
 	if h.Status == pinger.StatusDown {
 		if h.AlertAcknowledged {
@@ -779,7 +917,10 @@ func getStatusWeight(h *pinger.HostState) int {
 	if h.Status == pinger.StatusUp {
 		return 3
 	}
-	return 5
+	if h.Status == pinger.StatusPending {
+		return 4
+	}
+	return 6
 }
 
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
@@ -836,8 +977,16 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 				if h.Status != pinger.StatusUp || h.IsExcluded {
 					continue
 				}
+			case "pending":
+				if h.Status != pinger.StatusPending || h.IsExcluded {
+					continue
+				}
 			case "excluded":
 				if !h.IsExcluded && h.Status != pinger.StatusExcluded {
+					continue
+				}
+			default:
+				if string(h.Status) != strings.ToUpper(status) {
 					continue
 				}
 			}
@@ -1019,6 +1168,13 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		writeError(w, http.StatusBadRequest, "Invalid IP address")
+		return
+	}
+	ip = parsedIP.String()
+
 	if len(parts) == 1 {
 		// GET /api/hosts/{ip}
 		if r.Method == http.MethodGet {
@@ -1064,7 +1220,11 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 			return
 		}
-		_ = s.coord.store.RemoveDiscoveredHost(ip)
+		if err := s.coord.store.RemoveDiscoveredHost(ip); err != nil {
+			log.Printf("[DINIS] Error removing host %s: %v", ip, err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to un-enroll host: %v", err))
+			return
+		}
 		s.coord.alerts.Resolve(ip)
 		s.coord.RebuildTargetList()
 		writeJSON(w, http.StatusOK, map[string]string{"message": "Host un-enrolled from active monitoring"})
@@ -1074,14 +1234,37 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 			return
 		}
+
 		now := time.Now()
-		_ = s.coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		cidr := ip + "/32"
+		discovered := s.coord.store.GetDiscoveredHosts()
+		if existing, ok := discovered[ip]; ok && existing.CIDR != "" && existing.CIDR != "Static" {
+			cidr = existing.CIDR
+		} else {
+			cidrs := s.coord.store.GetCIDRs()
+			for _, c := range cidrs {
+				if !c.Enabled {
+					continue
+				}
+				_, ipNet, err := net.ParseCIDR(c.CIDR)
+				if err == nil && ipNet.Contains(parsedIP) {
+					cidr = c.CIDR
+					break
+				}
+			}
+		}
+
+		if err := s.coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
 			IP:             ip,
-			CIDR:           "Static",
+			CIDR:           cidr,
 			DiscoveredAt:   now,
 			LastDiscovered: now,
 			IsStatic:       true,
-		})
+		}); err != nil {
+			log.Printf("[DINIS] Error promoting host %s: %v", ip, err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to promote host: %v", err))
+			return
+		}
 		s.coord.RebuildTargetList()
 		writeJSON(w, http.StatusOK, map[string]string{"message": "Host promoted to static monitored target"})
 
@@ -1094,8 +1277,8 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			Alias string `json:"alias"`
 			Notes string `json:"notes"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeDecodeError(w, err)
 			return
 		}
 
@@ -1131,8 +1314,8 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 			Enabled            *bool  `json:"enabled"`
 			IncludeNetAndBcast bool   `json:"includeNetAndBcast"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid JSON payload")
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeDecodeError(w, err)
 			return
 		}
 
@@ -1176,11 +1359,11 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		cidr := r.URL.Query().Get("cidr")
-		if cidr == "" {
+		if cidr == "" && r.Body != nil {
 			var body struct {
 				CIDR string `json:"cidr"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = decodeJSON(w, r, &body)
 			cidr = body.CIDR
 		}
 		if cidr == "" {
@@ -1213,8 +1396,8 @@ func (s *Server) handleExclusions(w http.ResponseWriter, r *http.Request) {
 			Reason  string `json:"reason"`
 			Enabled *bool  `json:"enabled"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid JSON payload")
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeDecodeError(w, err)
 			return
 		}
 
@@ -1253,11 +1436,11 @@ func (s *Server) handleExclusions(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		rule := r.URL.Query().Get("rule")
-		if rule == "" {
+		if rule == "" && r.Body != nil {
 			var body struct {
 				Rule string `json:"rule"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = decodeJSON(w, r, &body)
 			rule = body.Rule
 		}
 		if rule == "" {
@@ -1308,8 +1491,8 @@ func (s *Server) handleAlertAcknowledge(w http.ResponseWriter, r *http.Request) 
 		AckBy string `json:"ackBy"`
 		Note  string `json:"note"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid JSON payload")
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 
@@ -1347,7 +1530,9 @@ func (s *Server) handleAlertAcknowledgeAll(w http.ResponseWriter, r *http.Reques
 		AckBy string `json:"ackBy"`
 		Note  string `json:"note"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		_ = decodeJSON(w, r, &req)
+	}
 
 	ackAlerts := s.coord.alerts.AcknowledgeAll(req.AckBy, req.Note)
 	for _, a := range ackAlerts {
@@ -1368,8 +1553,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut, http.MethodPost:
 		var req store.AppSettings
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid JSON payload")
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeDecodeError(w, err)
 			return
 		}
 

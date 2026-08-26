@@ -37,6 +37,8 @@ type Manager struct {
 	mu           sync.RWMutex
 	activeAlerts map[string]*Alert // IP -> Alert
 	history      []*Alert
+	historyHead  int
+	historyCount int
 	maxHistory   int
 
 	OnAlertTriggered    func(alert *Alert)
@@ -51,8 +53,16 @@ func NewManager(maxHistory int) *Manager {
 	}
 	return &Manager{
 		activeAlerts: make(map[string]*Alert),
-		history:      make([]*Alert, 0),
+		history:      make([]*Alert, maxHistory),
 		maxHistory:   maxHistory,
+	}
+}
+
+func (m *Manager) pushHistory(alert *Alert) {
+	m.history[m.historyHead] = alert
+	m.historyHead = (m.historyHead + 1) % m.maxHistory
+	if m.historyCount < m.maxHistory {
+		m.historyCount++
 	}
 }
 
@@ -179,10 +189,7 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	alert.State = AlertStateResolved
 	alert.DurationSec = int64(now.Sub(alert.StartedAt).Seconds())
 
-	m.history = append([]*Alert{alert}, m.history...)
-	if len(m.history) > m.maxHistory {
-		m.history = m.history[:m.maxHistory]
-	}
+	m.pushHistory(alert)
 
 	cpy := *alert
 	if m.OnAlertResolved != nil {
@@ -207,10 +214,7 @@ func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
 			alert.State = AlertStateResolved
 			alert.DurationSec = int64(now.Sub(alert.StartedAt).Seconds())
 
-			m.history = append([]*Alert{alert}, m.history...)
-			if len(m.history) > m.maxHistory {
-				m.history = m.history[:m.maxHistory]
-			}
+			m.pushHistory(alert)
 
 			cpy := *alert
 			resolved = append(resolved, &cpy)
@@ -238,18 +242,34 @@ func (m *Manager) GetActiveAlerts() []*Alert {
 	return res
 }
 
-// GetAlertHistory returns historical resolved alerts.
+// GetActiveAlertsMap returns a map of IP -> Alert copy for all currently active alerts.
+func (m *Manager) GetActiveAlertsMap() map[string]*Alert {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	now := time.Now()
+	res := make(map[string]*Alert, len(m.activeAlerts))
+	for ip, a := range m.activeAlerts {
+		cpy := *a
+		cpy.DurationSec = int64(now.Sub(a.StartedAt).Seconds())
+		res[ip] = &cpy
+	}
+	return res
+}
+
+// GetAlertHistory returns historical resolved alerts, ordered newest to oldest.
 func (m *Manager) GetAlertHistory(limit int) []*Alert {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if limit <= 0 || limit > len(m.history) {
-		limit = len(m.history)
+	if limit <= 0 || limit > m.historyCount {
+		limit = m.historyCount
 	}
 
 	res := make([]*Alert, 0, limit)
 	for i := 0; i < limit; i++ {
-		cpy := *m.history[i]
+		idx := (m.historyHead - 1 - i + m.maxHistory*2) % m.maxHistory
+		cpy := *m.history[idx]
 		res = append(res, &cpy)
 	}
 	return res

@@ -1,15 +1,21 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"dinis/pkg/pinger"
 	"dinis/pkg/store"
+	"dinis/pkg/timeseries"
 )
 
 func setupTestServer(t *testing.T) (*Server, *Coordinator, func()) {
@@ -154,3 +160,442 @@ func TestServerEndpoints(t *testing.T) {
 		t.Errorf("expected 0 outliers after CIDR deletion, got %d", len(postDelOutliers))
 	}
 }
+
+func TestConcurrentRebuildTargetList(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Seed some initial CIDRs
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.10.0.0/24",
+		Description: "Office LAN",
+		Enabled:     true,
+	})
+
+	const numWorkers = 20
+	const iterations = 10
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		workerID := w
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				ip := fmt.Sprintf("10.10.%d.%d", workerID, i%250+1)
+
+				// Interleave store modifications and rebuilds
+				switch (workerID + i) % 4 {
+				case 0:
+					_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+						IP:             ip,
+						CIDR:           "10.10.0.0/24",
+						DiscoveredAt:   time.Now(),
+						LastDiscovered: time.Now(),
+					})
+				case 1:
+					_ = coord.store.SetHostMeta(store.HostMeta{
+						IP:    ip,
+						Alias: fmt.Sprintf("Host-%d-%d", workerID, i),
+						Notes: "Concurrent test note",
+					})
+				case 2:
+					_ = coord.store.AddOrUpdateExclusion(store.ExclusionConfig{
+						Rule:    ip,
+						Reason:  "Maintenance",
+						Enabled: i%2 == 0,
+					})
+				case 3:
+					coord.alerts.Trigger(ip, "Test Host", "10.10.0.0/24", "Simulated packet loss")
+				}
+
+				coord.RebuildTargetList()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify the final coordinator state is intact and accessible
+	hosts := coord.pinger.GetAllHosts()
+	if len(hosts) == 0 {
+		t.Errorf("expected monitored hosts to exist after concurrent rebuilds")
+	}
+}
+
+func TestConcurrentRebuildAndAPI(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	const numWorkers = 15
+	const iterations = 8
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		workerID := w
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				switch (workerID + i) % 5 {
+				case 0:
+					// GET /api/hosts
+					req := httptest.NewRequest(http.MethodGet, "/api/hosts", nil)
+					rec := httptest.NewRecorder()
+					srv.mux.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Errorf("GET /api/hosts returned %d", rec.Code)
+					}
+				case 1:
+					// GET /api/summary
+					req := httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+					rec := httptest.NewRecorder()
+					srv.mux.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Errorf("GET /api/summary returned %d", rec.Code)
+					}
+				case 2:
+					// POST /api/cidrs
+					body := fmt.Sprintf(`{"cidr":"172.16.%d.0/24","description":"VLAN %d"}`, workerID, workerID)
+					req := httptest.NewRequest(http.MethodPost, "/api/cidrs", bytes.NewBufferString(body))
+					rec := httptest.NewRecorder()
+					srv.mux.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Errorf("POST /api/cidrs returned %d", rec.Code)
+					}
+				case 3:
+					// POST /api/exclusions
+					body := fmt.Sprintf(`{"rule":"172.16.%d.50","reason":"Gateway %d"}`, workerID, workerID)
+					req := httptest.NewRequest(http.MethodPost, "/api/exclusions", bytes.NewBufferString(body))
+					rec := httptest.NewRecorder()
+					srv.mux.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Errorf("POST /api/exclusions returned %d", rec.Code)
+					}
+				case 4:
+					// Explicit RebuildTargetList call
+					coord.RebuildTargetList()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestPromoteHostStaticTarget(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Configure a CIDR
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "192.168.10.0/24",
+		Description: "Office Subnet",
+		Enabled:     true,
+	})
+	coord.RebuildTargetList()
+
+	// 1. Promote an IP within the configured CIDR
+	req := httptest.NewRequest(http.MethodPost, "/api/hosts/192.168.10.25/promote", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 promoting host within CIDR, got %d", rec.Code)
+	}
+
+	// 2. Promote a standalone IP outside any configured CIDR
+	req = httptest.NewRequest(http.MethodPost, "/api/hosts/8.8.4.4/promote", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 promoting standalone host, got %d", rec.Code)
+	}
+
+	// Trigger a rebuild to ensure pruning does not drop static hosts
+	coord.RebuildTargetList()
+
+	h1, ok1 := coord.pinger.GetHost("192.168.10.25")
+	if !ok1 {
+		t.Fatalf("expected 192.168.10.25 to still be monitored after rebuild")
+	}
+	if !h1.IsStatic {
+		t.Errorf("expected 192.168.10.25 to be static")
+	}
+	if h1.CIDR != "192.168.10.0/24" {
+		t.Errorf("expected 192.168.10.25 to have CIDR 192.168.10.0/24, got %s", h1.CIDR)
+	}
+
+	h2, ok2 := coord.pinger.GetHost("8.8.4.4")
+	if !ok2 {
+		t.Fatalf("expected 8.8.4.4 to still be monitored after rebuild")
+	}
+	if !h2.IsStatic {
+		t.Errorf("expected 8.8.4.4 to be static")
+	}
+	if h2.CIDR != "8.8.4.4/32" {
+		t.Errorf("expected 8.8.4.4 to have CIDR 8.8.4.4/32, got %s", h2.CIDR)
+	}
+
+	// Verify subnet matrix grouping for the promoted subnet host
+	req = httptest.NewRequest(http.MethodGet, "/api/subnets/matrix", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subnets matrix, got %d", rec.Code)
+	}
+	var matrix []struct {
+		CIDR  string `json:"cidr"`
+		Cells []struct {
+			IP string `json:"ip"`
+		} `json:"cells"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&matrix); err != nil {
+		t.Fatalf("failed to decode matrix: %v", err)
+	}
+
+	foundInSubnet := false
+	for _, block := range matrix {
+		if block.CIDR == "192.168.10.0/24" {
+			for _, cell := range block.Cells {
+				if cell.IP == "192.168.10.25" {
+					foundInSubnet = true
+					break
+				}
+			}
+		}
+	}
+	if !foundInSubnet {
+		t.Errorf("expected 192.168.10.25 to be grouped in 192.168.10.0/24 matrix block")
+	}
+}
+
+func TestCORSAndSecurityHeaders(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Same-host Origin
+	req := httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Host = "monitor.corp.net:8080"
+	req.Header.Set("Origin", "http://monitor.corp.net:8080")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for matching host origin, got %d", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "http://monitor.corp.net:8080" {
+		t.Errorf("expected matching allow origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("expected X-Content-Type-Options: nosniff")
+	}
+	if rec.Header().Get("X-Frame-Options") != "SAMEORIGIN" {
+		t.Errorf("expected X-Frame-Options: SAMEORIGIN")
+	}
+
+	// 2. Localhost Origin
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
+		t.Errorf("expected allow for localhost origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// 3. Untrusted cross-origin preflight should be rejected with 403
+	req = httptest.NewRequest(http.MethodOptions, "/api/settings", nil)
+	req.Header.Set("Origin", "https://malicious-site.com")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for untrusted cross-origin preflight, got %d", rec.Code)
+	}
+
+	// 4. Untrusted cross-origin GET should not receive Access-Control-Allow-Origin
+	req = httptest.NewRequest(http.MethodGet, "/api/hosts", nil)
+	req.Header.Set("Origin", "https://malicious-site.com")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("expected empty Allow-Origin for untrusted origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// 5. Configured explicit allowed origins
+	srv.SetAllowedOrigins([]string{"https://dashboard.internal.net"})
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Header.Set("Origin", "https://dashboard.internal.net")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://dashboard.internal.net" {
+		t.Errorf("expected explicit allowed origin to be reflected, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestSSEStreamShutdownConcurrentWithStop(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	coord.Start()
+
+	// Launch multiple SSE client connections
+	var wg sync.WaitGroup
+	const numClients = 10
+	wg.Add(numClients)
+
+	for i := 0; i < numClients; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/api/stream", nil)
+			rec := httptest.NewRecorder()
+			// Serve SSE stream
+			srv.handleSSE(rec, req)
+		}()
+	}
+
+	// Wait briefly for clients to register in sseClients
+	time.Sleep(20 * time.Millisecond)
+
+	// Broadcast an event to registered SSE clients
+	coord.broadcastEvent("test_event", map[string]string{"foo": "bar"})
+
+	// Stop the coordinator while SSE clients are active
+	coord.Stop()
+
+	// Wait for all client goroutines to exit without panic
+	wg.Wait()
+}
+
+func TestHostDetailOrActionInvalidIPValidation(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	invalidPaths := []string{
+		"/api/hosts/not-an-ip",
+		"/api/hosts/999.999.999.999",
+		"/api/hosts/256.0.0.1",
+		"/api/hosts/192.168.1.500/history",
+		"/api/hosts/invalid-ip/ping",
+		"/api/hosts/invalid-ip/enrollment",
+		"/api/hosts/invalid-ip/promote",
+		"/api/hosts/invalid-ip/meta",
+	}
+
+	for _, p := range invalidPaths {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		if strings.HasSuffix(p, "/ping") || strings.HasSuffix(p, "/promote") || strings.HasSuffix(p, "/meta") {
+			req = httptest.NewRequest(http.MethodPost, p, bytes.NewBufferString(`{"alias":"bad"}`))
+		} else if strings.HasSuffix(p, "/enrollment") {
+			req = httptest.NewRequest(http.MethodDelete, p, nil)
+		}
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("path %s expected 400 Bad Request, got %d", p, rec.Code)
+		}
+	}
+}
+
+func TestRunDiscoveryEmptyTargets(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Disable all CIDRs so targets is completely empty
+	cidrs := coord.store.GetCIDRs()
+	for _, c := range cidrs {
+		c.Enabled = false
+		_ = coord.store.AddOrUpdateCIDR(c)
+	}
+
+	online, newDisc, err := coord.RunDiscovery("")
+	if err != nil {
+		t.Fatalf("unexpected error running discovery with empty targets: %v", err)
+	}
+	if online != 0 || newDisc != 0 {
+		t.Errorf("expected 0 online, 0 newDisc, got %d, %d", online, newDisc)
+	}
+
+	status := coord.GetDiscoveryStatus()
+	if status.IsScanning {
+		t.Errorf("expected IsScanning to be false after empty discovery")
+	}
+	if status.LastScannedCount != 0 {
+		t.Errorf("expected LastScannedCount 0, got %d", status.LastScannedCount)
+	}
+}
+
+func TestRequestBodySizeLimit(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Create a payload larger than 1MB (1.5MB)
+	largePadding := strings.Repeat("x", 1500*1024)
+	largeBody := fmt.Sprintf(`{"alias":"bad","notes":"%s"}`, largePadding)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/hosts/127.0.0.1/meta", bytes.NewBufferString(largeBody))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413 Request Entity Too Large, got %d", rec.Code)
+	}
+}
+
+func TestHostsFilterPendingAndMatrixPendingCount(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Initially, configured hosts start with StatusPending
+	req := httptest.NewRequest(http.MethodGet, "/api/hosts?status=pending", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	var resp struct {
+		Total int                  `json:"total"`
+		Hosts []*pinger.HostState `json:"hosts"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Total == 0 {
+		t.Errorf("expected pending hosts to be returned, got 0")
+	}
+	for _, h := range resp.Hosts {
+		if h.Status != pinger.StatusPending {
+			t.Errorf("expected all returned hosts to be StatusPending, got %s for %s", h.Status, h.IP)
+		}
+	}
+
+	// Verify subnet matrix has pendingCount populated
+	req = httptest.NewRequest(http.MethodGet, "/api/subnets/matrix", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subnets matrix, got %d", rec.Code)
+	}
+
+	var matrix []timeseries.SubnetMatrixBlock
+	if err := json.NewDecoder(rec.Body).Decode(&matrix); err != nil {
+		t.Fatalf("failed to decode matrix: %v", err)
+	}
+
+	totalPending := 0
+	for _, block := range matrix {
+		totalPending += block.PendingCount
+	}
+	if totalPending != len(coord.pinger.GetAllHosts()) {
+		t.Errorf("expected total PendingCount %d in matrix, got %d", len(coord.pinger.GetAllHosts()), totalPending)
+	}
+}
+
+
+
+
+
+
+
+

@@ -1,6 +1,8 @@
 package network
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -52,6 +54,18 @@ func TestParseCIDR(t *testing.T) {
 	if info.TotalHosts != 1 || info.IPs[0] != "10.0.0.5" {
 		t.Errorf("expected 1 host for /32, got %v", info)
 	}
+
+	// Test boundary condition: subnet ending at 255.255.255.255 (0xFFFFFFFF)
+	info, err = ParseCIDR("255.255.255.240/28", true)
+	if err != nil {
+		t.Fatalf("unexpected error for 255.255.255.240/28: %v", err)
+	}
+	if info.TotalHosts != 16 {
+		t.Errorf("expected 16 hosts for boundary /28, got %d", info.TotalHosts)
+	}
+	if len(info.IPs) != 16 || info.IPs[15] != "255.255.255.255" {
+		t.Errorf("expected last IP to be 255.255.255.255, got %v", info.IPs)
+	}
 }
 
 func TestExclusionMatcher(t *testing.T) {
@@ -87,3 +101,37 @@ func TestExclusionMatcher(t *testing.T) {
 		t.Errorf("expected no match for 10.0.1.42")
 	}
 }
+
+func TestExclusionMatcherConcurrent(t *testing.T) {
+	matcher := NewExclusionMatcher()
+
+	const numWorkers = 20
+	const iterations = 50
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		workerID := w
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				ip := fmt.Sprintf("10.%d.%d.1", workerID, i)
+				cidr := fmt.Sprintf("172.%d.%d.0/24", workerID, i)
+
+				if i%2 == 0 {
+					_ = matcher.AddExclusion(ip, "Exact rule")
+				} else {
+					_ = matcher.AddExclusion(cidr, "Subnet rule")
+				}
+
+				// Concurrent query while mutations are happening
+				matcher.Matches(ip)
+				matcher.Matches(fmt.Sprintf("172.%d.%d.5", workerID, i))
+				matcher.Matches("192.168.1.1")
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+

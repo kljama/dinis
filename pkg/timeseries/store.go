@@ -3,8 +3,10 @@ package timeseries
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,15 +38,16 @@ type SubnetMatrixCell struct {
 
 // SubnetMatrixBlock represents a /24 subnet containing up to 256 cells and aggregate statistics.
 type SubnetMatrixBlock struct {
-	CIDR           string             `json:"cidr"`
-	TotalHosts     int                `json:"totalHosts"`
-	OnlineCount    int                `json:"onlineCount"`
-	OfflineCount   int                `json:"offlineCount"`
-	ExcludedCount  int                `json:"excludedCount"`
-	AvgLatencyMs   float64            `json:"avgLatencyMs"`
-	P95LatencyMs   float64            `json:"p95LatencyMs"`
-	HealthPct      float64            `json:"healthPct"`
-	Cells          []SubnetMatrixCell `json:"cells"`
+	CIDR          string             `json:"cidr"`
+	TotalHosts    int                `json:"totalHosts"`
+	OnlineCount   int                `json:"onlineCount"`
+	OfflineCount  int                `json:"offlineCount"`
+	PendingCount  int                `json:"pendingCount"`
+	ExcludedCount int                `json:"excludedCount"`
+	AvgLatencyMs  float64            `json:"avgLatencyMs"`
+	P95LatencyMs  float64            `json:"p95LatencyMs"`
+	HealthPct     float64            `json:"healthPct"`
+	Cells         []SubnetMatrixCell `json:"cells"`
 }
 
 // Store manages in-memory multi-tier time-series metric retention and rollups for all IPs.
@@ -64,25 +67,39 @@ type Store struct {
 
 // NewStore creates a new time-series metric store.
 func NewStore() *Store {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &Store{
 		rawBuffers:   make(map[string]*HostRingBuffer),
 		minuteSeries: make(map[string]*RollupSeries),
 		hourSeries:   make(map[string]*RollupSeries),
-		ctx:          ctx,
-		cancel:       cancel,
 	}
 }
 
 // Start launches the background automated downsampling ticker.
+// Safe to call multiple times; redundant calls while running are ignored.
 func (s *Store) Start() {
+	s.mu.Lock()
+	if s.ctx != nil {
+		s.mu.Unlock()
+		return
+	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.wg.Add(1)
+	s.mu.Unlock()
+
 	go s.rollupLoop()
 }
 
 // Stop gracefully stops background downsampling routines.
+// Safe to call multiple times or before Start. Allows subsequent Start calls.
 func (s *Store) Stop() {
-	s.cancel()
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel()
+		s.ctx = nil
+		s.cancel = nil
+	}
+	s.mu.Unlock()
+
 	s.wg.Wait()
 }
 
@@ -237,19 +254,19 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, s
 			continue
 		}
 
-		avgLat, _, _, p95Lat, lossRatio, count := rb.ComputeSummary()
+		avgLat, _, _, p95Lat, lossRatio, jitter, count := rb.ComputeSummary()
 		if count < 2 {
 			continue
 		}
 
 		lossPct := lossRatio * 100.0
 
-		// Identify outliers: packet loss > 0% or latency > 100ms
-		if lossPct > 0.0 || avgLat > 100.0 || p95Lat > 150.0 {
+		// Identify outliers: packet loss > 0% or latency > 100ms or jitter > 30ms
+		if lossPct > 0.0 || avgLat > 100.0 || p95Lat > 150.0 || jitter > 30.0 {
 			var severity string
 			if lossPct >= 50.0 {
 				severity = "CRITICAL"
-			} else if lossPct > 0.0 || p95Lat > 250.0 {
+			} else if lossPct > 0.0 || p95Lat > 250.0 || jitter > 50.0 {
 				severity = "WARNING"
 			} else {
 				severity = "DEGRADED"
@@ -258,9 +275,10 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, s
 			outliers = append(outliers, OutlierHost{
 				IP:            ip,
 				Subnet:        subnet,
-				AvgLatencyMs:  avgLat,
-				P95LatencyMs:  p95Lat,
-				PacketLossPct: lossPct,
+				AvgLatencyMs:  math.Round(avgLat*100) / 100,
+				P95LatencyMs:  math.Round(p95Lat*100) / 100,
+				PacketLossPct: math.Round(lossPct*10) / 10,
+				JitterMs:      jitter,
 				SampleCount:   count,
 				Severity:      severity,
 			})
@@ -285,6 +303,13 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, s
 func (s *Store) rollupLoop() {
 	defer s.wg.Done()
 
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+	if ctx == nil {
+		return
+	}
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -293,7 +318,7 @@ func (s *Store) rollupLoop() {
 
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
 			// Check if 1-minute downsampling is due
@@ -356,39 +381,7 @@ func (s *Store) computeHourRollups(now time.Time) {
 
 		minuteRollups := ms.GetSince(cutoff)
 		if len(minuteRollups) > 0 {
-			// Aggregate 1-minute rollups into an hour rollup
-			var sumAvg float64
-			var sumLoss float64
-			var sumUpRatio float64
-			var totalSamples int
-			minLat := minuteRollups[0].MinLatencyMs
-			maxLat := minuteRollups[0].MaxLatencyMs
-
-			for _, mr := range minuteRollups {
-				sumAvg += mr.AvgLatencyMs
-				sumLoss += mr.PacketLossPct
-				sumUpRatio += mr.UpRatio
-				totalSamples += mr.SampleCount
-				if mr.MinLatencyMs < minLat && mr.MinLatencyMs > 0 {
-					minLat = mr.MinLatencyMs
-				}
-				if mr.MaxLatencyMs > maxLat {
-					maxLat = mr.MaxLatencyMs
-				}
-			}
-
-			count := float64(len(minuteRollups))
-			hourPoint := RollupPoint{
-				Timestamp:      now,
-				BucketDuration: 1 * time.Hour,
-				MinLatencyMs:   minLat,
-				MaxLatencyMs:   maxLat,
-				AvgLatencyMs:   sumAvg / count,
-				PacketLossPct:  sumLoss / count,
-				UpRatio:        sumUpRatio / count,
-				SampleCount:    totalSamples,
-			}
-
+			hourPoint := AggregateRollups(now, 1*time.Hour, minuteRollups)
 			hs := s.getOrCreateHourSeries(ip)
 			hs.Append(hourPoint)
 		}
@@ -404,7 +397,7 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 			continue
 		}
 
-		var online, offline, excluded int
+		var online, offline, pending, excluded int
 		var sumLat float64
 		var latencies []float64
 
@@ -418,6 +411,8 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 				}
 			case "DOWN":
 				offline++
+			case "PENDING":
+				pending++
 			case "EXCLUDED":
 				excluded++
 			}
@@ -453,6 +448,7 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 			TotalHosts:    len(cells),
 			OnlineCount:   online,
 			OfflineCount:  offline,
+			PendingCount:  pending,
 			ExcludedCount: excluded,
 			AvgLatencyMs:  avgLat,
 			P95LatencyMs:  p95Lat,
@@ -461,10 +457,34 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 		})
 	}
 
-	// Sort blocks by CIDR string
+	// Sort blocks numerically by network IP address, then prefix length
 	sort.Slice(blocks, func(i, j int) bool {
-		return strings.Compare(blocks[i].CIDR, blocks[j].CIDR) < 0
+		ipA, maskA := parseCIDRBaseUint32(blocks[i].CIDR)
+		ipB, maskB := parseCIDRBaseUint32(blocks[j].CIDR)
+		if ipA != ipB {
+			return ipA < ipB
+		}
+		if maskA != maskB {
+			return maskA < maskB
+		}
+		return blocks[i].CIDR < blocks[j].CIDR
 	})
 
 	return blocks
+}
+
+func parseCIDRBaseUint32(cidrStr string) (uint32, int) {
+	ipStr := cidrStr
+	prefixLen := 32
+	if idx := strings.IndexByte(cidrStr, '/'); idx != -1 {
+		ipStr = cidrStr[:idx]
+		if p, err := strconv.Atoi(cidrStr[idx+1:]); err == nil {
+			prefixLen = p
+		}
+	}
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return 0, prefixLen
+	}
+	return binary.BigEndian.Uint32(ip), prefixLen
 }

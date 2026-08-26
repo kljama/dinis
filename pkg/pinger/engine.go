@@ -559,17 +559,22 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 		h.LastError = ""
 		h.LastSeen = &now
 
-		if h.MinLatencyMs == 0 || res.LatencyMs < h.MinLatencyMs {
+		if h.RecvPackets == 1 {
 			h.MinLatencyMs = res.LatencyMs
-		}
-		if res.LatencyMs > h.MaxLatencyMs {
 			h.MaxLatencyMs = res.LatencyMs
-		}
-		// Rolling average RTT
-		if h.AvgLatencyMs == 0 {
 			h.AvgLatencyMs = res.LatencyMs
 		} else {
-			h.AvgLatencyMs = math.Round(((h.AvgLatencyMs*0.8)+(res.LatencyMs*0.2))*100) / 100
+			if h.MinLatencyMs <= 0 || res.LatencyMs < h.MinLatencyMs {
+				h.MinLatencyMs = res.LatencyMs
+			}
+			if res.LatencyMs > h.MaxLatencyMs {
+				h.MaxLatencyMs = res.LatencyMs
+			}
+			if h.AvgLatencyMs <= 0 {
+				h.AvgLatencyMs = res.LatencyMs
+			} else {
+				h.AvgLatencyMs = math.Round(((h.AvgLatencyMs*0.8)+(res.LatencyMs*0.2))*100) / 100
+			}
 		}
 
 		// Append to history, copying into a fresh slice when trimming
