@@ -347,6 +347,16 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 }
 
 func (p *SingleProber) execProbe(ctx context.Context, ipStr string, timeout time.Duration) PingResult {
+	// Defense-in-depth: validate ipStr is a valid IP to prevent command injection
+	if net.ParseIP(ipStr) == nil {
+		return PingResult{
+			IP:        ipStr,
+			Success:   false,
+			Error:     "Invalid IP address",
+			Timestamp: time.Now(),
+		}
+	}
+
 	timeoutSec := int(timeout.Seconds())
 	if timeoutSec < 1 {
 		timeoutSec = 1
