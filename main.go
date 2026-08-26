@@ -61,8 +61,8 @@ func main() {
 			Bucket: *influxBucketFlag,
 			Token:  *influxTokenFlag,
 		})
-		coord.SetProbeExporter(func(ip string, latencyMs float64, success bool, ts time.Time) {
-			influxWriter.WriteProbe(ip, "", "", latencyMs, success, ts)
+		coord.SetProbeExporter(func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time) {
+			influxWriter.WriteProbe(ip, subnet, alias, latencyMs, success, ts)
 		})
 		log.Printf("[DINIS] InfluxDB export enabled -> %s (bucket: %s)", *influxURLFlag, *influxBucketFlag)
 	}

@@ -145,7 +145,7 @@ func (c *Coordinator) Stop() {
 
 // SetProbeExporter registers a callback that is invoked for every ICMP probe result,
 // enabling export to external stores such as InfluxDB.
-func (c *Coordinator) SetProbeExporter(fn func(ip string, latencyMs float64, success bool, ts time.Time)) {
+func (c *Coordinator) SetProbeExporter(fn func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time)) {
 	c.pinger.OnProbeRecorded = fn
 }
 
