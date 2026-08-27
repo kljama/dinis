@@ -400,6 +400,12 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 func (e *Engine) runLoop() {
 	defer e.wg.Done()
 
+	// Drain any pre-startup wake signal so the initial cycle starts cleanly
+	select {
+	case <-e.wakeChan:
+	default:
+	}
+
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -482,17 +488,28 @@ func (e *Engine) runCycle() {
 	var cycleWg sync.WaitGroup
 	cycleWg.Add(numWorkers)
 
+	e.mu.RLock()
+	ctx := e.ctx
+	e.mu.RUnlock()
+
+	var ctxDone <-chan struct{}
+	probeCtx := context.Background()
+	if ctx != nil {
+		ctxDone = ctx.Done()
+		probeCtx = ctx
+	}
+
 	for w := 0; w < numWorkers; w++ {
 		go func() {
 			defer cycleWg.Done()
 			for ip := range workChan {
 				select {
-				case <-e.ctx.Done():
+				case <-ctxDone:
 					return
 				default:
 				}
 
-				res := e.prober.Probe(e.ctx, ip, timeout)
+				res := e.prober.Probe(probeCtx, ip, timeout)
 
 				e.mu.Lock()
 				h, exists := e.hosts[ip]
@@ -527,7 +544,7 @@ func (e *Engine) runCycle() {
 	// Paced feeder: dispatch target IPs smoothly across the interval window
 	for _, ip := range targets {
 		select {
-		case <-e.ctx.Done():
+		case <-ctxDone:
 			close(workChan)
 			cycleWg.Wait()
 			return
@@ -536,12 +553,10 @@ func (e *Engine) runCycle() {
 
 		if paceDelay > 0 {
 			select {
-			case <-e.ctx.Done():
+			case <-ctxDone:
 				close(workChan)
 				cycleWg.Wait()
 				return
-			case <-e.wakeChan:
-				paceDelay = 0
 			case <-time.After(paceDelay):
 			}
 		}

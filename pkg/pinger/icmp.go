@@ -71,7 +71,7 @@ func NewSingleProber() *SingleProber {
 	return &SingleProber{
 		id:   id,
 		seq:  seq,
-		pool: make(chan *probeSocket, 128),
+		pool: make(chan *probeSocket, 512),
 	}
 }
 

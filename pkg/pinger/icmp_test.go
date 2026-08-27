@@ -2,6 +2,7 @@ package pinger
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -62,4 +63,32 @@ func TestSingleProberSocketPool(t *testing.T) {
 	}
 }
 
+func TestSingleProberConcurrentLocalhost(t *testing.T) {
+	prober := NewSingleProber()
+	defer prober.Close()
 
+	const count = 100
+	errChan := make(chan error, count)
+
+	for i := 0; i < count; i++ {
+		go func(idx int) {
+			res := prober.Probe(context.Background(), "127.0.0.1", 1*time.Second)
+			if !res.Success {
+				errChan <- fmt.Errorf("probe #%d failed: %s", idx, res.Error)
+				return
+			}
+			errChan <- nil
+		}(i)
+	}
+
+	var failures []error
+	for i := 0; i < count; i++ {
+		if err := <-errChan; err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	if len(failures) > 0 {
+		t.Fatalf("%d out of %d concurrent probes failed. First error: %v", len(failures), count, failures[0])
+	}
+}

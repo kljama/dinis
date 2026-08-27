@@ -92,6 +92,38 @@ func TestEnginePacing(t *testing.T) {
 	}
 }
 
+func TestEnginePacingWithWake(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 500 * time.Millisecond
+	cfg.Timeout = 100 * time.Millisecond
+
+	engine := NewEngine(cfg)
+
+	hosts := make(map[string]*HostState)
+	for i := 1; i <= 5; i++ {
+		ip := fmt.Sprintf("127.0.0.%d", i)
+		hosts[ip] = &HostState{
+			IP:     ip,
+			CIDR:   "127.0.0.0/24",
+			Status: StatusPending,
+		}
+	}
+	engine.SetHosts(hosts)
+
+	// Simulate pre-startup Wake() call like RebuildTargetList does
+	engine.Wake()
+
+	start := time.Now()
+	engine.runCycle()
+	duration := time.Since(start)
+
+	// With 5 hosts and 50ms max pace delay, the cycle should take at least (5-1)*40ms = 160ms,
+	// verifying that pacing was NOT zeroed out by the pre-existing Wake signal.
+	if duration < 100*time.Millisecond {
+		t.Fatalf("expected runCycle to maintain pacing (>=100ms), but finished in %v (pacing was bypassed)", duration)
+	}
+}
+
 func TestEngineMinMaxAvgLatencyProgression(t *testing.T) {
 	engine := NewEngine(DefaultConfig())
 	h := &HostState{

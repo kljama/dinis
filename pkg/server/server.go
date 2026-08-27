@@ -519,11 +519,11 @@ func (c *Coordinator) GetDiscoveryStatus() DiscoveryStatus {
 }
 
 func (c *Coordinator) discoveryLoop() {
-	// Run initial discovery sweep on startup after a 500ms warmup
+	// Run initial discovery sweep on startup after a 5s warmup to avoid colliding with initial engine cycle
 	select {
 	case <-c.stopChan:
 		return
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 	}
 	settings := c.store.GetSettings()
 	if settings.AutoDiscovery {
