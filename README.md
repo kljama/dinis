@@ -42,7 +42,22 @@ go build -o dinis main.go
 | `-host` | `0.0.0.0` | HTTP listen address |
 | `-data` | `data/dinis.json` | Path to JSON persistence file |
 | `-static` | `""` | Filesystem path for web assets (overrides embedded) |
+| `-influxdb-url` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
+| `-influxdb-bucket` | `dinis` | InfluxDB database/bucket name |
+| `-influxdb-token` | `""` | InfluxDB authentication token (optional) |
 | `-version` | `false` | Print version and exit |
+
+## Docker & Enterprise Deployment
+
+Run the complete observability stack (DINIS + InfluxDB 3 Core + Grafana) via Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+- **DINIS Web Dashboard**: [http://localhost:8080](http://localhost:8080)
+- **InfluxDB 3 Core API**: [http://localhost:8181](http://localhost:8181)
+- **Grafana**: [http://localhost:3000](http://localhost:3000) (default credentials: `admin` / `admin`)
 
 ## Settings
 

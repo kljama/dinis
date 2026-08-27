@@ -143,6 +143,12 @@ func (c *Coordinator) Stop() {
 	})
 }
 
+// SetProbeExporter registers a callback that is invoked for every ICMP probe result,
+// enabling export to external stores such as InfluxDB.
+func (c *Coordinator) SetProbeExporter(fn func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time)) {
+	c.pinger.OnProbeRecorded = fn
+}
+
 // RebuildTargetList recalculates the list of active target hosts based on discovered hosts, configured CIDRs, and exclusions.
 func (c *Coordinator) RebuildTargetList() {
 	c.rebuildMu.Lock()
@@ -513,11 +519,11 @@ func (c *Coordinator) GetDiscoveryStatus() DiscoveryStatus {
 }
 
 func (c *Coordinator) discoveryLoop() {
-	// Run initial discovery sweep on startup after a 500ms warmup
+	// Run initial discovery sweep on startup after a 5s warmup to avoid colliding with initial engine cycle
 	select {
 	case <-c.stopChan:
 		return
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 	}
 	settings := c.store.GetSettings()
 	if settings.AutoDiscovery {
