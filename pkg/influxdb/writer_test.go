@@ -1,10 +1,11 @@
 package influxdb
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -146,4 +147,99 @@ func TestWriteProbeEndpoint(t *testing.T) {
 	if info.query != "db=mydb" {
 		t.Errorf("expected query db=mydb, got %q", info.query)
 	}
+}
+
+func TestWriterRetryOnTransientFailure(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		att := atomic.AddInt32(&attempts, 1)
+		if att < 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:           srv.URL,
+		Bucket:        "retrydb",
+		FlushInterval: time.Hour,
+		BatchSize:     1,
+	}
+	w := NewWriter(cfg)
+	defer w.Stop()
+
+	w.WriteProbe("10.0.0.1", "", "", 2.5, true, time.Now())
+
+	// Wait for worker to flush and retry
+	time.Sleep(300 * time.Millisecond)
+
+	if atomic.LoadInt32(&attempts) < 2 {
+		t.Errorf("expected at least 2 attempts due to retry, got %d", atomic.LoadInt32(&attempts))
+	}
+}
+
+func TestWriterGracefulShutdownDrain(t *testing.T) {
+	receivedCh := make(chan string, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := new(strings.Builder)
+		io.Copy(buf, r.Body)
+		receivedCh <- buf.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:           srv.URL,
+		Bucket:        "drainingdb",
+		FlushInterval: time.Hour, // no auto ticker flush
+		BatchSize:     1000,      // high batch size so it won't auto flush
+	}
+	w := NewWriter(cfg)
+
+	// Write items that shouldn't flush immediately
+	w.WriteProbe("10.0.0.1", "host1", "", 1.0, true, time.Now())
+	w.WriteProbe("10.0.0.2", "host2", "", 2.0, true, time.Now())
+
+	// Calling Stop must trigger a final flush
+	w.Stop()
+
+	var received string
+	select {
+	case received = <-receivedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for final flush on Stop()")
+	}
+
+	if !strings.Contains(received, "10.0.0.1") || !strings.Contains(received, "10.0.0.2") {
+		t.Errorf("expected both hosts in flushed output on Stop, got: %q", received)
+	}
+}
+
+func BenchmarkWriteProbe(b *testing.B) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:           srv.URL,
+		Bucket:        "benchdb",
+		FlushInterval: 100 * time.Millisecond,
+		BatchSize:     1000,
+	}
+	w := NewWriter(cfg)
+	defer w.Stop()
+
+	ts := time.Now()
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			w.WriteProbe("192.168.1.100", "core-switch-01", "192.168.1.0/24", 1.452, true, ts)
+		}
+	})
 }

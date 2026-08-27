@@ -6,8 +6,9 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -25,6 +26,7 @@ type Writer struct {
 
 	flushInterval time.Duration
 	batchSize     int
+	flushSignal   chan struct{}
 	stopChan      chan struct{}
 	wg            sync.WaitGroup
 }
@@ -47,13 +49,28 @@ func NewWriter(cfg Config) *Writer {
 		cfg.BatchSize = 100
 	}
 
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	w := &Writer{
-		url:           strings.TrimRight(cfg.URL, "/"),
-		bucket:        cfg.Bucket,
-		token:         cfg.Token,
-		client:        &http.Client{Timeout: 10 * time.Second},
+		url:    cfg.URL,
+		bucket: cfg.Bucket,
+		token:  cfg.Token,
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   10 * time.Second,
+		},
 		flushInterval: cfg.FlushInterval,
 		batchSize:     cfg.BatchSize,
+		flushSignal:   make(chan struct{}, 1),
 		stopChan:      make(chan struct{}),
 	}
 
@@ -64,36 +81,41 @@ func NewWriter(cfg Config) *Writer {
 
 // WriteProbe enqueues a single ICMP probe result for batch writing.
 func (w *Writer) WriteProbe(ip string, alias string, subnet string, latencyMs float64, success bool, ts time.Time) {
-	// Build line-protocol line:
-	// icmp_probe,ip=x.x.x.x,subnet=y.y.y.y/z latency_ms=1.23,success=1i <timestamp_ns>
-	var line strings.Builder
-	line.WriteString("icmp_probe,ip=")
-	line.WriteString(escapeTag(ip))
+	// Pre-format line protocol into a stack-allocated buffer without heap allocations:
+	// icmp_probe,ip=x.x.x.x[,subnet=...][,alias=...] latency_ms=1.23,success=1i <timestamp_ns>\n
+	var line [256]byte
+	b := line[:0]
+	b = append(b, "icmp_probe,ip="...)
+	b = appendEscapedTag(b, ip)
 	if subnet != "" {
-		line.WriteString(",subnet=")
-		line.WriteString(escapeTag(subnet))
+		b = append(b, ",subnet="...)
+		b = appendEscapedTag(b, subnet)
 	}
 	if alias != "" {
-		line.WriteString(",alias=")
-		line.WriteString(escapeTag(alias))
+		b = append(b, ",alias="...)
+		b = appendEscapedTag(b, alias)
 	}
-	line.WriteString(" latency_ms=")
-	line.WriteString(fmt.Sprintf("%.4f", latencyMs))
-	successVal := 0
+	b = append(b, " latency_ms="...)
+	b = strconv.AppendFloat(b, latencyMs, 'f', 4, 64)
 	if success {
-		successVal = 1
+		b = append(b, ",success=1i "...)
+	} else {
+		b = append(b, ",success=0i "...)
 	}
-	line.WriteString(fmt.Sprintf(",success=%di", successVal))
-	line.WriteString(fmt.Sprintf(" %d\n", ts.UnixNano()))
+	b = strconv.AppendInt(b, ts.UnixNano(), 10)
+	b = append(b, '\n')
 
 	w.mu.Lock()
-	w.buf.WriteString(line.String())
+	w.buf.Write(b)
 	w.count++
-	shouldFlush := w.count >= w.batchSize
+	shouldSignal := w.count >= w.batchSize
 	w.mu.Unlock()
 
-	if shouldFlush {
-		go w.flush()
+	if shouldSignal {
+		select {
+		case w.flushSignal <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -115,6 +137,8 @@ func (w *Writer) flushLoop() {
 			return
 		case <-ticker.C:
 			w.flush()
+		case <-w.flushSignal:
+			w.flush()
 		}
 	}
 }
@@ -132,32 +156,61 @@ func (w *Writer) flush() {
 	w.mu.Unlock()
 
 	endpoint := fmt.Sprintf("%s/api/v3/write_lp?db=%s", w.url, w.bucket)
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
-	if err != nil {
-		log.Printf("[INFLUXDB] Failed to create request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	if w.token != "" {
-		req.Header.Set("Authorization", "Bearer "+w.token)
-	}
 
-	resp, err := w.client.Do(req)
-	if err != nil {
-		log.Printf("[INFLUXDB] Write failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+	// Attempt write with up to 2 retries for transient connection errors
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+		if err != nil {
+			log.Printf("[INFLUXDB] Failed to create request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+		if w.token != "" {
+			req.Header.Set("Authorization", "Bearer "+w.token)
+		}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp, err := w.client.Do(req)
+		if err != nil {
+			if attempt < 2 {
+				time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+				continue
+			}
+			log.Printf("[INFLUXDB] Write failed after retries: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return
+		}
+
+		// Transient server error: retry
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && attempt < 2 {
+			time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
+			continue
+		}
+
 		log.Printf("[INFLUXDB] Write returned status %d", resp.StatusCode)
+		return
 	}
+}
+
+// appendEscapedTag appends tag string s to dst, escaping '\', ' ', ',', and '=' per line-protocol spec.
+func appendEscapedTag(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\\', ' ', ',', '=':
+			dst = append(dst, '\\', c)
+		default:
+			dst = append(dst, c)
+		}
+	}
+	return dst
 }
 
 // escapeTag escapes special characters in tag values per line-protocol spec.
 func escapeTag(s string) string {
-	s = strings.ReplaceAll(s, " ", "\\ ")
-	s = strings.ReplaceAll(s, ",", "\\,")
-	s = strings.ReplaceAll(s, "=", "\\=")
-	return s
+	var buf []byte
+	return string(appendEscapedTag(buf, s))
 }
