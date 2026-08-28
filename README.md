@@ -1,154 +1,111 @@
 # DINIS
 
-ICMP network monitoring daemon with embedded web dashboard. Written in Go, single binary, no external dependencies.
+DINIS is an ICMP network monitoring daemon with an embedded web interface and REST API. It discovers active hosts across CIDR ranges, runs periodic ICMP probes to track latency and packet loss, and can export metrics to InfluxDB 3.
 
-Scans CIDR ranges for responsive hosts, monitors them with paced ICMP probes, tracks latency/loss metrics with in-memory time-series rollups, and fires outage alerts.
+## Prerequisites
 
-## Requirements
+- **Go**: 1.26 or later (for building from source)
+- **Linux Network Permissions**: ICMP socket access via unprivileged ping sockets or raw socket capabilities:
+  - *Option 1 (Unprivileged ICMP)*:
+    ```bash
+    sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+    ```
+  - *Option 2 (`CAP_NET_RAW` capability)*:
+    ```bash
+    sudo setcap cap_net_raw+ep ./dinis
+    ```
+- **Docker & Docker Compose** (optional, for containerized deployment)
 
-- Go 1.26+
-- Linux with unprivileged ICMP sockets or `CAP_NET_RAW`
+## Installation & Setup
 
-### ICMP Socket Permissions
-
-Option A — unprivileged ICMP (`SOCK_DGRAM`):
-```bash
-sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
-```
-
-Persist across reboots:
-```bash
-echo "net.ipv4.ping_group_range = 0 2147483647" | sudo tee /etc/sysctl.d/99-ping-group.conf
-sudo sysctl --system
-```
-
-Option B — capabilities on the binary:
-```bash
-sudo setcap cap_net_raw+ep dinis
-```
-
-## Build & Run
+### Build from Source
 
 ```bash
 go build -o dinis main.go
-./dinis -port 8080 -data data/dinis.json
 ```
 
-## CLI Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `-port` | `8080` | HTTP listen port |
-| `-host` | `0.0.0.0` | HTTP listen address |
-| `-data` | `data/dinis.json` | Path to JSON persistence file |
-| `-static` | `""` | Filesystem path for web assets (overrides embedded) |
-| `-influxdb-url` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
-| `-influxdb-bucket` | `dinis` | InfluxDB database/bucket name |
-| `-influxdb-token` | `""` | InfluxDB authentication token (optional) |
-| `-version` | `false` | Print version and exit |
-
-## Docker & Enterprise Deployment
-
-Run the complete observability stack (DINIS + InfluxDB 3 Core + Grafana) via Docker Compose:
+### Run with Docker Compose
 
 ```bash
 docker compose up -d
 ```
 
-- **DINIS Web Dashboard**: [http://localhost:8080](http://localhost:8080)
-- **InfluxDB 3 Core API**: [http://localhost:8181](http://localhost:8181)
-- **Grafana**: [http://localhost:3000](http://localhost:3000) (default credentials: `admin` / `admin`)
+## Usage / Quickstart
 
-## Settings
-
-Configurable at runtime via `PUT /api/settings`.
-
-| Setting | Default | Description |
-|---|---|---|
-| `intervalSec` | `60.0` | Probe interval (seconds) |
-| `discoveryIntervalMin` | `240` | Discovery sweep interval (minutes, `0` disables) |
-| `timeoutMs` | `1000` | ICMP reply timeout (ms) |
-| `failThreshold` | `2` | Consecutive failures before marking host `DOWN` |
-| `concurrency` | `100` | Max parallel probe/discovery goroutines |
-| `autoDiscovery` | `true` | Run discovery sweeps on schedule |
-
-## REST API
-
-### Hosts & Monitoring
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/summary` | Aggregate metrics and alert counts |
-| `GET` | `/api/hosts` | List hosts (supports `?page=&limit=&search=&status=&sort=&lightweight=true`) |
-| `GET` | `/api/hosts/{ip}` | Single host detail |
-| `GET` | `/api/hosts/{ip}/history?window={1h\|24h\|168h}` | Rollup history for a host |
-| `POST` | `/api/hosts/{ip}/ping` | On-demand probe |
-| `PUT` | `/api/hosts/{ip}/meta` | Update alias/notes |
-| `DELETE` | `/api/hosts/{ip}/enrollment` | Remove host from monitoring |
-| `POST` | `/api/hosts/{ip}/promote` | Mark host as static target |
-
-### Subnets & Heatmap
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/subnets/matrix` | Subnet heatmap data |
-| `GET` | `/api/outliers?limit={n}` | Top degraded hosts by loss/latency |
-
-### CIDRs & Exclusions
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/cidrs` | List CIDR blocks |
-| `POST` | `/api/cidrs` | Add/update CIDR block |
-| `DELETE` | `/api/cidrs?cidr={cidr}` | Remove CIDR block |
-| `GET` | `/api/exclusions` | List exclusions |
-| `POST` | `/api/exclusions` | Add exclusion rule |
-| `DELETE` | `/api/exclusions?rule={rule}` | Remove exclusion rule |
-
-### Discovery & Alerts
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/discovery/status` | Discovery state and next run time |
-| `POST` | `/api/discovery/run` | Trigger discovery sweep (optional `{"cidr": "..."}`) |
-| `GET` | `/api/alerts` | Active alerts |
-| `GET` | `/api/alerts/history` | Resolved alert history |
-| `POST` | `/api/alerts/acknowledge` | Acknowledge alert |
-| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all firing alerts |
-
-### Settings & Stream
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/settings` | Current settings |
-| `PUT` | `/api/settings` | Update settings |
-| `GET` | `/api/stream` | SSE stream for real-time updates |
-
-## Project Structure
-
-```
-├── main.go                      # Entrypoint
-├── go.mod
-├── verify_e2e.py                # E2E test suite
-├── pkg/
-│   ├── network/                 # CIDR parsing, exclusion matching
-│   ├── pinger/                  # ICMP sockets, probe engine, pacing
-│   ├── timeseries/              # Ring buffer, 1m/1h rollups, outlier detection
-│   ├── alerts/                  # Alert lifecycle and acknowledgements
-│   ├── store/                   # Atomic JSON persistence
-│   └── server/                  # HTTP server, REST API, SSE
-│       └── web_dist/            # Embedded dashboard (HTML/CSS/JS)
-└── data/                        # Persistent storage directory
-```
-
-## Testing
+### Start the Daemon
 
 ```bash
-go test -v -race ./...
+./dinis -port 8080 -data data/dinis.json
 ```
 
-E2E tests against a running instance:
+Once running, access the web dashboard at `http://localhost:8080`.
+
+### REST API Examples
+
+Add a CIDR range for discovery and monitoring:
 ```bash
-./dinis -port 8080 -data data/dinis_test.json &
-python3 verify_e2e.py
+curl -X POST http://localhost:8080/api/cidrs \
+  -H "Content-Type: application/json" \
+  -d '{"cidr": "192.168.1.0/24", "label": "LAN"}'
+```
+
+Trigger an immediate discovery scan:
+```bash
+curl -X POST http://localhost:8080/api/discovery/run
+```
+
+Get system summary metrics:
+```bash
+curl http://localhost:8080/api/summary
+```
+
+Send an on-demand ping probe to a specific host:
+```bash
+curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
+```
+
+## Configuration
+
+### Command-Line Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `-port` | `8080` | HTTP listen port for API and web dashboard |
+| `-host` | `0.0.0.0` | HTTP listen address |
+| `-data` | `data/dinis.json` | Path to persistent JSON database file |
+| `-static` | `""` | Directory path for static web assets (overrides embedded assets) |
+| `-influxdb-url` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
+| `-influxdb-bucket` | `dinis` | InfluxDB database/bucket name |
+| `-influxdb-token` | `""` | InfluxDB authentication token |
+| `-version` | `false` | Print version and exit |
+
+### Environment Variables (Docker Compose)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DINIS_PORT` | `8080` | Host port mapped to the DINIS container |
+| `DINIS_DATA` | `/data/dinis.json` | Storage file path inside the container |
+| `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB 3 Core endpoint |
+| `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
+| `INFLUXDB3_TOKEN` | `""` | InfluxDB API token |
+| `INFLUXDB3_NODE_ID` | `dinis-node` | InfluxDB 3 node identifier |
+| `GRAFANA_ADMIN_PASSWORD` | `admin` | Initial admin password for Grafana |
+
+## Architecture / Project Structure
+
+```
+.
+├── main.go               # Program entrypoint, CLI flag configuration, and service coordinator
+├── Dockerfile            # Multi-stage build definition for alpine-based container
+├── docker-compose.yml    # Service definition for DINIS, InfluxDB 3 Core, and Grafana
+├── verify_e2e.py         # End-to-end integration and API verification test script
+└── pkg/
+    ├── alerts/           # Alert evaluation, state transitions, and acknowledgments
+    ├── influxdb/         # InfluxDB 3 line protocol metric exporter
+    ├── network/          # CIDR parsing, IP expansion, and exclusion matching
+    ├── pinger/           # ICMP raw/datagram sockets, packet pacing, and probe engine
+    ├── server/           # HTTP handlers, REST API endpoints, and SSE event streaming
+    │   └── web_dist/     # Embedded web dashboard frontend assets
+    ├── store/            # JSON persistence layer with atomic writes
+    └── timeseries/       # In-memory metric ring buffers, rollups, and outlier detection
 ```

@@ -3,13 +3,27 @@ services:
     image: influxdb:3-core
     container_name: dinis-influxdb3
     user: "0:0"
+    environment:
+      - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
+      - INFLUXDB3_NODE_ID=${INFLUXDB3_NODE_ID:-dinis-node}
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - influxdb3
-      - serve
-      - --node-id=${INFLUXDB3_NODE_ID:-dinis-node}
-      - --object-store=file
-      - --data-dir=/var/lib/influxdb3/data
-      - --without-auth
+      - >
+        if [ -n "$$INFLUXDB3_TOKEN" ]; then
+          mkdir -p /var/lib/influxdb3
+          echo "{\"token\": \"$$INFLUXDB3_TOKEN\", \"name\": \"admin\"}" > /var/lib/influxdb3/admin-token.json
+          exec influxdb3 serve \
+            --node-id=$${INFLUXDB3_NODE_ID:-dinis-node} \
+            --object-store=file \
+            --data-dir=/var/lib/influxdb3/data \
+            --admin-token-file=/var/lib/influxdb3/admin-token.json
+        else
+          exec influxdb3 serve \
+            --node-id=$${INFLUXDB3_NODE_ID:-dinis-node} \
+            --object-store=file \
+            --data-dir=/var/lib/influxdb3/data \
+            --without-auth
+        fi
     ports:
       - "8181:8181"
     volumes:
