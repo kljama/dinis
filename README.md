@@ -76,7 +76,7 @@ curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 | `-static` | `""` | Directory path for static web assets (overrides embedded assets) |
 | `-influxdb-url` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
 | `-influxdb-bucket` | `dinis` | InfluxDB database/bucket name |
-| `-influxdb-token` | `""` | InfluxDB authentication token |
+| `-influxdb-token` | `""` | InfluxDB authentication token (must start with `apiv3_` if set) |
 | `-version` | `false` | Print version and exit |
 
 ### Environment Variables (Docker Compose)
@@ -87,7 +87,7 @@ curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 | `DINIS_DATA` | `/data/dinis.json` | Storage file path inside the container |
 | `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB 3 Core endpoint |
 | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
-| `INFLUXDB3_TOKEN` | `""` | InfluxDB API token |
+| `INFLUXDB3_TOKEN` | `""` | InfluxDB API token (must start with `apiv3_` if set) |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | InfluxDB 3 node identifier |
 | `GRAFANA_ADMIN_PASSWORD` | `admin` | Initial admin password for Grafana |
 
