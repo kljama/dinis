@@ -3,9 +3,7 @@ package timeseries
 import (
 	"container/list"
 	"context"
-	"encoding/binary"
 	"math"
-	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -476,15 +474,26 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 			p95Lat = getPercentile(latencies, 0.95)
 		}
 
-		// Sort cells by IP numerically
-		sort.Slice(cells, func(i, j int) bool {
-			ipA := net.ParseIP(cells[i].IP).To4()
-			ipB := net.ParseIP(cells[j].IP).To4()
-			if ipA != nil && ipB != nil {
-				return binary.BigEndian.Uint32(ipA) < binary.BigEndian.Uint32(ipB)
+		// Pre-parse cells to uint32 for fast sorting
+		type parsedCell struct {
+			cell   SubnetMatrixCell
+			ipUint uint32
+		}
+		parsedCells := make([]parsedCell, len(cells))
+		for i, c := range cells {
+			parsedCells[i] = parsedCell{
+				cell:   c,
+				ipUint: parseIPv4ToUint32(c.IP),
 			}
-			return cells[i].IP < cells[j].IP
+		}
+
+		sort.Slice(parsedCells, func(i, j int) bool {
+			return parsedCells[i].ipUint < parsedCells[j].ipUint
 		})
+
+		for i := range cells {
+			cells[i] = parsedCells[i].cell
+		}
 
 		blocks = append(blocks, SubnetMatrixBlock{
 			CIDR:          cidr,
@@ -500,20 +509,52 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 		})
 	}
 
-	// Sort blocks numerically by network IP address, then prefix length
-	sort.Slice(blocks, func(i, j int) bool {
-		ipA, maskA := parseCIDRBaseUint32(blocks[i].CIDR)
-		ipB, maskB := parseCIDRBaseUint32(blocks[j].CIDR)
-		if ipA != ipB {
-			return ipA < ipB
+	// Pre-parse block CIDR bases for fast block sorting
+	type parsedBlock struct {
+		block     SubnetMatrixBlock
+		ipUint    uint32
+		prefixLen int
+	}
+	parsedBlocks := make([]parsedBlock, len(blocks))
+	for i, b := range blocks {
+		ipUint, prefixLen := parseCIDRBaseUint32(b.CIDR)
+		parsedBlocks[i] = parsedBlock{
+			block:     b,
+			ipUint:    ipUint,
+			prefixLen: prefixLen,
 		}
-		if maskA != maskB {
-			return maskA < maskB
+	}
+
+	sort.Slice(parsedBlocks, func(i, j int) bool {
+		if parsedBlocks[i].ipUint != parsedBlocks[j].ipUint {
+			return parsedBlocks[i].ipUint < parsedBlocks[j].ipUint
 		}
-		return blocks[i].CIDR < blocks[j].CIDR
+		if parsedBlocks[i].prefixLen != parsedBlocks[j].prefixLen {
+			return parsedBlocks[i].prefixLen < parsedBlocks[j].prefixLen
+		}
+		return parsedBlocks[i].block.CIDR < parsedBlocks[j].block.CIDR
 	})
 
+	for i := range blocks {
+		blocks[i] = parsedBlocks[i].block
+	}
+
 	return blocks
+}
+
+func parseIPv4ToUint32(ipStr string) uint32 {
+	var val uint32
+	var octet uint32
+	for i := 0; i < len(ipStr); i++ {
+		b := ipStr[i]
+		if b >= '0' && b <= '9' {
+			octet = octet*10 + uint32(b-'0')
+		} else if b == '.' {
+			val = (val << 8) | octet
+			octet = 0
+		}
+	}
+	return (val << 8) | octet
 }
 
 func parseCIDRBaseUint32(cidrStr string) (uint32, int) {
@@ -525,9 +566,5 @@ func parseCIDRBaseUint32(cidrStr string) (uint32, int) {
 			prefixLen = p
 		}
 	}
-	ip := net.ParseIP(ipStr).To4()
-	if ip == nil {
-		return 0, prefixLen
-	}
-	return binary.BigEndian.Uint32(ip), prefixLen
+	return parseIPv4ToUint32(ipStr), prefixLen
 }
