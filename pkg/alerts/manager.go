@@ -69,13 +69,13 @@ func (m *Manager) pushHistory(alert *Alert) {
 // Trigger creates or updates an alert when an IP becomes unreachable.
 func (m *Manager) Trigger(ip, alias, cidr, lastErr string) *Alert {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	now := time.Now()
 	if existing, exists := m.activeAlerts[ip]; exists {
 		existing.LastError = lastErr
 		existing.DurationSec = int64(now.Sub(existing.StartedAt).Seconds())
 		cpy := *existing
+		m.mu.Unlock()
 		return &cpy
 	}
 
@@ -93,9 +93,11 @@ func (m *Manager) Trigger(ip, alias, cidr, lastErr string) *Alert {
 
 	m.activeAlerts[ip] = alert
 	cpy := *alert
+	cb := m.OnAlertTriggered
+	m.mu.Unlock()
 
-	if m.OnAlertTriggered != nil {
-		go m.OnAlertTriggered(&cpy)
+	if cb != nil {
+		cb(&cpy)
 	}
 
 	return &cpy
@@ -104,7 +106,6 @@ func (m *Manager) Trigger(ip, alias, cidr, lastErr string) *Alert {
 // Acknowledge marks an alert as acknowledged by an operator with an optional note.
 func (m *Manager) Acknowledge(ipOrID, ackBy, note string) (*Alert, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	var target *Alert
 	if a, exists := m.activeAlerts[ipOrID]; exists {
@@ -119,6 +120,7 @@ func (m *Manager) Acknowledge(ipOrID, ackBy, note string) (*Alert, error) {
 	}
 
 	if target == nil {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("active alert for %q not found", ipOrID)
 	}
 
@@ -135,8 +137,11 @@ func (m *Manager) Acknowledge(ipOrID, ackBy, note string) (*Alert, error) {
 	target.DurationSec = int64(now.Sub(target.StartedAt).Seconds())
 
 	cpy := *target
-	if m.OnAlertAcknowledged != nil {
-		go m.OnAlertAcknowledged(&cpy)
+	cb := m.OnAlertAcknowledged
+	m.mu.Unlock()
+
+	if cb != nil {
+		cb(&cpy)
 	}
 
 	return &cpy, nil
@@ -145,7 +150,6 @@ func (m *Manager) Acknowledge(ipOrID, ackBy, note string) (*Alert, error) {
 // AcknowledgeAll acknowledges all currently firing unacknowledged alerts.
 func (m *Manager) AcknowledgeAll(ackBy, note string) []*Alert {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	now := time.Now()
 	if ackBy == "" {
@@ -164,9 +168,14 @@ func (m *Manager) AcknowledgeAll(ackBy, note string) []*Alert {
 
 			cpy := *target
 			acknowledged = append(acknowledged, &cpy)
-			if m.OnAlertAcknowledged != nil {
-				go m.OnAlertAcknowledged(&cpy)
-			}
+		}
+	}
+	cb := m.OnAlertAcknowledged
+	m.mu.Unlock()
+
+	if cb != nil {
+		for _, a := range acknowledged {
+			cb(a)
 		}
 	}
 
@@ -176,10 +185,10 @@ func (m *Manager) AcknowledgeAll(ackBy, note string) []*Alert {
 // Resolve clears the alert when a host recovers and moves it to history.
 func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	alert, exists := m.activeAlerts[ip]
 	if !exists {
+		m.mu.Unlock()
 		return nil, false
 	}
 
@@ -192,8 +201,11 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	m.pushHistory(alert)
 
 	cpy := *alert
-	if m.OnAlertResolved != nil {
-		go m.OnAlertResolved(&cpy)
+	cb := m.OnAlertResolved
+	m.mu.Unlock()
+
+	if cb != nil {
+		cb(&cpy)
 	}
 
 	return &cpy, true
@@ -202,7 +214,6 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 // ResolveIf evaluates active alerts directly under lock and resolves any matching alerts without creating intermediate slices of all active alerts.
 func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	var resolved []*Alert
 	now := time.Now()
@@ -218,9 +229,14 @@ func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
 
 			cpy := *alert
 			resolved = append(resolved, &cpy)
-			if m.OnAlertResolved != nil {
-				go m.OnAlertResolved(&cpy)
-			}
+		}
+	}
+	cb := m.OnAlertResolved
+	m.mu.Unlock()
+
+	if cb != nil {
+		for _, a := range resolved {
+			cb(a)
 		}
 	}
 

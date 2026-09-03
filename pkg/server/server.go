@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,12 +68,17 @@ type Coordinator struct {
 // NewCoordinator creates and wires the entire monitoring subsystem.
 func NewCoordinator(st *store.Store) *Coordinator {
 	settings := st.GetSettings()
+	maxMetricHosts := settings.MaxMetricHosts
+	if maxMetricHosts <= 0 {
+		maxMetricHosts = 10000
+	}
 	cfg := pinger.EngineConfig{
-		Interval:      time.Duration(settings.IntervalSec * float64(time.Second)),
-		Timeout:       time.Duration(settings.TimeoutMs) * time.Millisecond,
-		Concurrency:   settings.Concurrency,
-		FailThreshold: settings.FailThreshold,
-		HistorySize:   25,
+		Interval:       time.Duration(settings.IntervalSec * float64(time.Second)),
+		Timeout:        time.Duration(settings.TimeoutMs) * time.Millisecond,
+		Concurrency:    settings.Concurrency,
+		FailThreshold:  settings.FailThreshold,
+		HistorySize:    25,
+		MaxMetricHosts: maxMetricHosts,
 	}
 
 	p := pinger.NewEngine(cfg)
@@ -168,12 +174,14 @@ func (c *Coordinator) RebuildTargetList() {
 		}
 	}
 
+	allConfiguredCIDRs := make(map[string]bool)
 	validCIDRs := make(map[string]bool)
 	cidrMap := make(map[string]*network.CIDRInfo)
 	totalCapacity := 0
 	var newStaticHosts []store.DiscoveredHost
 
 	for _, cfg := range cidrs {
+		allConfiguredCIDRs[cfg.CIDR] = true
 		if !cfg.Enabled {
 			continue
 		}
@@ -210,8 +218,8 @@ func (c *Coordinator) RebuildTargetList() {
 		}
 	}
 
-	// Prune discovered hosts belonging to deleted CIDRs (preserves IsStatic hosts)
-	if err := c.store.PruneDiscoveredHosts(validCIDRs); err != nil {
+	// Prune discovered hosts belonging to deleted CIDRs (preserves IsStatic hosts and disabled CIDRs)
+	if err := c.store.PruneDiscoveredHosts(allConfiguredCIDRs); err != nil {
 		log.Printf("[DINIS] Error pruning unmanaged discovered hosts from disk: %v", err)
 	}
 
@@ -261,22 +269,51 @@ func (c *Coordinator) RebuildTargetList() {
 		status := pinger.StatusPending
 		if matched {
 			status = pinger.StatusExcluded
+		} else if existing, ok := c.pinger.GetHost(ip); ok {
+			// Retain existing live status (e.g. UP, DOWN) across rebuilds
+			status = existing.Status
+		}
+
+		activeAlert, hasAlert := c.alerts.GetAlertForIP(ip)
+		alertActive := false
+		alertID := ""
+		alertAck := false
+		alertAckBy := ""
+		alertAckNote := ""
+		var alertAckAt *time.Time
+		var alertStartedAt *time.Time
+
+		if hasAlert && !matched {
+			alertActive = true
+			alertID = activeAlert.ID
+			alertAck = activeAlert.Acknowledged
+			alertAckBy = activeAlert.AcknowledgedBy
+			alertAckNote = activeAlert.AckNote
+			alertAckAt = activeAlert.AcknowledgedAt
+			alertStartedAt = &activeAlert.StartedAt
 		}
 
 		discAt := disc.DiscoveredAt
 		lastDisc := disc.LastDiscovered
 
 		hostMap[ip] = &pinger.HostState{
-			IP:              ip,
-			Alias:           alias,
-			CIDR:            hostCIDR,
-			Status:          status,
-			IsExcluded:      matched,
-			ExclusionReason: reason,
-			DiscoveredAt:    &discAt,
-			LastDiscovered:  &lastDisc,
-			IsStatic:        disc.IsStatic,
-			LatencyHistory:  make([]float64, 0, 25),
+			IP:                ip,
+			Alias:             alias,
+			CIDR:              hostCIDR,
+			Status:            status,
+			IsExcluded:        matched,
+			ExclusionReason:   reason,
+			DiscoveredAt:      &discAt,
+			LastDiscovered:    &lastDisc,
+			IsStatic:          disc.IsStatic,
+			AlertActive:       alertActive,
+			AlertID:           alertID,
+			AlertAcknowledged: alertAck,
+			AlertAckBy:        alertAckBy,
+			AlertAckNote:      alertAckNote,
+			AlertAckAt:        alertAckAt,
+			AlertStartedAt:    alertStartedAt,
+			LatencyHistory:    make([]float64, 0, 25),
 		}
 	}
 
@@ -383,6 +420,17 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 		concurrency = len(targets)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-c.stopChan:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	workChan := make(chan candidate, concurrency*2)
 	var discoveredMu sync.Mutex
 	discoveredOnline := 0
@@ -396,28 +444,36 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 	for w := 0; w < concurrency; w++ {
 		go func() {
 			defer wg.Done()
-			for cand := range workChan {
-				res := prober.Probe(context.TODO(), cand.ip, 750*time.Millisecond)
-				if res.Success {
-					now := time.Now()
-					discoveredMu.Lock()
-					discoveredOnline++
-					discAt := now
-					isStatic := false
-					if existing, exists := existingDiscovered[cand.ip]; exists {
-						discAt = existing.DiscoveredAt
-						isStatic = existing.IsStatic
-					} else {
-						newDiscovered++
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case cand, ok := <-workChan:
+					if !ok {
+						return
 					}
-					discoveredBatch = append(discoveredBatch, store.DiscoveredHost{
-						IP:             cand.ip,
-						CIDR:           cand.cidr,
-						DiscoveredAt:   discAt,
-						LastDiscovered: now,
-						IsStatic:       isStatic,
-					})
-					discoveredMu.Unlock()
+					res := prober.Probe(ctx, cand.ip, 750*time.Millisecond)
+					if res.Success {
+						now := time.Now()
+						discoveredMu.Lock()
+						discoveredOnline++
+						discAt := now
+						isStatic := false
+						if existing, exists := existingDiscovered[cand.ip]; exists {
+							discAt = existing.DiscoveredAt
+							isStatic = existing.IsStatic
+						} else {
+							newDiscovered++
+						}
+						discoveredBatch = append(discoveredBatch, store.DiscoveredHost{
+							IP:             cand.ip,
+							CIDR:           cand.cidr,
+							DiscoveredAt:   discAt,
+							LastDiscovered: now,
+							IsStatic:       isStatic,
+						})
+						discoveredMu.Unlock()
+					}
 				}
 			}
 		}()
@@ -437,7 +493,7 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 feeder:
 	for _, t := range targets {
 		select {
-		case <-c.stopChan:
+		case <-ctx.Done():
 			aborted = true
 			break feeder
 		case workChan <- t:
@@ -445,7 +501,7 @@ feeder:
 
 		if discPace > 0 {
 			select {
-			case <-c.stopChan:
+			case <-ctx.Done():
 				aborted = true
 				break feeder
 			case <-time.After(discPace):
@@ -688,15 +744,24 @@ type Server struct {
 	mux            *http.ServeMux
 	distFS         http.FileSystem
 	staticPath     string // If provided, serves live directory instead of embedded
-	allowedOrigins []string
+	allowedOrigins    []string
+	allowedHosts      []string
+	allowedClientIPs  []net.IP
+	allowedClientNets []*net.IPNet
+	trustedProxyIPs   []net.IP
+	trustedProxyNets  []*net.IPNet
+	apiToken          string
+	manualPingMu      sync.Mutex
+	manualPingLast    map[string]time.Time
 }
 
 // NewServer creates a new HTTP server routing all REST APIs and web dashboard assets.
 func NewServer(coord *Coordinator, staticDir string) *Server {
 	s := &Server{
-		coord:      coord,
-		mux:        http.NewServeMux(),
-		staticPath: staticDir,
+		coord:          coord,
+		mux:            http.NewServeMux(),
+		staticPath:     staticDir,
+		manualPingLast: make(map[string]time.Time),
 	}
 
 	if staticDir != "" {
@@ -717,13 +782,232 @@ func (s *Server) SetAllowedOrigins(origins []string) {
 	s.allowedOrigins = origins
 }
 
+// SetAllowedHosts configures explicit allowed Host header values for DNS rebinding protection.
+func (s *Server) SetAllowedHosts(hosts []string) {
+	s.allowedHosts = hosts
+}
+
+// SetAllowedClientIPs configures an IP filter whitelist (individual IPs or CIDR subnets).
+func (s *Server) SetAllowedClientIPs(rules []string) {
+	var ips []net.IP
+	var nets []*net.IPNet
+
+	for _, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		if strings.Contains(rule, "/") {
+			_, ipNet, err := net.ParseCIDR(rule)
+			if err == nil && ipNet != nil {
+				nets = append(nets, ipNet)
+			}
+		} else {
+			ip := net.ParseIP(rule)
+			if ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+
+	s.allowedClientIPs = ips
+	s.allowedClientNets = nets
+}
+
+// SetTrustedProxies configures reverse proxy IPs/CIDRs that are permitted to provide X-Forwarded-For, X-Real-IP, and X-Forwarded-Host.
+// It accepts individual IPs (e.g. "127.0.0.1"), CIDR ranges (e.g. "172.16.0.0/12"), or the preset "docker" / "private".
+func (s *Server) SetTrustedProxies(rules []string) {
+	var ips []net.IP
+	var nets []*net.IPNet
+
+	for _, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		if strings.EqualFold(rule, "docker") || strings.EqualFold(rule, "private") {
+			presets := []string{
+				"127.0.0.0/8",    // IPv4 Loopback
+				"::1/128",        // IPv6 Loopback
+				"10.0.0.0/8",     // RFC 1918 Class A
+				"172.16.0.0/12",  // RFC 1918 Class B (includes Docker default bridges 172.17.0.0/16 - 172.31.0.0/16)
+				"192.168.0.0/16", // RFC 1918 Class C
+				"fc00::/7",       // IPv6 Unique Local Addresses
+			}
+			for _, p := range presets {
+				_, ipNet, err := net.ParseCIDR(p)
+				if err == nil && ipNet != nil {
+					nets = append(nets, ipNet)
+				}
+			}
+			continue
+		}
+
+		if strings.Contains(rule, "/") {
+			_, ipNet, err := net.ParseCIDR(rule)
+			if err == nil && ipNet != nil {
+				nets = append(nets, ipNet)
+			}
+		} else {
+			ip := net.ParseIP(rule)
+			if ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+
+	s.trustedProxyIPs = ips
+	s.trustedProxyNets = nets
+}
+
+func (s *Server) isTrustedProxy(remoteIP net.IP) bool {
+	if remoteIP == nil {
+		return false
+	}
+	for _, ip := range s.trustedProxyIPs {
+		if remoteIP.Equal(ip) {
+			return true
+		}
+	}
+	for _, ipNet := range s.trustedProxyNets {
+		if ipNet.Contains(remoteIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// getClientIP extracts the effective client IP, checking X-Forwarded-For or X-Real-IP
+// only if the direct socket connection originates from a configured trusted proxy.
+func (s *Server) getClientIP(r *http.Request) net.IP {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+
+	remoteIP := net.ParseIP(host)
+	if remoteIP == nil {
+		return nil
+	}
+
+	if s.isTrustedProxy(remoteIP) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			// Walk backwards from right to left to find the first untrusted client IP
+			for i := len(parts) - 1; i >= 0; i-- {
+				p := strings.TrimSpace(parts[i])
+				if parsed := net.ParseIP(p); parsed != nil {
+					if !s.isTrustedProxy(parsed) {
+						return parsed
+					}
+				}
+			}
+			// If all IPs in chain are trusted proxies, use the leftmost
+			if len(parts) > 0 {
+				if first := net.ParseIP(strings.TrimSpace(parts[0])); first != nil {
+					return first
+				}
+			}
+		}
+
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			if parsed := net.ParseIP(strings.TrimSpace(xri)); parsed != nil {
+				return parsed
+			}
+		}
+	}
+
+	return remoteIP
+}
+
+func (s *Server) isAllowedClientIP(r *http.Request) bool {
+	if len(s.allowedClientIPs) == 0 && len(s.allowedClientNets) == 0 {
+		return true
+	}
+
+	clientIP := s.getClientIP(r)
+	if clientIP == nil {
+		return false
+	}
+
+	// Always allow loopback access
+	if clientIP.IsLoopback() {
+		return true
+	}
+
+	for _, ip := range s.allowedClientIPs {
+		if clientIP.Equal(ip) {
+			return true
+		}
+	}
+
+	for _, ipNet := range s.allowedClientNets {
+		if ipNet.Contains(clientIP) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// SetAPIToken configures an optional authentication token required on API endpoints.
+func (s *Server) SetAPIToken(token string) {
+	s.apiToken = token
+}
+
+func (s *Server) isAllowedHostName(reqHost string) bool {
+	if len(s.allowedHosts) == 0 {
+		return true
+	}
+	if reqHost == "" {
+		return false
+	}
+	hostName := reqHost
+	if h, _, err := net.SplitHostPort(reqHost); err == nil {
+		hostName = h
+	}
+
+	// Always allow loopback
+	if hostName == "localhost" || hostName == "127.0.0.1" || hostName == "::1" {
+		return true
+	}
+
+	// Check against explicitly configured allowed hosts
+	for _, ah := range s.allowedHosts {
+		if ah == "*" || strings.EqualFold(ah, reqHost) || strings.EqualFold(ah, hostName) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *Server) isAllowedHost(r *http.Request) bool {
+	if len(s.allowedHosts) == 0 {
+		return true
+	}
+
+	reqHost := r.Host
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	if remoteIP := net.ParseIP(host); remoteIP != nil && s.isTrustedProxy(remoteIP) {
+		if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
+			reqHost = strings.TrimSpace(strings.Split(xfh, ",")[0])
+		}
+	}
+
+	return s.isAllowedHostName(reqHost)
+}
+
 func (s *Server) isAllowedOrigin(origin, reqHost string) bool {
 	if origin == "" {
 		return false
 	}
 
 	for _, ao := range s.allowedOrigins {
-		if ao == "*" || ao == origin {
+		if ao == "*" || strings.EqualFold(ao, origin) {
 			return true
 		}
 	}
@@ -733,8 +1017,12 @@ func (s *Server) isAllowedOrigin(origin, reqHost string) bool {
 		return false
 	}
 
-	// Match request Host header (same host and port)
+	// Match request Host header (same host and port).
+	// If allowed hosts are configured, enforce that reqHost is in the allowed list.
 	if strings.EqualFold(u.Host, reqHost) {
+		if len(s.allowedHosts) > 0 && !s.isAllowedHostName(reqHost) {
+			return false
+		}
 		return true
 	}
 
@@ -759,12 +1047,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
+	// Public Health check endpoint for Docker / Kubernetes liveness & readiness probes
+	if r.URL.Path == "/health" || r.URL.Path == "/api/health" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+
+	// Validate client IP filter if configured
+	if !s.isAllowedClientIP(r) {
+		http.Error(w, "Forbidden: Client IP not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Validate Host header if allowed hosts are configured (protects against DNS rebinding attacks)
+	if len(s.allowedHosts) > 0 && !s.isAllowedHost(r) {
+		http.Error(w, "Forbidden: Invalid Host header", http.StatusForbidden)
+		return
+	}
+
+	// Validate API token if configured
+	if s.apiToken != "" && strings.HasPrefix(r.URL.Path, "/api/") {
+		token := ""
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
+			token = apiKey
+		} else {
+			token = r.URL.Query().Get("token")
+		}
+
+		if token == "" || token != s.apiToken {
+			writeError(w, http.StatusUnauthorized, "Unauthorized: invalid or missing API token")
+			return
+		}
+	}
+
 	origin := r.Header.Get("Origin")
 	if origin != "" {
 		if s.isAllowedOrigin(origin, r.Host) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 			w.Header().Set("Vary", "Origin")
 		} else if r.Method == http.MethodOptions {
 			// Untrusted cross-origin preflight rejected
@@ -825,13 +1151,66 @@ func (s *Server) routes() {
 	// Static UI assets
 	if s.distFS != nil {
 		fileServer := http.FileServer(s.distFS)
-		s.mux.Handle("/", fileServer)
+		s.mux.Handle("/", s.cacheControlMiddleware(fileServer))
 	} else {
 		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte("<h1>DINIS ICMP Monitor Running</h1>"))
 		})
 	}
+}
+
+func (s *Server) allowManualPing(ip string) bool {
+	s.manualPingMu.Lock()
+	defer s.manualPingMu.Unlock()
+
+	now := time.Now()
+	if last, exists := s.manualPingLast[ip]; exists {
+		if now.Sub(last) < 1*time.Second {
+			return false
+		}
+	}
+
+	s.manualPingLast[ip] = now
+
+	// Periodic cleanup to avoid unbounded memory growth
+	if len(s.manualPingLast) > 1000 {
+		cutoff := now.Add(-5 * time.Minute)
+		for k, t := range s.manualPingLast {
+			if t.Before(cutoff) {
+				delete(s.manualPingLast, k)
+			}
+		}
+	}
+
+	return true
+}
+
+func (s *Server) cacheControlMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/" || path == "/index.html" {
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		ext := filepath.Ext(path)
+		switch ext {
+		case ".js", ".css", ".svg", ".png", ".ico", ".woff2":
+			w.Header().Set("Cache-Control", "public, max-age=86400, must-revalidate")
+			etag := fmt.Sprintf(`W/"dinis-%s"`, strings.ReplaceAll(path, "/", "-"))
+			w.Header().Set("ETag", etag)
+			if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // JSON Helpers
@@ -906,6 +1285,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Send initial greeting / sync state
 	summary := s.coord.pinger.GetSummary()
 	sumBytes, _ := json.Marshal(summary)
+	_ = rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, _ = fmt.Fprintf(w, "event: summary_update\ndata: %s\n\n", string(sumBytes))
 	flusher.Flush()
 
@@ -918,6 +1298,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
+			_ = rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			_, err := w.Write(msg)
 			if err != nil {
 				return
@@ -1296,6 +1677,10 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 	case "ping":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		if !s.allowManualPing(ip) {
+			writeError(w, http.StatusTooManyRequests, "Rate limit exceeded: manual ping allows at most 1 probe per second per host")
 			return
 		}
 		res := s.coord.pinger.PingSingle(r.Context(), ip)
@@ -1677,6 +2062,15 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.DiscoveryIntervalMin < 0 {
 			req.DiscoveryIntervalMin = 0
 		}
+		if req.MaxMetricHosts <= 0 {
+			req.MaxMetricHosts = 10000
+		}
+		if req.MaxMetricHosts < 500 {
+			req.MaxMetricHosts = 500
+		}
+		if req.MaxMetricHosts > 500000 {
+			req.MaxMetricHosts = 500000
+		}
 
 		if err := s.coord.store.UpdateSettings(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -1685,11 +2079,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 		// Update engine config live
 		s.coord.pinger.UpdateConfig(pinger.EngineConfig{
-			Interval:      time.Duration(req.IntervalSec * float64(time.Second)),
-			Timeout:       time.Duration(req.TimeoutMs) * time.Millisecond,
-			Concurrency:   req.Concurrency,
-			FailThreshold: req.FailThreshold,
-			HistorySize:   25,
+			Interval:       time.Duration(req.IntervalSec * float64(time.Second)),
+			Timeout:        time.Duration(req.TimeoutMs) * time.Millisecond,
+			Concurrency:    req.Concurrency,
+			FailThreshold:  req.FailThreshold,
+			HistorySize:    25,
+			MaxMetricHosts: req.MaxMetricHosts,
 		})
 
 		s.coord.discMu.Lock()

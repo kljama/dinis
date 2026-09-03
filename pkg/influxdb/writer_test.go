@@ -20,6 +20,8 @@ func TestEscapeTag(t *testing.T) {
 		{"with,comma", "with\\,comma"},
 		{"with=equals", "with\\=equals"},
 		{"a b,c=d", "a\\ b\\,c\\=d"},
+		{"line\nbreak", "line break"},
+		{"carriage\rreturn", "carriage return"},
 	}
 	for _, tc := range tests {
 		got := escapeTag(tc.input)
@@ -61,7 +63,7 @@ func TestWriteProbeLineProtocol(t *testing.T) {
 	if !strings.Contains(received, "icmp_probe,ip=1.2.3.4,subnet=10.0.0.0/24,alias=myhost") {
 		t.Errorf("unexpected line-protocol output: %q", received)
 	}
-	if !strings.Contains(received, "latency_ms=12.3456") {
+	if !strings.Contains(received, "latency_ms=12.35") {
 		t.Errorf("missing latency_ms field: %q", received)
 	}
 	if !strings.Contains(received, "success=1i") {
@@ -243,3 +245,55 @@ func BenchmarkWriteProbe(b *testing.B) {
 		}
 	})
 }
+
+func TestWriterRetainFailedPayload(t *testing.T) {
+	var shouldFail int32 = 1
+	receivedCh := make(chan string, 10)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&shouldFail) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		buf := new(strings.Builder)
+		io.Copy(buf, r.Body)
+		receivedCh <- buf.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:           srv.URL,
+		Bucket:        "retryretaindb",
+		FlushInterval: 100 * time.Millisecond,
+		BatchSize:     1,
+	}
+	w := NewWriter(cfg)
+
+	// Write probe while server is returning 500 InternalServerError
+	w.WriteProbe("10.99.99.1", "failing-host", "", 5.5, true, time.Now())
+
+	// Allow initial attempts to fail and retain
+	time.Sleep(350 * time.Millisecond)
+
+	// Recover the server
+	atomic.StoreInt32(&shouldFail, 0)
+
+	// Enqueue another probe to trigger a successful flush of retained data
+	w.WriteProbe("10.99.99.2", "succeeding-host", "", 2.2, true, time.Now())
+
+	var received string
+	select {
+	case received = <-receivedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for flush after server recovery")
+	}
+
+	w.Stop()
+
+	// The flushed data must contain the previously failed probe payload
+	if !strings.Contains(received, "10.99.99.1") {
+		t.Errorf("expected previously failed probe 10.99.99.1 to be retained and flushed, got: %q", received)
+	}
+}
+

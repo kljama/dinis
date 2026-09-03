@@ -509,6 +509,29 @@ func TestStoreMassiveHostIngestionBoundedMemory(t *testing.T) {
 	}
 }
 
+func TestStoreSetCapacity(t *testing.T) {
+	st := NewStoreWithLimit(2)
+	now := time.Now()
+
+	st.Record("10.0.0.1", now, 1.0, true)
+	st.Record("10.0.0.2", now, 2.0, true)
+
+	// Expand capacity to 5
+	st.SetCapacity(5)
+
+	st.Record("10.0.0.3", now, 3.0, true)
+	st.Record("10.0.0.4", now, 4.0, true)
+
+	st.mu.RLock()
+	count := len(st.rawBuffers)
+	st.mu.RUnlock()
+
+	if count != 4 {
+		t.Errorf("expected 4 hosts retained after expanding capacity, got %d", count)
+	}
+}
+
+
 
 
 

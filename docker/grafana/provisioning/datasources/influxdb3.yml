@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB3
+    type: influxdb
+    access: proxy
+    url: http://influxdb3:8181
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: ${INFLUXDB3_BUCKET:-dinis}
+      defaultBucket: ${INFLUXDB3_BUCKET:-dinis}
+      httpMode: POST
+    secureJsonData:
+      token: ${INFLUXDB3_TOKEN}
+    editable: true

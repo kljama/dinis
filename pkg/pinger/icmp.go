@@ -160,7 +160,7 @@ func (p *SingleProber) Probe(ctx context.Context, ipStr string, timeout time.Dur
 		}
 	}
 
-	result, err := p.nativeProbe(parsedIP, timeout)
+	result, err := p.nativeProbe(ctx, parsedIP, timeout)
 	if err == nil {
 		return result
 	}
@@ -169,7 +169,16 @@ func (p *SingleProber) Probe(ctx context.Context, ipStr string, timeout time.Dur
 	return p.execProbe(ctx, ipStr, timeout)
 }
 
-func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult, error) {
+func (p *SingleProber) nativeProbe(ctx context.Context, ip net.IP, timeout time.Duration) (PingResult, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return PingResult{
+			IP:        ip.String(),
+			Success:   false,
+			Error:     ctx.Err().Error(),
+			Timestamp: time.Now(),
+		}, nil
+	}
+
 	sock, err := p.getSocket()
 	if err != nil {
 		return PingResult{}, err
@@ -178,6 +187,9 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 	defer func() {
 		p.putSocket(sock, isFatal)
 	}()
+
+	sendTime := time.Now()
+	deadline := sendTime.Add(timeout)
 
 	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
 	_ = syscall.SetsockoptTimeval(sock.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
@@ -204,7 +216,6 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 	pkt[3] = 0
 	binary.BigEndian.PutUint16(pkt[4:6], expectedID)
 	binary.BigEndian.PutUint16(pkt[6:8], expectedSeq)
-	sendTime := time.Now()
 	sendNano := uint64(sendTime.UnixNano())
 	binary.BigEndian.PutUint64(pkt[8:16], sendNano)
 	binary.BigEndian.PutUint64(pkt[16:24], probeToken)
@@ -229,12 +240,39 @@ func (p *SingleProber) nativeProbe(ip net.IP, timeout time.Duration) (PingResult
 	}
 
 	// Read replies in a loop, skipping packets that don't match our probe.
-	// The socket receive timeout bounds this loop so it cannot spin forever.
+	// The overall probe deadline bounds this loop so it cannot spin indefinitely.
 	buf := make([]byte, 512)
 	for {
+		if ctx != nil && ctx.Err() != nil {
+			return PingResult{
+				IP:        ip.String(),
+				Success:   false,
+				Error:     ctx.Err().Error(),
+				Timestamp: time.Now(),
+			}, nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return PingResult{
+				IP:        ip.String(),
+				Success:   false,
+				Error:     "Request timeout",
+				Timestamp: time.Now(),
+			}, nil
+		}
+
+		// Dynamically adjust receive timeout so syscall does not block past the overall probe deadline
+		remainingTv := syscall.NsecToTimeval(remaining.Nanoseconds())
+		_ = syscall.SetsockoptTimeval(sock.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &remainingTv)
+
 		n, from, err := syscall.Recvfrom(sock.fd, buf, 0)
 		recvTime := time.Now()
 		if err != nil {
+			if errno, ok := err.(syscall.Errno); ok && errno == syscall.EINTR {
+				// Interrupted by signal or Go async preemption; retry if within deadline
+				continue
+			}
 			if isFatalSocketError(err) {
 				isFatal = true
 			}

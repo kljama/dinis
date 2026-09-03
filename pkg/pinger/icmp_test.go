@@ -92,3 +92,23 @@ func TestSingleProberConcurrentLocalhost(t *testing.T) {
 		t.Fatalf("%d out of %d concurrent probes failed. First error: %v", len(failures), count, failures[0])
 	}
 }
+
+func TestSingleProberContextCancellation(t *testing.T) {
+	prober := NewSingleProber()
+	defer prober.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context
+
+	start := time.Now()
+	res := prober.Probe(ctx, "127.0.0.1", 5*time.Second)
+	elapsed := time.Since(start)
+
+	if res.Success {
+		t.Errorf("expected cancelled probe to fail, but got success")
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("expected immediate cancellation, took %v", elapsed)
+	}
+}
+

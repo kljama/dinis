@@ -5,6 +5,7 @@ package influxdb
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"time"
 )
+
+const maxBufferSize = 10 << 20 // 10 MB maximum buffer ceiling
 
 // Writer batches and sends line-protocol data to InfluxDB 3 Core.
 type Writer struct {
@@ -96,7 +99,7 @@ func (w *Writer) WriteProbe(ip string, alias string, subnet string, latencyMs fl
 		b = appendEscapedTag(b, alias)
 	}
 	b = append(b, " latency_ms="...)
-	b = strconv.AppendFloat(b, latencyMs, 'f', 4, 64)
+	b = strconv.AppendFloat(b, latencyMs, 'f', 2, 64)
 	if success {
 		b = append(b, ",success=1i "...)
 	} else {
@@ -106,8 +109,12 @@ func (w *Writer) WriteProbe(ip string, alias string, subnet string, latencyMs fl
 	b = append(b, '\n')
 
 	w.mu.Lock()
-	w.buf.Write(b)
-	w.count++
+	if w.buf.Len()+len(b) <= maxBufferSize {
+		w.buf.Write(b)
+		w.count++
+	} else {
+		log.Printf("[INFLUXDB] Buffer ceiling reached (%d bytes); dropping newest probe metric to prevent OOM", maxBufferSize)
+	}
 	shouldSignal := w.count >= w.batchSize
 	w.mu.Unlock()
 
@@ -143,6 +150,20 @@ func (w *Writer) flushLoop() {
 	}
 }
 
+func (w *Writer) retainFailedPayload(payload []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.buf.Len()+len(payload) <= maxBufferSize {
+		var newBuf bytes.Buffer
+		newBuf.Write(payload)
+		newBuf.Write(w.buf.Bytes())
+		w.buf = newBuf
+	} else {
+		log.Printf("[INFLUXDB] Buffer ceiling reached; dropping oldest failed metrics to prevent OOM")
+	}
+}
+
 func (w *Writer) flush() {
 	w.mu.Lock()
 	if w.buf.Len() == 0 {
@@ -162,6 +183,7 @@ func (w *Writer) flush() {
 		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 		if err != nil {
 			log.Printf("[INFLUXDB] Failed to create request: %v", err)
+			w.retainFailedPayload(payload)
 			return
 		}
 		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
@@ -176,9 +198,13 @@ func (w *Writer) flush() {
 				continue
 			}
 			log.Printf("[INFLUXDB] Write failed after retries: %v", err)
+			w.retainFailedPayload(payload)
 			return
 		}
-		defer resp.Body.Close()
+
+		// Drain and close body for this attempt so the HTTP connection can be reused
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return
@@ -191,17 +217,23 @@ func (w *Writer) flush() {
 		}
 
 		log.Printf("[INFLUXDB] Write returned status %d", resp.StatusCode)
+		if resp.StatusCode >= 500 {
+			w.retainFailedPayload(payload)
+		}
 		return
 	}
 }
 
-// appendEscapedTag appends tag string s to dst, escaping '\', ' ', ',', and '=' per line-protocol spec.
+// appendEscapedTag appends tag string s to dst, escaping '\', ' ', ',', and '=' per line-protocol spec,
+// and sanitizing newlines to spaces so record boundaries remain intact.
 func appendEscapedTag(dst []byte, s string) []byte {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch c {
 		case '\\', ' ', ',', '=':
 			dst = append(dst, '\\', c)
+		case '\n', '\r':
+			dst = append(dst, ' ')
 		default:
 			dst = append(dst, c)
 		}

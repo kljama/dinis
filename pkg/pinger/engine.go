@@ -54,21 +54,23 @@ type HostState struct {
 
 // EngineConfig holds configuration parameters for the async ICMP engine.
 type EngineConfig struct {
-	Interval      time.Duration
-	Timeout       time.Duration
-	Concurrency   int
-	FailThreshold int
-	HistorySize   int
+	Interval       time.Duration
+	Timeout        time.Duration
+	Concurrency    int
+	FailThreshold  int
+	HistorySize    int
+	MaxMetricHosts int
 }
 
 // DefaultConfig returns default engine settings.
 func DefaultConfig() EngineConfig {
 	return EngineConfig{
-		Interval:      60 * time.Second,
-		Timeout:       1000 * time.Millisecond,
-		Concurrency:   100,
-		FailThreshold: 2,
-		HistorySize:   20,
+		Interval:       60 * time.Second,
+		Timeout:        1000 * time.Millisecond,
+		Concurrency:    100,
+		FailThreshold:  2,
+		HistorySize:    20,
+		MaxMetricHosts: 10000,
 	}
 }
 
@@ -131,10 +133,15 @@ func NewEngine(cfg EngineConfig) *Engine {
 		cfg.HistorySize = 20
 	}
 
+	maxMetricHosts := cfg.MaxMetricHosts
+	if maxMetricHosts <= 0 {
+		maxMetricHosts = timeseries.DefaultMaxHosts
+	}
+
 	return &Engine{
 		config:   cfg,
 		prober:   NewSingleProber(),
-		tsStore:  timeseries.NewStore(),
+		tsStore:  timeseries.NewStoreWithLimit(maxMetricHosts),
 		hosts:    make(map[string]*HostState),
 		wakeChan: make(chan struct{}, 1),
 	}
@@ -157,6 +164,9 @@ func (e *Engine) Wake() {
 func (e *Engine) UpdateConfig(cfg EngineConfig) {
 	e.mu.Lock()
 	e.config = cfg
+	if cfg.MaxMetricHosts > 0 && e.tsStore != nil {
+		e.tsStore.SetCapacity(cfg.MaxMetricHosts)
+	}
 	e.mu.Unlock()
 	e.Wake()
 }
@@ -187,6 +197,18 @@ func (e *Engine) SetHosts(hosts map[string]*HostState) {
 				oldH.AlertAckNote = ""
 				oldH.AlertAckAt = nil
 				oldH.AlertStartedAt = nil
+			} else if oldH.Status == StatusExcluded {
+				oldH.Status = StatusPending
+				oldH.ConsecutiveFails = 0
+			} else {
+				// Keep alert state synchronized with coordinator alert manager
+				oldH.AlertActive = newH.AlertActive
+				oldH.AlertID = newH.AlertID
+				oldH.AlertAcknowledged = newH.AlertAcknowledged
+				oldH.AlertAckBy = newH.AlertAckBy
+				oldH.AlertAckNote = newH.AlertAckNote
+				oldH.AlertAckAt = newH.AlertAckAt
+				oldH.AlertStartedAt = newH.AlertStartedAt
 			}
 
 			newMap[ip] = oldH
@@ -647,7 +669,7 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 	if len(h.LatencyHistory) > 0 {
 		lostCount := 0
 		for _, lat := range h.LatencyHistory {
-			if lat <= 0 {
+			if lat < 0 {
 				lostCount++
 			}
 		}

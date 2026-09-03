@@ -222,7 +222,15 @@
     inputConcurrency: document.getElementById('inputConcurrency'),
 
     // Toast Container
-    toastContainer: document.getElementById('toastContainer')
+    toastContainer: document.getElementById('toastContainer'),
+
+    // Auth Modal
+    btnOpenAuth: document.getElementById('btnOpenAuth'),
+    modalAuth: document.getElementById('modalAuth'),
+    btnCloseAuthModal: document.getElementById('btnCloseAuthModal'),
+    btnClearAuth: document.getElementById('btnClearAuth'),
+    formAuth: document.getElementById('formAuth'),
+    inputApiToken: document.getElementById('inputApiToken')
   };
 
   // Create single floating tooltip for the Subnet Matrix
@@ -439,11 +447,50 @@
     el.btnCloseAckModal.addEventListener('click', closeAckModal);
     el.btnCancelAck.addEventListener('click', closeAckModal);
     el.formAcknowledgeAlert.addEventListener('submit', handleConfirmAcknowledge);
+
+    // Auth Modal
+    if (el.btnOpenAuth) el.btnOpenAuth.addEventListener('click', openAuthModal);
+    if (el.btnCloseAuthModal) el.btnCloseAuthModal.addEventListener('click', closeAuthModal);
+    if (el.btnClearAuth) {
+      el.btnClearAuth.addEventListener('click', () => {
+        setAPIToken('');
+        if (el.inputApiToken) el.inputApiToken.value = '';
+        closeAuthModal();
+        showToast('API token cleared', 'info');
+        connectSSE();
+        fetchSummary();
+        fetchHosts(1);
+      });
+    }
+    if (el.formAuth) {
+      el.formAuth.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const t = el.inputApiToken ? el.inputApiToken.value.trim() : '';
+        setAPIToken(t);
+        closeAuthModal();
+        showToast('API token saved', 'success');
+        connectSSE();
+        fetchSummary();
+        fetchHosts(1);
+      });
+    }
   }
+
+  let currentSSE = null;
 
   // SSE Stream Connection
   function connectSSE() {
-    const sse = new EventSource('/api/stream');
+    if (currentSSE) {
+      currentSSE.close();
+      currentSSE = null;
+    }
+    let sseUrl = '/api/stream';
+    const token = getAPIToken();
+    if (token) {
+      sseUrl += `?token=${encodeURIComponent(token)}`;
+    }
+    const sse = new EventSource(sseUrl);
+    currentSSE = sse;
 
     sse.onopen = () => {
       state.sseConnected = true;
@@ -549,10 +596,67 @@
     });
   }
 
+  // Authentication Helpers & Fetch Wrapper
+  function getAPIToken() {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('token')) {
+      const t = params.get('token');
+      localStorage.setItem('dinis_api_token', t);
+      params.delete('token');
+      const newQuery = params.toString() ? `?${params.toString()}` : '';
+      window.history.replaceState({}, document.title, window.location.pathname + newQuery + window.location.hash);
+      return t;
+    }
+    return localStorage.getItem('dinis_api_token') || '';
+  }
+
+  function setAPIToken(token) {
+    if (token) {
+      localStorage.setItem('dinis_api_token', token.trim());
+    } else {
+      localStorage.removeItem('dinis_api_token');
+    }
+  }
+
+  function openAuthModal() {
+    if (el.inputApiToken) {
+      el.inputApiToken.value = getAPIToken();
+    }
+    if (el.modalAuth) {
+      el.modalAuth.style.display = 'flex';
+    }
+  }
+
+  function closeAuthModal() {
+    if (el.modalAuth) {
+      el.modalAuth.style.display = 'none';
+    }
+  }
+
+  async function apiFetch(url, options = {}) {
+    options = options || {};
+    options.headers = options.headers || {};
+    const token = getAPIToken();
+    if (token) {
+      if (options.headers instanceof Headers) {
+        options.headers.set('Authorization', `Bearer ${token}`);
+      } else {
+        options.headers['Authorization'] = `Bearer ${token}`;
+      }
+    }
+
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      openAuthModal();
+      showToast('Authentication required (401 Unauthorized)', 'error');
+    }
+    return res;
+  }
+
   // REST API Calls
   async function fetchSummary() {
     try {
-      const res = await fetch('/api/summary');
+      const res = await apiFetch('/api/summary');
       if (res.ok) {
         state.summary = await res.json();
         renderKPIs();
@@ -564,7 +668,7 @@
 
   async function fetchSettings() {
     try {
-      const res = await fetch('/api/settings');
+      const res = await apiFetch('/api/settings');
       if (res.ok) {
         state.settings = await res.json();
       }
@@ -575,7 +679,7 @@
 
   async function fetchDiscoveryStatus() {
     try {
-      const res = await fetch('/api/discovery/status');
+      const res = await apiFetch('/api/discovery/status');
       if (res.ok) {
         state.discoveryStatus = await res.json();
         updateDiscoveryUI();
@@ -587,7 +691,7 @@
 
   async function fetchCIDRs() {
     try {
-      const res = await fetch('/api/cidrs');
+      const res = await apiFetch('/api/cidrs');
       if (res.ok) {
         state.cidrs = await res.json();
         renderCIDRTable();
@@ -599,7 +703,7 @@
 
   async function fetchExclusions() {
     try {
-      const res = await fetch('/api/exclusions');
+      const res = await apiFetch('/api/exclusions');
       if (res.ok) {
         state.exclusions = await res.json();
         renderExclusionTable();
@@ -612,7 +716,7 @@
   // Fetch Subnet Matrix Heatmap
   async function fetchSubnetsMatrix() {
     try {
-      const res = await fetch('/api/subnets/matrix');
+      const res = await apiFetch('/api/subnets/matrix');
       if (res.ok) {
         state.subnetsMatrix = await res.json();
         renderSubnetMatrix();
@@ -625,7 +729,7 @@
   // Fetch Outliers
   async function fetchOutliers() {
     try {
-      const res = await fetch('/api/outliers?limit=50');
+      const res = await apiFetch('/api/outliers?limit=50');
       if (res.ok) {
         state.outliers = await res.json();
         renderOutliers();
@@ -647,7 +751,7 @@
         lightweight: 'true'
       });
 
-      const res = await fetch(`/api/hosts?${params.toString()}`);
+      const res = await apiFetch(`/api/hosts?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
         if (data.hosts !== undefined) {
@@ -680,7 +784,7 @@
 
   async function fetchAlerts() {
     try {
-      const res = await fetch('/api/alerts');
+      const res = await apiFetch('/api/alerts');
       if (res.ok) {
         state.activeAlerts = await res.json();
         renderAlertsDrawer();
@@ -693,7 +797,7 @@
 
   async function fetchAlertHistory() {
     try {
-      const res = await fetch('/api/alerts/history');
+      const res = await apiFetch('/api/alerts/history');
       if (res.ok) {
         state.alertHistory = await res.json();
         renderAlertHistory();
@@ -1183,7 +1287,7 @@
       return;
     }
 
-    const validPoints = data.filter(v => v > 0);
+    const validPoints = data.filter(v => v >= 0);
     const min = validPoints.length > 0 ? Math.min(...validPoints) * 0.8 : 0;
     const max = validPoints.length > 0 ? Math.max(...validPoints) * 1.2 : 10;
     const range = max - min || 1;
@@ -1195,7 +1299,7 @@
     for (let i = 0; i < data.length; i++) {
       const val = data[i];
       const x = i * step;
-      if (val <= 0) {
+      if (val < 0) {
         const y = height - 2;
         if (!started) { ctx.moveTo(x, y); started = true; }
         else { ctx.lineTo(x, y); }
@@ -1306,7 +1410,7 @@
     el.hostDetailModal.style.display = 'flex';
 
     try {
-      const res = await fetch(`/api/hosts/${ip}`);
+      const res = await apiFetch(`/api/hosts/${ip}`);
       if (res.ok) {
         const host = await res.json();
         state.selectedHostData = host;
@@ -1332,7 +1436,7 @@
     }
 
     try {
-      const res = await fetch(`/api/hosts/${ip}/history?window=${window}`);
+      const res = await apiFetch(`/api/hosts/${ip}/history?window=${window}`);
       if (res.ok) {
         state.historyPoints = await res.json();
         drawHistoricalChart(el.detailSparklineCanvas, state.historyPoints);
@@ -1412,7 +1516,7 @@
       el.btnDetailPingNow.disabled = true;
       el.btnDetailPingNow.textContent = 'Probing...';
 
-      const res = await fetch(`/api/hosts/${state.selectedHostIP}/ping`, { method: 'POST' });
+      const res = await apiFetch(`/api/hosts/${state.selectedHostIP}/ping`, { method: 'POST' });
       if (res.ok) {
         const result = await res.json();
         if (result.Success) {
@@ -1441,10 +1545,10 @@
 
     try {
       if (isExcl) {
-        await fetch(`/api/exclusions?rule=${encodeURIComponent(state.selectedHostIP)}`, { method: 'DELETE' });
+        await apiFetch(`/api/exclusions?rule=${encodeURIComponent(state.selectedHostIP)}`, { method: 'DELETE' });
         showToast(`Exclusion rule removed for ${state.selectedHostIP}`, 'success');
       } else {
-        await fetch('/api/exclusions', {
+        await apiFetch('/api/exclusions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1475,7 +1579,7 @@
     if (!confirm(`Un-enroll host ${state.selectedHostIP} from active monitoring?`)) return;
 
     try {
-      const res = await fetch(`/api/hosts/${state.selectedHostIP}/enrollment`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/hosts/${state.selectedHostIP}/enrollment`, { method: 'DELETE' });
       if (res.ok) {
         showToast(`Host ${state.selectedHostIP} un-enrolled`, 'info');
         closeHostDetailModal();
@@ -1497,7 +1601,7 @@
     if (!state.selectedHostIP) return;
 
     try {
-      const res = await fetch(`/api/hosts/${state.selectedHostIP}/meta`, {
+      const res = await apiFetch(`/api/hosts/${state.selectedHostIP}/meta`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1648,7 +1752,7 @@
     localStorage.setItem('dinis_operator_name', operator);
 
     try {
-      const res = await fetch('/api/alerts/acknowledge', {
+      const res = await apiFetch('/api/alerts/acknowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1684,7 +1788,7 @@
     localStorage.setItem('dinis_operator_name', operator);
 
     try {
-      const res = await fetch('/api/alerts/acknowledge-all', {
+      const res = await apiFetch('/api/alerts/acknowledge-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1747,7 +1851,7 @@
 
       tr.querySelector('.btn-del-cidr').addEventListener('click', async () => {
         if (confirm(`Remove CIDR ${c.cidr}? Discovered hosts under this subnet will be un-enrolled.`)) {
-          await fetch(`/api/cidrs?cidr=${encodeURIComponent(c.cidr)}`, { method: 'DELETE' });
+          await apiFetch(`/api/cidrs?cidr=${encodeURIComponent(c.cidr)}`, { method: 'DELETE' });
           showToast(`Removed CIDR ${c.cidr}`, 'info');
           await Promise.all([
             fetchCIDRs(),
@@ -1773,7 +1877,7 @@
     if (!cidr) return;
 
     try {
-      const res = await fetch('/api/cidrs', {
+      const res = await apiFetch('/api/cidrs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1840,7 +1944,7 @@
       `;
 
       tr.querySelector('.btn-del-excl').addEventListener('click', async () => {
-        await fetch(`/api/exclusions?rule=${encodeURIComponent(ex.rule)}`, { method: 'DELETE' });
+        await apiFetch(`/api/exclusions?rule=${encodeURIComponent(ex.rule)}`, { method: 'DELETE' });
         showToast(`Removed exclusion ${ex.rule}`, 'info');
         await Promise.all([
           fetchExclusions(),
@@ -1864,7 +1968,7 @@
     if (!rule) return;
 
     try {
-      const res = await fetch('/api/exclusions', {
+      const res = await apiFetch('/api/exclusions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1922,7 +2026,7 @@
     };
 
     try {
-      const res = await fetch('/api/settings', {
+      const res = await apiFetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -1954,7 +2058,7 @@
       el.discRadarIcon.classList.add('scanning');
       el.btnDiscoveryText.textContent = 'Scanning Subnets...';
 
-      const res = await fetch('/api/discovery/run', {
+      const res = await apiFetch('/api/discovery/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cidr })

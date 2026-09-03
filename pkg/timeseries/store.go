@@ -86,6 +86,17 @@ func NewStoreWithLimit(maxHosts int) *Store {
 	}
 }
 
+// SetCapacity dynamically updates the maximum host retention capacity.
+func (s *Store) SetCapacity(maxHosts int) {
+	if maxHosts <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxHosts = maxHosts
+}
+
+
 // Start launches the background automated downsampling ticker.
 // Safe to call multiple times; redundant calls while running are ignored.
 func (s *Store) Start() {

@@ -17,7 +17,8 @@ services:
             --node-id=$${INFLUXDB3_NODE_ID:-dinis-node} \
             --object-store=file \
             --data-dir=/var/lib/influxdb3/data \
-            --admin-token-file=/var/lib/influxdb3/admin-token.json
+            --admin-token-file=/var/lib/influxdb3/admin-token.json \
+            --disable-authz health,ping
         else
           exec influxdb3 serve \
             --node-id=$${INFLUXDB3_NODE_ID:-dinis-node} \
@@ -26,9 +27,15 @@ services:
             --without-auth
         fi
     ports:
-      - "8181:8181"
+      - "${INFLUXDB3_PORT:-8181}:8181"
     volumes:
       - influxdb3-data:/var/lib/influxdb3/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s http://127.0.0.1:8181/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
     restart: unless-stopped
 
   dinis:
@@ -36,17 +43,34 @@ services:
     container_name: dinis
     cap_add:
       - NET_RAW
+    # Optional on Linux: use host networking for direct layer-2 ICMP monitoring
+    # and to preserve real client source IPs for DINIS_ALLOWED_CLIENT_IPS:
+    # network_mode: host
+    environment:
+      - DINIS_DATA=${DINIS_DATA:-/data/dinis.json}
+      - DINIS_PORT=${DINIS_PORT:-8080}
+      - DINIS_API_TOKEN=${DINIS_API_TOKEN:-}
+      - DINIS_ALLOWED_HOSTS=${DINIS_ALLOWED_HOSTS:-}
+      - DINIS_ALLOWED_CLIENT_IPS=${DINIS_ALLOWED_CLIENT_IPS:-}
+      - DINIS_TRUSTED_PROXIES=${DINIS_TRUSTED_PROXIES:-docker}
+      - DINIS_ALLOWED_ORIGINS=${DINIS_ALLOWED_ORIGINS:-}
+      - DINIS_MAX_METRIC_HOSTS=${DINIS_MAX_METRIC_HOSTS:-10000}
+      - INFLUXDB3_URL=${INFLUXDB3_URL:-http://influxdb3:8181}
+      - INFLUXDB3_BUCKET=${INFLUXDB3_BUCKET:-dinis}
+      - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
     ports:
       - "${DINIS_PORT:-8080}:8080"
     volumes:
       - dinis-data:/data
-    command:
-      - --data=${DINIS_DATA:-/data/dinis.json}
-      - --influxdb-url=${INFLUXDB3_URL:-http://influxdb3:8181}
-      - --influxdb-bucket=${INFLUXDB3_BUCKET:-dinis}
-      - --influxdb-token=${INFLUXDB3_TOKEN:-}
     depends_on:
-      - influxdb3
+      influxdb3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
     restart: unless-stopped
 
   grafana:
@@ -56,10 +80,14 @@ services:
       - "3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - INFLUXDB3_BUCKET=${INFLUXDB3_BUCKET:-dinis}
+      - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
     depends_on:
-      - influxdb3
+      influxdb3:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

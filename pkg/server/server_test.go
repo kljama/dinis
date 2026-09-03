@@ -640,6 +640,40 @@ func TestRunDiscoveryEmptyTargets(t *testing.T) {
 	}
 }
 
+func TestRunDiscoveryCancellationOnStop(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Add a large subnet to scan
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:    "192.0.2.0/22", // 1024 hosts
+		Enabled: true,
+	})
+
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = coord.RunDiscovery("")
+		close(done)
+	}()
+
+	// Wait briefly for discovery workers to spin up and start probing
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop coordinator - must cancel discovery workers immediately
+	start := time.Now()
+	coord.Stop()
+
+	select {
+	case <-done:
+		duration := time.Since(start)
+		if duration > 2*time.Second {
+			t.Errorf("expected discovery to abort quickly upon Stop(), took %v", duration)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("discovery did not abort within 3 seconds of Stop()")
+	}
+}
+
 func TestRequestBodySizeLimit(t *testing.T) {
 	srv, _, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -1019,6 +1053,417 @@ func TestAlertHistoryEndpointAndLifecycle(t *testing.T) {
 		t.Errorf("expected 405 Method Not Allowed, got %d", wPost.Code)
 	}
 }
+
+func TestHostHeaderValidationAndDNSRebinding(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.SetAllowedHosts([]string{"internal.corp.net", "127.0.0.1"})
+
+	// 1. Allowed host should succeed
+	req := httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Host = "internal.corp.net:8080"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for allowed host, got %d", rec.Code)
+	}
+
+	// 2. Loopback should always succeed
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Host = "127.0.0.1:8080"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for loopback host, got %d", rec.Code)
+	}
+
+	// 3. Unauthorized Host header (DNS rebinding attempt) must be rejected with 403
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Host = "attacker.evil.com:8080"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for unauthorized Host header, got %d", rec.Code)
+	}
+
+	// 4. DNS rebinding CORS check: origin matching an unauthorized Host must NOT be allowed
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Host = "attacker.evil.com:8080"
+	req.Header.Set("Origin", "http://attacker.evil.com:8080")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("expected empty CORS header for unauthorized rebind origin, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestAPITokenAuthentication(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.SetAPIToken("super-secret-token-123")
+
+	// 1. Missing token -> 401
+	req := httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing token, got %d", rec.Code)
+	}
+
+	// 2. Invalid token -> 401
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for invalid token, got %d", rec.Code)
+	}
+
+	// 3. Valid Bearer token -> 200
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Header.Set("Authorization", "Bearer super-secret-token-123")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid Bearer token, got %d", rec.Code)
+	}
+
+	// 4. Valid X-API-Key -> 200
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.Header.Set("X-API-Key", "super-secret-token-123")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid X-API-Key header, got %d", rec.Code)
+	}
+
+	// 5. Valid query param token (e.g. for SSE stream) -> 200
+	req = httptest.NewRequest(http.MethodGet, "/api/summary?token=super-secret-token-123", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid query token, got %d", rec.Code)
+	}
+
+	// 6. Non-API path (e.g. static UI assets) should NOT require token
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Errorf("static UI endpoint should not require token, got %d", rec.Code)
+	}
+}
+
+func TestRebuildTargetListPreservesLiveHostMetrics(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:    "127.0.0.1/32",
+		Enabled: true,
+	})
+	coord.RebuildTargetList()
+
+	// Perform a successful ping probe on 127.0.0.1 to establish live metrics
+	res := coord.pinger.PingSingle(context.Background(), "127.0.0.1")
+	if !res.Success {
+		t.Fatalf("expected PingSingle to succeed on 127.0.0.1: %v", res.Error)
+	}
+
+	h, ok := coord.pinger.GetHost("127.0.0.1")
+	if !ok || h.Status != pinger.StatusUp {
+		t.Fatalf("expected host 127.0.0.1 to be UP after PingSingle")
+	}
+	if h.SentPackets != 1 || h.RecvPackets != 1 || len(h.LatencyHistory) != 1 {
+		t.Fatalf("expected initial live stats: sent=%d recv=%d hist=%d", h.SentPackets, h.RecvPackets, len(h.LatencyHistory))
+	}
+
+	// Add another CIDR and rebuild target list
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:    "10.0.0.2/32",
+		Enabled: true,
+	})
+	coord.RebuildTargetList()
+
+	// Verify 127.0.0.1 metrics and status were PRESERVED, not wiped back to StatusPending or empty
+	updatedH, ok := coord.pinger.GetHost("127.0.0.1")
+	if !ok {
+		t.Fatalf("expected host 127.0.0.1 to still exist after rebuild")
+	}
+	if updatedH.Status != pinger.StatusUp {
+		t.Errorf("expected status UP preserved across rebuild, got %v", updatedH.Status)
+	}
+	if updatedH.SentPackets != 1 || updatedH.RecvPackets != 1 {
+		t.Errorf("expected packet counts preserved, got sent=%d recv=%d", updatedH.SentPackets, updatedH.RecvPackets)
+	}
+	if len(updatedH.LatencyHistory) != 1 {
+		t.Errorf("expected latency history preserved, got %d entries", len(updatedH.LatencyHistory))
+	}
+}
+
+func TestUnexclusionStateTransition(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:    "10.0.0.1/32",
+		Enabled: true,
+	})
+	_ = coord.store.AddOrUpdateExclusion(store.ExclusionConfig{
+		Rule:    "10.0.0.1",
+		Reason:  "Maintenance",
+		Enabled: true,
+	})
+	coord.RebuildTargetList()
+
+	h, ok := coord.pinger.GetHost("10.0.0.1")
+	if !ok || h.Status != pinger.StatusExcluded {
+		t.Fatalf("expected host 10.0.0.1 to be EXCLUDED, got %v (exists: %v)", h.Status, ok)
+	}
+
+	// Remove exclusion rule and rebuild
+	_ = coord.store.DeleteExclusion("10.0.0.1")
+	coord.RebuildTargetList()
+
+	hAfter, ok := coord.pinger.GetHost("10.0.0.1")
+	if !ok {
+		t.Fatalf("expected host 10.0.0.1 to exist after removing exclusion")
+	}
+	if hAfter.Status == pinger.StatusExcluded {
+		t.Errorf("expected host status to transition out of EXCLUDED, but is still EXCLUDED")
+	}
+	if hAfter.IsExcluded {
+		t.Errorf("expected IsExcluded to be false")
+	}
+}
+
+func TestClientIPFiltering(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.SetAllowedClientIPs([]string{
+		"192.168.1.50",
+		"10.0.0.0/24",
+	})
+
+	// 1. Allowed single IP -> 200
+	req := httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "192.168.1.50:12345"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for allowed single IP, got %d", rec.Code)
+	}
+
+	// 2. Allowed CIDR subnet IP -> 200
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "10.0.0.88:12345"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for IP in allowed subnet, got %d", rec.Code)
+	}
+
+	// 3. Loopback IP -> always allowed
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for loopback IP, got %d", rec.Code)
+	}
+
+	// 4. Disallowed IP -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "172.16.50.99:12345"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for unapproved client IP, got %d", rec.Code)
+	}
+}
+
+func TestHealthEndpoints(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Lock down everything: require API token, restrict allowed hosts, restrict allowed client IPs
+	srv.SetAPIToken("secret-token")
+	srv.SetAllowedHosts([]string{"internal.corp.net"})
+	srv.SetAllowedClientIPs([]string{"10.10.10.10"})
+
+	// /health should succeed regardless of auth or IP filters (for Docker/K8s probes)
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.RemoteAddr = "172.18.0.2:50000" // container bridge IP
+	req.Host = "127.0.0.1:8080"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /health, got %d", rec.Code)
+	}
+
+	// /api/health should also succeed
+	req = httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.RemoteAddr = "172.18.0.2:50000"
+	req.Host = "127.0.0.1:8080"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /api/health, got %d", rec.Code)
+	}
+}
+
+func TestTrustedProxies(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.SetAllowedClientIPs([]string{"192.168.1.50"})
+
+	// Scenario 1: Untrusted client attempts to spoof X-Forwarded-For
+	// Direct socket address is 198.51.100.1 (not in trusted proxies)
+	req := httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "198.51.100.1:54321"
+	req.Header.Set("X-Forwarded-For", "192.168.1.50")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for untrusted client attempting XFF spoofing, got %d", rec.Code)
+	}
+
+	// Scenario 2: Configure trusted proxy IP (e.g. Docker bridge or reverse proxy)
+	srv.SetTrustedProxies([]string{"172.18.0.1"})
+
+	// Now trusted proxy forwards valid client IP -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "172.18.0.1:54321"
+	req.Header.Set("X-Forwarded-For", "192.168.1.50")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK when forwarded through trusted proxy, got %d", rec.Code)
+	}
+
+	// Scenario 3: Trusted proxy forwards an unauthorized client IP -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "172.18.0.1:54321"
+	req.Header.Set("X-Forwarded-For", "10.99.99.99")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for unauthorized client forwarded by proxy, got %d", rec.Code)
+	}
+
+	// Scenario 4: Trusted proxy forwards client IP via X-Real-IP
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "172.18.0.1:54321"
+	req.Header.Set("X-Real-IP", "192.168.1.50")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK when forwarded via X-Real-IP by trusted proxy, got %d", rec.Code)
+	}
+
+	// Scenario 5: X-Forwarded-Host from trusted proxy
+	srv.SetAllowedHosts([]string{"dashboard.mycorp.internal"})
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "172.18.0.1:54321"
+	req.Host = "172.18.0.2:8080" // container internal Host
+	req.Header.Set("X-Forwarded-Host", "dashboard.mycorp.internal")
+	req.Header.Set("X-Real-IP", "192.168.1.50")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for valid X-Forwarded-Host from trusted proxy, got %d", rec.Code)
+	}
+
+	// Scenario 6: Docker preset configuration
+	srv.SetTrustedProxies([]string{"docker"})
+	req = httptest.NewRequest(http.MethodGet, "/api/summary", nil)
+	req.RemoteAddr = "172.19.0.15:43210" // Docker custom network IP
+	req.Header.Set("X-Real-IP", "192.168.1.50")
+	req.Header.Set("X-Forwarded-Host", "dashboard.mycorp.internal")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK with 'docker' preset trusted proxy, got %d", rec.Code)
+	}
+}
+
+func TestStaticAssetCaching(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Root / or /index.html must have no-cache
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /, got %d", rec.Code)
+	}
+	cc := rec.Header().Get("Cache-Control")
+	if !strings.Contains(cc, "no-cache") {
+		t.Errorf("expected Cache-Control no-cache for root, got %q", cc)
+	}
+
+	// 2. Static asset like /app.js should return Cache-Control public and ETag
+	req = httptest.NewRequest(http.MethodGet, "/app.js", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /app.js, got %d", rec.Code)
+	}
+	cc = rec.Header().Get("Cache-Control")
+	if !strings.Contains(cc, "public") || !strings.Contains(cc, "max-age=86400") {
+		t.Errorf("expected Cache-Control public max-age=86400 for static asset, got %q", cc)
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Errorf("expected non-empty ETag for static asset")
+	}
+
+	// 3. Conditional request with matching If-None-Match should return 304 Not Modified
+	req = httptest.NewRequest(http.MethodGet, "/app.js", nil)
+	req.Header.Set("If-None-Match", etag)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("expected 304 Not Modified for matching ETag, got %d", rec.Code)
+	}
+}
+
+func TestManualPingRateLimit(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// First manual ping on 127.0.0.1 should succeed
+	req := httptest.NewRequest(http.MethodPost, "/api/hosts/127.0.0.1/ping", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected first ping to succeed with 200 OK, got %d", rec.Code)
+	}
+
+	// Immediate second ping on same IP should be rate-limited (429 Too Many Requests)
+	req = httptest.NewRequest(http.MethodPost, "/api/hosts/127.0.0.1/ping", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 Too Many Requests on immediate second ping, got %d", rec.Code)
+	}
+
+	// Immediate ping on a DIFFERENT IP (e.g. 1.1.1.1) should succeed
+	req = httptest.NewRequest(http.MethodPost, "/api/hosts/1.1.1.1/ping", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected ping on different IP to succeed with 200 OK, got %d", rec.Code)
+	}
+}
+
+
+
 
 
 

@@ -210,3 +210,40 @@ func TestEngineBeforeStateChangeHook(t *testing.T) {
 	}
 }
 
+func TestPacketLossZeroLatency(t *testing.T) {
+	cfg := EngineConfig{
+		Interval:      100 * time.Millisecond,
+		Timeout:       50 * time.Millisecond,
+		FailThreshold: 2,
+		HistorySize:   5,
+	}
+	engine := NewEngine(cfg)
+
+	host := &HostState{
+		IP: "127.0.0.1",
+	}
+
+	// Simulate host with ultra-fast 0.0ms latency probe
+	engine.applyResult(host, PingResult{
+		IP:        "127.0.0.1",
+		Success:   true,
+		LatencyMs: 0.0,
+	})
+
+	if host.PacketLoss != 0.0 {
+		t.Errorf("expected 0%% packet loss for 0.0ms probe, got %f%%", host.PacketLoss)
+	}
+
+	// Now record a failed probe (-1)
+	engine.applyResult(host, PingResult{
+		IP:      "127.0.0.1",
+		Success: false,
+		Error:   "request timeout",
+	})
+
+	// 1 success (0.0ms), 1 failure (-1) => 50% packet loss
+	if host.PacketLoss != 50.0 {
+		t.Errorf("expected 50%% packet loss, got %f%%", host.PacketLoss)
+	}
+}
+

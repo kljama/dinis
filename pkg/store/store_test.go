@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -46,10 +47,12 @@ func TestStore(t *testing.T) {
 	}
 
 	// 4. Reload from disk to verify persistence
+	_ = s.Close()
 	s2, err := NewStore(dbPath)
 	if err != nil {
 		t.Fatalf("failed to reload store: %v", err)
 	}
+	defer s2.Close()
 
 	var foundCIDR, foundExcl bool
 	for _, c := range s2.GetCIDRs() {
@@ -230,5 +233,93 @@ func TestSaveUnsafeTmpFileCleanupOnRenameError(t *testing.T) {
 		t.Errorf("expected tmp file %s to be cleaned up, but it still exists (statErr=%v)", tmpFile, statErr)
 	}
 }
+
+func TestDisabledCIDRDoesNotPruneDiscoveredHosts(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dinis_disabled_cidr_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "data.json")
+	s, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	// Add CIDR 192.168.10.0/24 (disabled)
+	_ = s.AddOrUpdateCIDR(CIDRConfig{
+		CIDR:    "192.168.10.0/24",
+		Enabled: false,
+	})
+
+	// Add discovered host under this CIDR
+	_ = s.AddOrUpdateDiscoveredHost(DiscoveredHost{
+		IP:       "192.168.10.5",
+		CIDR:     "192.168.10.0/24",
+		IsStatic: false,
+	})
+
+	// When allConfiguredCIDRs includes the disabled CIDR, PruneDiscoveredHosts MUST NOT delete the host
+	allConfiguredCIDRs := map[string]bool{
+		"192.168.10.0/24": true,
+	}
+
+	if err := s.PruneDiscoveredHosts(allConfiguredCIDRs); err != nil {
+		t.Fatalf("prune failed: %v", err)
+	}
+
+	hosts := s.GetDiscoveredHosts()
+	if _, exists := hosts["192.168.10.5"]; !exists {
+		t.Errorf("expected discovered host in disabled CIDR to be preserved on disk")
+	}
+
+	// Now simulate deleting the CIDR from configuration (allConfiguredCIDRs empty)
+	if err := s.PruneDiscoveredHosts(map[string]bool{}); err != nil {
+		t.Fatalf("prune after delete failed: %v", err)
+	}
+
+	hostsAfterDelete := s.GetDiscoveredHosts()
+	if _, exists := hostsAfterDelete["192.168.10.5"]; exists {
+		t.Errorf("expected discovered host to be pruned after CIDR was deleted")
+	}
+}
+
+func TestStoreFileLock(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dinis_file_lock_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "data.json")
+	s1, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create initial store: %v", err)
+	}
+	defer s1.Close()
+
+	// Attempting to open a second store on the same file path while s1 is open MUST fail
+	s2, err := NewStore(dbPath)
+	if err == nil {
+		s2.Close()
+		t.Fatalf("expected NewStore to fail due to file lock, but succeeded")
+	}
+	if !strings.Contains(err.Error(), "database is locked") {
+		t.Errorf("expected 'database is locked' error, got: %v", err)
+	}
+
+	// Close s1; now a new store MUST succeed
+	if err := s1.Close(); err != nil {
+		t.Fatalf("failed to close s1: %v", err)
+	}
+
+	s3, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("expected NewStore to succeed after s1 was closed, got: %v", err)
+	}
+	_ = s3.Close()
+}
+
 
 

@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,14 +21,36 @@ import (
 
 const version = "1.0.0"
 
+func envOrDefault(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
 func main() {
-	portFlag := flag.Int("port", 8080, "HTTP Web UI and API listen port")
-	hostFlag := flag.String("host", "0.0.0.0", "HTTP listen host address")
-	dataFlag := flag.String("data", "data/dinis.json", "Path to persistent JSON database file")
-	staticFlag := flag.String("static", "", "Optional path to static web assets directory (overrides embedded assets)")
-	influxURLFlag := flag.String("influxdb-url", "", "InfluxDB 3 Core URL (e.g. http://localhost:8181). Empty disables InfluxDB export.")
-	influxBucketFlag := flag.String("influxdb-bucket", "dinis", "InfluxDB bucket/database name")
-	influxTokenFlag := flag.String("influxdb-token", "", "InfluxDB auth token (optional)")
+	portFlag := flag.Int("port", envIntOrDefault("DINIS_PORT", 8080), "HTTP Web UI and API listen port (DINIS_PORT)")
+	hostFlag := flag.String("host", envOrDefault("DINIS_HOST", "0.0.0.0"), "HTTP listen host address (DINIS_HOST)")
+	dataFlag := flag.String("data", envOrDefault("DINIS_DATA", "data/dinis.json"), "Path to persistent JSON database file (DINIS_DATA)")
+	staticFlag := flag.String("static", envOrDefault("DINIS_STATIC", ""), "Optional path to static web assets directory (DINIS_STATIC)")
+	influxURLFlag := flag.String("influxdb-url", envOrDefault("INFLUXDB3_URL", ""), "InfluxDB 3 Core URL (INFLUXDB3_URL). Empty disables InfluxDB export.")
+	influxBucketFlag := flag.String("influxdb-bucket", envOrDefault("INFLUXDB3_BUCKET", "dinis"), "InfluxDB bucket/database name (INFLUXDB3_BUCKET)")
+	influxTokenFlag := flag.String("influxdb-token", envOrDefault("INFLUXDB3_TOKEN", ""), "InfluxDB auth token (INFLUXDB3_TOKEN)")
+	apiTokenFlag := flag.String("api-token", os.Getenv("DINIS_API_TOKEN"), "Optional API authentication token for REST endpoints (DINIS_API_TOKEN)")
+	allowedHostsFlag := flag.String("allowed-hosts", os.Getenv("DINIS_ALLOWED_HOSTS"), "Comma-separated list of allowed HTTP Host header values (DINIS_ALLOWED_HOSTS)")
+	allowedClientIPsFlag := flag.String("allowed-client-ips", os.Getenv("DINIS_ALLOWED_CLIENT_IPS"), "Comma-separated list of allowed client IPs/CIDRs for Web UI and API access (DINIS_ALLOWED_CLIENT_IPS)")
+	trustedProxiesFlag := flag.String("trusted-proxies", os.Getenv("DINIS_TRUSTED_PROXIES"), "Comma-separated list of trusted proxy IPs/CIDRs or preset ('docker'/'private') permitted to provide X-Forwarded-For/Host (DINIS_TRUSTED_PROXIES)")
+	allowedOriginsFlag := flag.String("allowed-origins", os.Getenv("DINIS_ALLOWED_ORIGINS"), "Comma-separated list of allowed CORS origins (DINIS_ALLOWED_ORIGINS)")
+	maxMetricHostsFlag := flag.Int("max-metric-hosts", envIntOrDefault("DINIS_MAX_METRIC_HOSTS", 10000), "Maximum monitored hosts metric retention capacity before LRU eviction (DINIS_MAX_METRIC_HOSTS)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -48,6 +72,15 @@ func main() {
 	st, err := store.NewStore(dataPath)
 	if err != nil {
 		log.Fatalf("[DINIS] Failed to initialize storage: %v", err)
+	}
+	defer st.Close()
+
+	if *maxMetricHostsFlag > 0 {
+		settings := st.GetSettings()
+		if settings.MaxMetricHosts != *maxMetricHostsFlag {
+			settings.MaxMetricHosts = *maxMetricHostsFlag
+			_ = st.UpdateSettings(settings)
+		}
 	}
 
 	// Initialize coordinator (ICMP Engine, Alerts, CIDR manager)
@@ -75,6 +108,43 @@ func main() {
 
 	// Initialize HTTP server
 	srvHandler := server.NewServer(coord, *staticFlag)
+	if *apiTokenFlag != "" {
+		srvHandler.SetAPIToken(*apiTokenFlag)
+		log.Println("[DINIS] API token authentication enabled for REST endpoints")
+	}
+	if *allowedHostsFlag != "" {
+		hosts := strings.Split(*allowedHostsFlag, ",")
+		for i := range hosts {
+			hosts[i] = strings.TrimSpace(hosts[i])
+		}
+		srvHandler.SetAllowedHosts(hosts)
+		log.Printf("[DINIS] Allowed hosts configured: %v", hosts)
+	}
+	if *allowedOriginsFlag != "" {
+		origins := strings.Split(*allowedOriginsFlag, ",")
+		for i := range origins {
+			origins[i] = strings.TrimSpace(origins[i])
+		}
+		srvHandler.SetAllowedOrigins(origins)
+		log.Printf("[DINIS] Allowed CORS origins configured: %v", origins)
+	}
+	if *allowedClientIPsFlag != "" {
+		ips := strings.Split(*allowedClientIPsFlag, ",")
+		for i := range ips {
+			ips[i] = strings.TrimSpace(ips[i])
+		}
+		srvHandler.SetAllowedClientIPs(ips)
+		log.Printf("[DINIS] Client IP filter configured: %v", ips)
+	}
+	if *trustedProxiesFlag != "" {
+		proxies := strings.Split(*trustedProxiesFlag, ",")
+		for i := range proxies {
+			proxies[i] = strings.TrimSpace(proxies[i])
+		}
+		srvHandler.SetTrustedProxies(proxies)
+		log.Printf("[DINIS] Trusted proxies configured: %v", proxies)
+	}
+
 	addr := fmt.Sprintf("%s:%d", *hostFlag, *portFlag)
 	httpServer := &http.Server{
 		Addr:              addr,

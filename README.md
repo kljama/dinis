@@ -74,6 +74,11 @@ curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 | `-host` | `0.0.0.0` | HTTP listen address |
 | `-data` | `data/dinis.json` | Path to persistent JSON database file |
 | `-static` | `""` | Directory path for static web assets (overrides embedded assets) |
+| `-api-token` | `""` | Optional API authentication token required for REST endpoints (`DINIS_API_TOKEN`) |
+| `-allowed-hosts` | `""` | Comma-separated list of allowed Host header values for DNS rebinding protection (`DINIS_ALLOWED_HOSTS`) |
+| `-allowed-client-ips` | `""` | Comma-separated list of allowed client IPs/CIDRs for dashboard & API access (`DINIS_ALLOWED_CLIENT_IPS`) |
+| `-trusted-proxies` | `""` | Comma-separated trusted reverse proxy IPs/CIDRs or preset ('docker'/'private') for `X-Forwarded-For`/`Host` (`DINIS_TRUSTED_PROXIES`) |
+| `-allowed-origins` | `""` | Comma-separated list of allowed CORS origins (`DINIS_ALLOWED_ORIGINS`) |
 | `-influxdb-url` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
 | `-influxdb-bucket` | `dinis` | InfluxDB database/bucket name |
 | `-influxdb-token` | `""` | InfluxDB authentication token (must start with `apiv3_` if set) |
@@ -85,7 +90,14 @@ curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 |---|---|---|
 | `DINIS_PORT` | `8080` | Host port mapped to the DINIS container |
 | `DINIS_DATA` | `/data/dinis.json` | Storage file path inside the container |
+| `DINIS_API_TOKEN` | `""` | Optional API authentication token required for REST endpoints |
+| `DINIS_ALLOWED_HOSTS` | `""` | Allowed Host header values for DNS rebinding defense (e.g. `localhost,monitor.corp.net`) |
+| `DINIS_ALLOWED_CLIENT_IPS`| `""` | Client IP/CIDR whitelist for dashboard & API access (e.g. `127.0.0.1,10.0.0.0/8`) |
+| `DINIS_TRUSTED_PROXIES` | `docker` | Trusted reverse proxy IPs/CIDRs permitted to provide `X-Forwarded-For`/`Host` |
+| `DINIS_ALLOWED_ORIGINS` | `""` | Allowed CORS origins (e.g. `http://localhost:3000,https://dashboard.corp.net`) |
+| `DINIS_MAX_METRIC_HOSTS` | `10000` | In-memory time-series host retention limit before LRU rollup eviction |
 | `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB 3 Core endpoint |
+| `INFLUXDB3_PORT` | `8181` | Host port mapped to InfluxDB 3 Core |
 | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
 | `INFLUXDB3_TOKEN` | `""` | InfluxDB API token (must start with `apiv3_` if set) |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | InfluxDB 3 node identifier |

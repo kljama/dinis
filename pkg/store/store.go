@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -26,7 +27,7 @@ type ExclusionConfig struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
-// HostMeta stores user-defined metadata/labels for an IP.
+// HostMeta represents user-defined metadata for a specific host IP.
 type HostMeta struct {
 	IP        string    `json:"ip"`
 	Alias     string    `json:"alias"`
@@ -34,33 +35,35 @@ type HostMeta struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// DiscoveredHost represents an IP discovered online during a discovery sweep.
+// DiscoveredHost represents a dynamically discovered active endpoint under an enrolled CIDR.
 type DiscoveredHost struct {
 	IP             string    `json:"ip"`
 	CIDR           string    `json:"cidr"`
 	DiscoveredAt   time.Time `json:"discoveredAt"`
 	LastDiscovered time.Time `json:"lastDiscovered"`
-	IsStatic       bool      `json:"isStatic"` // If true, always monitored even before first discovery
+	IsStatic       bool      `json:"isStatic"`
 }
 
-// AppSettings stores configurable application settings.
+// AppSettings holds dynamic configuration tunable via Web UI settings modal.
 type AppSettings struct {
+	DiscoveryIntervalMin int     `json:"discoveryIntervalMin"` // 0 disables auto-discovery
 	IntervalSec          float64 `json:"intervalSec"`
 	TimeoutMs            int     `json:"timeoutMs"`
 	FailThreshold        int     `json:"failThreshold"`
 	Concurrency          int     `json:"concurrency"`
-	DiscoveryIntervalMin int     `json:"discoveryIntervalMin"` // e.g. 15 mins (0 = manual only)
+	MaxMetricHosts       int     `json:"maxMetricHosts"` // Capacity limit for time-series metric retention
 	AutoDiscovery        bool    `json:"autoDiscovery"`
 }
 
-// DefaultSettings returns default app settings.
+// DefaultSettings returns safe production defaults.
 func DefaultSettings() AppSettings {
 	return AppSettings{
-		IntervalSec:          60.0,
+		DiscoveryIntervalMin: 240, // 4 hours
+		IntervalSec:          60,  // 60s ping cycle
 		TimeoutMs:            1000,
 		FailThreshold:        2,
 		Concurrency:          100,
-		DiscoveryIntervalMin: 240,
+		MaxMetricHosts:       10000,
 		AutoDiscovery:        true,
 	}
 }
@@ -78,13 +81,32 @@ type StoreData struct {
 type Store struct {
 	mu       sync.RWMutex
 	filePath string
+	lockFile *os.File
 	data     StoreData
 }
 
 // NewStore initializes or loads the persistent store from the specified file path.
+// It acquires an OS advisory lock on <filePath>.lock to prevent multi-instance data corruption.
 func NewStore(filePath string) (*Store, error) {
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	lockPath := filePath + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open lock file %s: %w", lockPath, err)
+	}
+
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lf.Close()
+		return nil, fmt.Errorf("cannot acquire lock on %s: database is locked by another running DINIS process", lockPath)
+	}
+
 	s := &Store{
 		filePath: filePath,
+		lockFile: lf,
 		data: StoreData{
 			CIDRs:           make([]CIDRConfig, 0),
 			Exclusions:      make([]ExclusionConfig, 0),
@@ -95,10 +117,25 @@ func NewStore(filePath string) (*Store, error) {
 	}
 
 	if err := s.load(); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// Close unlocks and releases the file lock descriptor.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.lockFile != nil {
+		_ = syscall.Flock(int(s.lockFile.Fd()), syscall.LOCK_UN)
+		err := s.lockFile.Close()
+		s.lockFile = nil
+		return err
+	}
+	return nil
 }
 
 func (s *Store) load() error {
@@ -132,29 +169,25 @@ func (s *Store) load() error {
 
 	raw, err := os.ReadFile(s.filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read data file: %w", err)
-	}
-
-	if len(raw) == 0 {
-		return nil
+		return fmt.Errorf("failed to read store file %s: %w", s.filePath, err)
 	}
 
 	var data StoreData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return fmt.Errorf("failed to parse data file %s: %w", s.filePath, err)
+		return fmt.Errorf("failed to parse JSON from %s: %w", s.filePath, err)
 	}
 
-	if data.CIDRs == nil {
-		data.CIDRs = make([]CIDRConfig, 0)
-	}
-	if data.Exclusions == nil {
-		data.Exclusions = make([]ExclusionConfig, 0)
-	}
 	if data.HostMeta == nil {
 		data.HostMeta = make(map[string]HostMeta)
 	}
 	if data.DiscoveredHosts == nil {
 		data.DiscoveredHosts = make(map[string]DiscoveredHost)
+	}
+	if data.CIDRs == nil {
+		data.CIDRs = make([]CIDRConfig, 0)
+	}
+	if data.Exclusions == nil {
+		data.Exclusions = make([]ExclusionConfig, 0)
 	}
 	if data.Settings.IntervalSec <= 0 {
 		data.Settings = DefaultSettings()
@@ -170,7 +203,8 @@ func (s *Store) saveUnsafe() error {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	raw, err := json.MarshalIndent(s.data, "", "  ")
+	// Compact JSON serialization eliminates indentation overhead and cuts disk I/O by ~50%
+	raw, err := json.Marshal(s.data)
 	if err != nil {
 		return fmt.Errorf("failed to encode store data: %w", err)
 	}
