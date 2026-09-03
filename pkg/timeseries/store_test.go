@@ -325,6 +325,40 @@ func BenchmarkStoreRecord(b *testing.B) {
 	}
 }
 
+func BenchmarkGenerateSubnetMatrix(b *testing.B) {
+	// Create sample subnet matrix input with 10 subnets, each having 256 cells
+	input := make(map[string][]SubnetMatrixCell)
+	for s := 0; s < 10; s++ {
+		cidr := fmt.Sprintf("192.168.%d.0/24", s)
+		cells := make([]SubnetMatrixCell, 256)
+		for i := 0; i < 256; i++ {
+			// Reverse/unordered IP order to test sorting performance
+			hostIdx := (255 - i)
+			cells[i] = SubnetMatrixCell{
+				IP:        fmt.Sprintf("192.168.%d.%d", s, hostIdx),
+				HostIndex: hostIdx,
+				Status:    "UP",
+				LatencyMs: float64(i) * 0.1,
+			}
+		}
+		input[cidr] = cells
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		// Deep copy input map slices for each iteration to ensure sort works on same state
+		iterInput := make(map[string][]SubnetMatrixCell, len(input))
+		for cidr, cells := range input {
+			cellsCopy := make([]SubnetMatrixCell, len(cells))
+			copy(cellsCopy, cells)
+			iterInput[cidr] = cellsCopy
+		}
+
+		_ = GenerateSubnetMatrix(iterInput)
+	}
+}
+
 func TestHostRingBufferDynamicGrowthAndWrap(t *testing.T) {
 	rb := NewHostRingBuffer(5)
 	if rb.GetAll() != nil {
