@@ -140,6 +140,16 @@ curl -N http://localhost:8080/api/stream
 | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
 | `INFLUXDB3_TOKEN` | `""` | InfluxDB API token (must start with `apiv3_` if set) |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | InfluxDB 3 node identifier |
+| `NGINX_EXPLORER_PORT` | `8888` | Host port mapped to Nginx for InfluxDB 3 Explorer Web UI |
+
+## InfluxDB 3 Explorer Web UI
+
+To visually browse tables, inspect probe metrics, and execute ad-hoc SQL queries against InfluxDB 3 Core without Grafana:
+* Open **`http://<dinis-host-ip>:8888`** in your browser.
+* Connect with:
+  - **Host URL:** `http://influxdb3:8181` (inside Docker) or `http://<dinis-host-ip>:8181`
+  - **Database:** `dinis` (or `INFLUXDB3_BUCKET`)
+  - **Token:** `INFLUXDB3_TOKEN` (starts with `apiv3_`, if configured)
 
 ## Connecting an External Grafana Instance
 
