@@ -246,4 +246,3 @@ func TestPacketLossZeroLatency(t *testing.T) {
 		t.Errorf("expected 50%% packet loss, got %f%%", host.PacketLoss)
 	}
 }
-

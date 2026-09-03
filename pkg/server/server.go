@@ -50,9 +50,9 @@ const (
 
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
 type Coordinator struct {
-	rebuildMu  sync.Mutex
-	store      *store.Store
-	pinger     *pinger.Engine
+	rebuildMu   sync.Mutex
+	store       *store.Store
+	pinger      *pinger.Engine
 	alerts      *alerts.Manager
 	broadcastMu sync.Mutex
 	clientsMu   sync.RWMutex
@@ -766,10 +766,10 @@ func (c *Coordinator) heartbeatLoop() {
 
 // Server holds the HTTP handler routing.
 type Server struct {
-	coord          *Coordinator
-	mux            *http.ServeMux
-	distFS         http.FileSystem
-	staticPath     string // If provided, serves live directory instead of embedded
+	coord             *Coordinator
+	mux               *http.ServeMux
+	distFS            http.FileSystem
+	staticPath        string // If provided, serves live directory instead of embedded
 	allowedOrigins    []string
 	allowedHosts      []string
 	allowedClientIPs  []net.IP

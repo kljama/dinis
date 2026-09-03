@@ -3,8 +3,9 @@ import urllib.request
 import json
 import time
 import sys
+import os
 
-BASE_URL = "http://localhost:8080"
+BASE_URL = os.environ.get("DINIS_BASE_URL", os.environ.get("BASE_URL", "http://localhost:8080"))
 
 def get(path):
     req = urllib.request.Request(f"{BASE_URL}{path}")

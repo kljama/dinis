@@ -70,11 +70,11 @@ func DefaultSettings() AppSettings {
 
 // StoreData represents the root persisted JSON structure.
 type StoreData struct {
-	CIDRs           []CIDRConfig               `json:"cidrs"`
-	Exclusions      []ExclusionConfig          `json:"exclusions"`
-	HostMeta        map[string]HostMeta        `json:"hostMeta"`
-	DiscoveredHosts map[string]DiscoveredHost  `json:"discoveredHosts"`
-	Settings        AppSettings                `json:"settings"`
+	CIDRs           []CIDRConfig              `json:"cidrs"`
+	Exclusions      []ExclusionConfig         `json:"exclusions"`
+	HostMeta        map[string]HostMeta       `json:"hostMeta"`
+	DiscoveredHosts map[string]DiscoveredHost `json:"discoveredHosts"`
+	Settings        AppSettings               `json:"settings"`
 }
 
 // Store manages thread-safe atomic reading and writing of configuration.
@@ -387,7 +387,6 @@ func (s *Store) mergeDiscoveredHostUnsafe(h DiscoveredHost) {
 
 	s.data.DiscoveredHosts[h.IP] = h
 }
-
 
 // RemoveDiscoveredHost removes an IP from the discovered/monitored set.
 func (s *Store) RemoveDiscoveredHost(ip string) error {

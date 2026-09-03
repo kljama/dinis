@@ -96,7 +96,6 @@ func (s *Store) SetCapacity(maxHosts int) {
 	s.maxHosts = maxHosts
 }
 
-
 // Start launches the background automated downsampling ticker.
 // Safe to call multiple times; redundant calls while running are ignored.
 func (s *Store) Start() {

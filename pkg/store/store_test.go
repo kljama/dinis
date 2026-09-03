@@ -320,6 +320,3 @@ func TestStoreFileLock(t *testing.T) {
 	}
 	_ = s3.Close()
 }
-
-
-

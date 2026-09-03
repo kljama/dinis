@@ -111,4 +111,3 @@ func TestSingleProberContextCancellation(t *testing.T) {
 		t.Errorf("expected immediate cancellation, took %v", elapsed)
 	}
 }
-

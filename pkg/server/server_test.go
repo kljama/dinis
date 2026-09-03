@@ -580,7 +580,6 @@ func TestConcurrentBroadcastEventBufferOverflow(t *testing.T) {
 	wg.Wait()
 }
 
-
 func TestHostDetailOrActionInvalidIPValidation(t *testing.T) {
 	srv, _, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -739,7 +738,7 @@ func TestHostsFilterPendingAndMatrixPendingCount(t *testing.T) {
 	}
 
 	var resp struct {
-		Total int                  `json:"total"`
+		Total int                 `json:"total"`
 		Hosts []*pinger.HostState `json:"hosts"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {

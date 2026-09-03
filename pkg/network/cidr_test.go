@@ -149,4 +149,3 @@ func TestExclusionMatcherConcurrent(t *testing.T) {
 
 	wg.Wait()
 }
-

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Go Lint & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Verify Code Formatting (gofmt)
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not properly formatted:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Static Analysis (go vet)
+        run: go vet ./...
+
+      - name: Enable ICMP Socket Access
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      - name: Run Tests with Race Detector
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Run Alert Benchmarks
+        run: go test -bench=. -run=^$ ./pkg/alerts
+
+  validate-configs:
+    name: Validate Docker & Nginx
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Nginx Configuration
+        run: |
+          docker run --rm \
+            --add-host dinis:127.0.0.1 \
+            --add-host influxdb3:127.0.0.1 \
+            -v $(pwd)/docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro \
+            -v $(pwd)/docker/nginx/conf.d:/etc/nginx/conf.d:ro \
+            nginx:1.27-alpine nginx -t
+
+      - name: Validate Docker Compose Config
+        run: docker compose config
+
+      - name: Build Docker Image
+        run: docker build -t dinis:ci .
+
+  e2e:
+    name: E2E Integration Test
+    runs-on: ubuntu-latest
+    needs: [test, validate-configs]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Enable Host ICMP Capabilities
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      - name: Start Compose Stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build --wait
+
+      - name: Verify Health via Nginx Proxy
+        run: |
+          curl -f -s http://localhost/health || exit 1
+          curl -f -s http://localhost:8181/health || exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run E2E Test Suite
+        env:
+          BASE_URL: http://localhost
+        run: python3 verify_e2e.py
+
+      - name: Dump Container Logs on Failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Teardown Stack
+        if: always()
+        run: docker compose down -v

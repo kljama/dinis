@@ -296,4 +296,3 @@ func TestWriterRetainFailedPayload(t *testing.T) {
 		t.Errorf("expected previously failed probe 10.99.99.1 to be retained and flushed, got: %q", received)
 	}
 }
-
