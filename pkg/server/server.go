@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -137,8 +140,8 @@ func (c *Coordinator) Start() {
 func (c *Coordinator) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopChan)
-		c.pinger.Stop()
 		c.wg.Wait()
+		c.pinger.Stop()
 
 		c.clientsMu.Lock()
 		for ch := range c.sseClients {
@@ -489,6 +492,12 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 		}
 	}
 
+	var paceTimer *time.Timer
+	if discPace > 0 {
+		paceTimer = time.NewTimer(discPace)
+		defer paceTimer.Stop()
+	}
+
 	aborted := false
 feeder:
 	for _, t := range targets {
@@ -499,12 +508,19 @@ feeder:
 		case workChan <- t:
 		}
 
-		if discPace > 0 {
+		if paceTimer != nil {
+			if !paceTimer.Stop() {
+				select {
+				case <-paceTimer.C:
+				default:
+				}
+			}
+			paceTimer.Reset(discPace)
 			select {
 			case <-ctx.Done():
 				aborted = true
 				break feeder
-			case <-time.After(discPace):
+			case <-paceTimer.C:
 			}
 		}
 	}
@@ -556,15 +572,25 @@ feeder:
 	return discoveredOnline, newDiscovered, nil
 }
 
-// TriggerDiscovery initiates a discovery sweep asynchronously.
-func (c *Coordinator) TriggerDiscovery(specificCIDR string) {
+// TriggerDiscovery initiates a discovery sweep asynchronously. Returns false if server is shutting down.
+func (c *Coordinator) TriggerDiscovery(specificCIDR string) bool {
+	c.discMu.Lock()
+	select {
+	case <-c.stopChan:
+		c.discMu.Unlock()
+		return false
+	default:
+	}
 	c.wg.Add(1)
+	c.discMu.Unlock()
+
 	go func() {
 		defer c.wg.Done()
 		if _, _, err := c.RunDiscovery(specificCIDR); err != nil {
 			log.Printf("[DINIS] Triggered discovery sweep error: %v", err)
 		}
 	}()
+	return true
 }
 
 // GetDiscoveryStatus returns a copy of current discovery status.
@@ -753,6 +779,8 @@ type Server struct {
 	apiToken          string
 	manualPingMu      sync.Mutex
 	manualPingLast    map[string]time.Time
+	etagMu            sync.RWMutex
+	assetETags        map[string]string
 }
 
 // NewServer creates a new HTTP server routing all REST APIs and web dashboard assets.
@@ -762,6 +790,7 @@ func NewServer(coord *Coordinator, staticDir string) *Server {
 		mux:            http.NewServeMux(),
 		staticPath:     staticDir,
 		manualPingLast: make(map[string]time.Time),
+		assetETags:     make(map[string]string),
 	}
 
 	if staticDir != "" {
@@ -1079,7 +1108,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			token = r.URL.Query().Get("token")
 		}
 
-		if token == "" || token != s.apiToken {
+		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.apiToken)) != 1 {
 			writeError(w, http.StatusUnauthorized, "Unauthorized: invalid or missing API token")
 			return
 		}
@@ -1093,8 +1122,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 			w.Header().Set("Vary", "Origin")
 		} else if r.Method == http.MethodOptions {
-			// Untrusted cross-origin preflight rejected
-			w.WriteHeader(http.StatusForbidden)
+			http.Error(w, "Forbidden: CORS origin not allowed", http.StatusForbidden)
 			return
 		}
 	}
@@ -1107,6 +1135,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Limit request body size across all incoming HTTP requests to prevent memory exhaustion attacks
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Now().Add(15 * time.Second))
+		}
 	}
 
 	s.mux.ServeHTTP(w, r)
@@ -1186,6 +1218,39 @@ func (s *Server) allowManualPing(ip string) bool {
 	return true
 }
 
+func (s *Server) getAssetETag(path string) string {
+	s.etagMu.RLock()
+	etag, ok := s.assetETags[path]
+	s.etagMu.RUnlock()
+	if ok {
+		return etag
+	}
+
+	s.etagMu.Lock()
+	defer s.etagMu.Unlock()
+	if etag, ok := s.assetETags[path]; ok {
+		return etag
+	}
+
+	if s.distFS != nil {
+		cleanPath := strings.TrimPrefix(path, "/")
+		f, err := s.distFS.Open(cleanPath)
+		if err == nil {
+			defer f.Close()
+			hasher := sha256.New()
+			if _, err := io.Copy(hasher, f); err == nil {
+				etag = fmt.Sprintf(`W/"%x"`, hasher.Sum(nil)[:16])
+				s.assetETags[path] = etag
+				return etag
+			}
+		}
+	}
+
+	etag = fmt.Sprintf(`W/"dinis-%s"`, strings.ReplaceAll(path, "/", "-"))
+	s.assetETags[path] = etag
+	return etag
+}
+
 func (s *Server) cacheControlMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -1201,7 +1266,7 @@ func (s *Server) cacheControlMiddleware(next http.Handler) http.Handler {
 		switch ext {
 		case ".js", ".css", ".svg", ".png", ".ico", ".woff2":
 			w.Header().Set("Cache-Control", "public, max-age=86400, must-revalidate")
-			etag := fmt.Sprintf(`W/"dinis-%s"`, strings.ReplaceAll(path, "/", "-"))
+			etag := s.getAssetETag(path)
 			w.Header().Set("ETag", etag)
 			if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
 				w.WriteHeader(http.StatusNotModified)
@@ -1247,15 +1312,15 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 
 // SSE Handler
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Time{})  // Clear read deadline for indefinite SSE streaming
+	_ = rc.SetWriteDeadline(time.Time{}) // Disable HTTP write deadline for this long-lived SSE streaming connection
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported", http.StatusBadRequest)
 		return
 	}
-
-	// Disable HTTP write deadline for this long-lived SSE streaming connection
-	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Time{})
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1340,7 +1405,10 @@ func (s *Server) handleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
 		_ = decodeJSON(r, &req)
 	}
 
-	s.coord.TriggerDiscovery(req.CIDR)
+	if !s.coord.TriggerDiscovery(req.CIDR) {
+		writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "Discovery sweep initiated",
 	})
@@ -2064,11 +2132,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.MaxMetricHosts <= 0 {
 			req.MaxMetricHosts = 10000
-		}
-		if req.MaxMetricHosts < 500 {
+		} else if req.MaxMetricHosts < 500 {
 			req.MaxMetricHosts = 500
-		}
-		if req.MaxMetricHosts > 500000 {
+		} else if req.MaxMetricHosts > 500000 {
 			req.MaxMetricHosts = 500000
 		}
 

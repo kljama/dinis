@@ -1,6 +1,7 @@
 package timeseries
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -531,7 +532,47 @@ func TestStoreSetCapacity(t *testing.T) {
 	}
 }
 
+func TestParseIPv4ToUint32Bounds(t *testing.T) {
+	cases := []struct {
+		input string
+		want  uint32
+	}{
+		{"192.168.1.1", 0xC0A80101},
+		{"10.0.0.1", 0x0A000001},
+		{"0.0.0.0", 0},
+		{"255.255.255.255", 0xFFFFFFFF},
+		{"999.999.999.999", 0},
+		{"256.0.0.1", 0},
+		{"192.168.1", 0},
+		{"192.168.1.1.1", 0},
+		{"", 0},
+		{"192.168..1", 0},
+		{"abc.def.ghi.jkl", 0},
+		{"10.0.0.-1", 0},
+	}
+	for _, tc := range cases {
+		got := parseIPv4ToUint32(tc.input)
+		if got != tc.want {
+			t.Errorf("parseIPv4ToUint32(%q) = %x, want %x", tc.input, got, tc.want)
+		}
+	}
+}
 
-
-
-
+func TestRollupPointJSONDuration(t *testing.T) {
+	now := time.Now()
+	rp := ComputeRollup(now, time.Minute, nil)
+	data, err := json.Marshal(rp)
+	if err != nil {
+		t.Fatalf("failed to marshal RollupPoint: %v", err)
+	}
+	var res map[string]interface{}
+	if err := json.Unmarshal(data, &res); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+	if sec, ok := res["bucketDurationSec"].(float64); !ok || sec != 60 {
+		t.Errorf("expected bucketDurationSec=60, got %v", res["bucketDurationSec"])
+	}
+	if str, ok := res["bucketDurationStr"].(string); !ok || str != "1m0s" {
+		t.Errorf("expected bucketDurationStr='1m0s', got %v", res["bucketDurationStr"])
+	}
+}

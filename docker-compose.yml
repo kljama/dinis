@@ -26,8 +26,8 @@ services:
             --data-dir=/var/lib/influxdb3/data \
             --without-auth
         fi
-    ports:
-      - "${INFLUXDB3_PORT:-8181}:8181"
+    expose:
+      - 8181
     volumes:
       - influxdb3-data:/var/lib/influxdb3/data
     healthcheck:
@@ -58,8 +58,8 @@ services:
       - INFLUXDB3_URL=${INFLUXDB3_URL:-http://influxdb3:8181}
       - INFLUXDB3_BUCKET=${INFLUXDB3_BUCKET:-dinis}
       - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
-    ports:
-      - "${DINIS_PORT:-8080}:8080"
+    expose:
+      - 8080
     volumes:
       - dinis-data:/data
     depends_on:
@@ -73,19 +73,18 @@ services:
       start_period: 2s
     restart: unless-stopped
 
-  grafana:
-    image: grafana/grafana-oss:latest
-    container_name: dinis-grafana
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: dinis-nginx
     ports:
-      - "3000:3000"
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_INFLUX_PORT:-8181}:8181"
     volumes:
-      - grafana-data:/var/lib/grafana
-      - ./docker/grafana/provisioning:/etc/grafana/provisioning
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - INFLUXDB3_BUCKET=${INFLUXDB3_BUCKET:-dinis}
-      - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:
+      dinis:
+        condition: service_healthy
       influxdb3:
         condition: service_healthy
     restart: unless-stopped
@@ -93,4 +92,3 @@ services:
 volumes:
   influxdb3-data:
   dinis-data:
-  grafana-data:

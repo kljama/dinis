@@ -556,14 +556,30 @@ func GenerateSubnetMatrix(hostsBySubnet map[string][]SubnetMatrixCell) []SubnetM
 func parseIPv4ToUint32(ipStr string) uint32 {
 	var val uint32
 	var octet uint32
+	var dots int
+	var hasDigits bool
 	for i := 0; i < len(ipStr); i++ {
 		b := ipStr[i]
 		if b >= '0' && b <= '9' {
 			octet = octet*10 + uint32(b-'0')
+			if octet > 255 {
+				return 0
+			}
+			hasDigits = true
 		} else if b == '.' {
+			if !hasDigits || dots >= 3 {
+				return 0
+			}
 			val = (val << 8) | octet
 			octet = 0
+			dots++
+			hasDigits = false
+		} else {
+			return 0
 		}
+	}
+	if dots != 3 || !hasDigits || octet > 255 {
+		return 0
 	}
 	return (val << 8) | octet
 }

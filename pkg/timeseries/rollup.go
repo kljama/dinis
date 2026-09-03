@@ -9,26 +9,30 @@ import (
 
 // RollupPoint represents downsampled aggregate metrics over a time bucket (e.g. 1m, 1h).
 type RollupPoint struct {
-	Timestamp      time.Time     `json:"timestamp"`
-	BucketDuration time.Duration `json:"bucketDuration"`
-	MinLatencyMs   float64       `json:"minLatencyMs"`
-	MaxLatencyMs   float64       `json:"maxLatencyMs"`
-	AvgLatencyMs   float64       `json:"avgLatencyMs"`
-	P50LatencyMs   float64       `json:"p50LatencyMs"`
-	P95LatencyMs   float64       `json:"p95LatencyMs"`
-	P99LatencyMs   float64       `json:"p99LatencyMs"`
-	PacketLossPct  float64       `json:"packetLossPct"`
-	SampleCount    int           `json:"sampleCount"`
-	UpRatio        float64       `json:"upRatio"`
-	JitterMs       float64       `json:"jitterMs"` // Mean consecutive latency variance
+	Timestamp         time.Time     `json:"timestamp"`
+	BucketDuration    time.Duration `json:"bucketDuration"`
+	BucketDurationSec float64       `json:"bucketDurationSec,omitempty"`
+	BucketDurationStr string        `json:"bucketDurationStr,omitempty"`
+	MinLatencyMs      float64       `json:"minLatencyMs"`
+	MaxLatencyMs      float64       `json:"maxLatencyMs"`
+	AvgLatencyMs      float64       `json:"avgLatencyMs"`
+	P50LatencyMs      float64       `json:"p50LatencyMs"`
+	P95LatencyMs      float64       `json:"p95LatencyMs"`
+	P99LatencyMs      float64       `json:"p99LatencyMs"`
+	PacketLossPct     float64       `json:"packetLossPct"`
+	SampleCount       int           `json:"sampleCount"`
+	UpRatio           float64       `json:"upRatio"`
+	JitterMs          float64       `json:"jitterMs"` // Mean consecutive latency variance
 }
 
 // ComputeRollup aggregates raw samples into a single statistical RollupPoint.
 func ComputeRollup(bucketTime time.Time, duration time.Duration, samples []RawSample) RollupPoint {
 	if len(samples) == 0 {
 		return RollupPoint{
-			Timestamp:      bucketTime,
-			BucketDuration: duration,
+			Timestamp:         bucketTime,
+			BucketDuration:    duration,
+			BucketDurationSec: duration.Seconds(),
+			BucketDurationStr: duration.String(),
 		}
 	}
 
@@ -58,11 +62,13 @@ func ComputeRollup(bucketTime time.Time, duration time.Duration, samples []RawSa
 	upRatio := float64(len(validLatencies)) / float64(total)
 
 	rp := RollupPoint{
-		Timestamp:      bucketTime,
-		BucketDuration: duration,
-		PacketLossPct:  lossPct,
-		SampleCount:    total,
-		UpRatio:        upRatio,
+		Timestamp:         bucketTime,
+		BucketDuration:    duration,
+		BucketDurationSec: duration.Seconds(),
+		BucketDurationStr: duration.String(),
+		PacketLossPct:     lossPct,
+		SampleCount:       total,
+		UpRatio:           upRatio,
 	}
 
 	if len(validLatencies) > 0 {
@@ -108,8 +114,10 @@ func getPercentile(sorted []float64, pct float64) float64 {
 func AggregateRollups(bucketTime time.Time, duration time.Duration, points []RollupPoint) RollupPoint {
 	if len(points) == 0 {
 		return RollupPoint{
-			Timestamp:      bucketTime,
-			BucketDuration: duration,
+			Timestamp:         bucketTime,
+			BucketDuration:    duration,
+			BucketDurationSec: duration.Seconds(),
+			BucketDurationStr: duration.String(),
 		}
 	}
 
@@ -155,17 +163,21 @@ func AggregateRollups(bucketTime time.Time, duration time.Duration, points []Rol
 
 	if totalSamples == 0 {
 		return RollupPoint{
-			Timestamp:      bucketTime,
-			BucketDuration: duration,
+			Timestamp:         bucketTime,
+			BucketDuration:    duration,
+			BucketDurationSec: duration.Seconds(),
+			BucketDurationStr: duration.String(),
 		}
 	}
 
 	rp := RollupPoint{
-		Timestamp:      bucketTime,
-		BucketDuration: duration,
-		SampleCount:    totalSamples,
-		PacketLossPct:  (totalFailedSamples / float64(totalSamples)) * 100.0,
-		UpRatio:        totalValidSamples / float64(totalSamples),
+		Timestamp:         bucketTime,
+		BucketDuration:    duration,
+		BucketDurationSec: duration.Seconds(),
+		BucketDurationStr: duration.String(),
+		SampleCount:       totalSamples,
+		PacketLossPct:     (totalFailedSamples / float64(totalSamples)) * 100.0,
+		UpRatio:           totalValidSamples / float64(totalSamples),
 	}
 
 	if totalValidSamples > 0 {

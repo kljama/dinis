@@ -1,6 +1,7 @@
 package alerts
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -132,7 +133,7 @@ func TestAlertHistoryRingBuffer(t *testing.T) {
 func BenchmarkGetActiveAlertsCleanupBaseline(b *testing.B) {
 	mgr := NewManager(1000)
 	for i := 0; i < 500; i++ {
-		ip := "10.0.0." + string(rune(i))
+		ip := fmt.Sprintf("10.0.%d.%d", (i/256)%256, i%256)
 		mgr.Trigger(ip, "host", "10.0.0.0/24", "err")
 	}
 
@@ -153,7 +154,7 @@ func BenchmarkResolveIfCleanup(b *testing.B) {
 		b.StopTimer()
 		mgr := NewManager(1000)
 		for j := 0; j < 500; j++ {
-			ip := "10.0.0." + string(rune(j))
+			ip := fmt.Sprintf("10.0.%d.%d", (j/256)%256, j%256)
 			mgr.Trigger(ip, "host", "10.0.0.0/24", "err")
 		}
 		b.StartTimer()

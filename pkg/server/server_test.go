@@ -1462,15 +1462,96 @@ func TestManualPingRateLimit(t *testing.T) {
 	}
 }
 
+func TestTriggerDiscoveryRejectionOnStop(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
 
+	coord.Stop()
 
+	// Direct call should return false and not panic
+	if coord.TriggerDiscovery("") {
+		t.Errorf("expected TriggerDiscovery to return false after coordinator is stopped")
+	}
 
+	// HTTP call should return 503 Service Unavailable
+	req := httptest.NewRequest(http.MethodPost, "/api/discovery/run", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 Service Unavailable after stop, got %d", rec.Code)
+	}
+}
 
+func TestStaticAssetETagContentHash(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
 
+	req := httptest.NewRequest(http.MethodGet, "/app.js", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /app.js, got %d", rec.Code)
+	}
+	etag := rec.Header().Get("ETag")
+	if !strings.HasPrefix(etag, `W/"`) || len(etag) < 10 {
+		t.Errorf("expected content-hashed ETag W/\"...\", got %q", etag)
+	}
+	// Verify it's not the old naive path-based W/"dinis--app.js"
+	if strings.Contains(etag, "dinis-") {
+		t.Errorf("expected content hash in ETag, got naive path-based ETag %q", etag)
+	}
+}
 
+func TestSettingsMaxMetricHostsClamping(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
 
+	// 1. MaxMetricHosts <= 0 should default to 10000
+	payload := `{"discoveryIntervalMin":60,"intervalSec":5,"timeoutMs":1000,"failThreshold":2,"concurrency":50,"maxMetricHosts":0}`
+	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	var res store.AppSettings
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res.MaxMetricHosts != 10000 {
+		t.Errorf("expected MaxMetricHosts=10000 for 0, got %d", res.MaxMetricHosts)
+	}
 
+	// 2. MaxMetricHosts between 1 and 499 should clamp to 500
+	payload = `{"discoveryIntervalMin":60,"intervalSec":5,"timeoutMs":1000,"failThreshold":2,"concurrency":50,"maxMetricHosts":100}`
+	req = httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res.MaxMetricHosts != 500 {
+		t.Errorf("expected MaxMetricHosts clamped to 500 for 100, got %d", res.MaxMetricHosts)
+	}
 
-
-
-
+	// 3. MaxMetricHosts > 500000 should clamp to 500000
+	payload = `{"discoveryIntervalMin":60,"intervalSec":5,"timeoutMs":1000,"failThreshold":2,"concurrency":50,"maxMetricHosts":600000}`
+	req = httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res.MaxMetricHosts != 500000 {
+		t.Errorf("expected MaxMetricHosts clamped to 500000 for 600000, got %d", res.MaxMetricHosts)
+	}
+}

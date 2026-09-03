@@ -564,6 +564,11 @@ func (e *Engine) runCycle() {
 	}
 
 	// Paced feeder: dispatch target IPs smoothly across the interval window
+	var paceTimer *time.Timer
+	if paceDelay > 0 {
+		paceTimer = time.NewTimer(paceDelay)
+		defer paceTimer.Stop()
+	}
 	for _, ip := range targets {
 		select {
 		case <-ctxDone:
@@ -573,13 +578,20 @@ func (e *Engine) runCycle() {
 		case workChan <- ip:
 		}
 
-		if paceDelay > 0 {
+		if paceTimer != nil {
+			if !paceTimer.Stop() {
+				select {
+				case <-paceTimer.C:
+				default:
+				}
+			}
+			paceTimer.Reset(paceDelay)
 			select {
 			case <-ctxDone:
 				close(workChan)
 				cycleWg.Wait()
 				return
-			case <-time.After(paceDelay):
+			case <-paceTimer.C:
 			}
 		}
 	}
