@@ -127,7 +127,7 @@ curl -N http://localhost:8080/api/stream
 | Variable | Default | Description |
 |---|---|---|
 | `NGINX_HTTP_PORT` | `80` | Host port mapped to Nginx for the DINIS dashboard & REST API |
-| `NGINX_INFLUX_PORT` | `8181` | Host port mapped to Nginx for InfluxDB 3 Core (external Grafana access) |
+| `INFLUXDB3_PORT` | `8181` | Host port mapped directly to InfluxDB 3 Core (HTTP API & Flight SQL) |
 | `DINIS_PORT` | `8080` | Internal container port for DINIS |
 | `DINIS_DATA` | `/data/dinis.json` | Storage file path inside the container |
 | `DINIS_API_TOKEN` | `""` | Optional API authentication token required for REST endpoints |
@@ -137,7 +137,6 @@ curl -N http://localhost:8080/api/stream
 | `DINIS_ALLOWED_ORIGINS` | `""` | Allowed CORS origins |
 | `DINIS_MAX_METRIC_HOSTS` | `10000` | In-memory time-series host retention limit before LRU rollup eviction |
 | `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB 3 Core endpoint |
-| `INFLUXDB3_PORT` | `8181` | Internal container port for InfluxDB 3 Core |
 | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
 | `INFLUXDB3_TOKEN` | `""` | InfluxDB API token (must start with `apiv3_` if set) |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | InfluxDB 3 node identifier |
@@ -146,18 +145,28 @@ curl -N http://localhost:8080/api/stream
 
 To visualize DINIS probe metrics in your existing Grafana installation:
 
-1. In Grafana, navigate to **Connections** > **Data Sources** > **Add data source**.
-2. Select **InfluxDB**.
-3. Configure the datasource settings:
+### Option A: Native InfluxDB 3 / Flight SQL (Recommended)
+1. In Grafana, navigate to **Connections** > **Data Sources** > **Add data source** and select **InfluxDB**.
+2. Configure settings:
+   - **Query Language:** `SQL`
+   - **URL:** `http://<dinis-host-ip>:8181`
+   - **Database:** `dinis` (or the value of `INFLUXDB3_BUCKET`)
+   - **Token:** Your `INFLUXDB3_TOKEN` (starts with `apiv3_`)
+   - **Insecure Connection:** Toggle **ON** (required for cleartext HTTP/2 `h2c` without TLS)
+3. Click **Save & test**.
+
+### Option B: InfluxQL Compatibility Mode
+1. In Grafana, select **InfluxDB**.
+2. Configure settings:
    - **Query Language:** `InfluxQL`
    - **URL:** `http://<dinis-host-ip>:8181`
    - **Database:** `dinis` (or the value of `INFLUXDB3_BUCKET`)
    - **HTTP Method:** `POST`
-4. If authentication is enabled (`INFLUXDB3_TOKEN` is set):
+3. If authentication is enabled (`INFLUXDB3_TOKEN` is set):
    - Under **Custom HTTP Headers**, click **Add header**:
      - **Header:** `Authorization`
      - **Value:** `Bearer <your_INFLUXDB3_TOKEN>`
-5. Click **Save & test**.
+4. Click **Save & test**.
 
 ## Architecture / Project Structure
 
