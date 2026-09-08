@@ -378,4 +378,3 @@ func TestCIDRIntervalSec(t *testing.T) {
 		}
 	}
 }
-

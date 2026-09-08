@@ -306,4 +306,3 @@ func TestPerSubnetPacingAndExecution(t *testing.T) {
 		t.Errorf("expected 500ms subnet host to send more packets than 1500ms subnet host, got h1=%d, h2=%d", h1.SentPackets, h2.SentPackets)
 	}
 }
-

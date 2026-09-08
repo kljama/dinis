@@ -1714,5 +1714,3 @@ func TestRebuildTargetListLongestPrefixMatch(t *testing.T) {
 		t.Errorf("expected 192.168.1.50 to be mapped to 192.168.1.50/32, got %q", h2.CIDR)
 	}
 }
-
-
