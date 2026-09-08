@@ -155,9 +155,27 @@
     formAddCIDR: document.getElementById('formAddCIDR'),
     inputCIDR: document.getElementById('inputCIDR'),
     inputCIDRDesc: document.getElementById('inputCIDRDesc'),
+    inputCIDRInterval: document.getElementById('inputCIDRInterval'),
     checkIncludeNetBcast: document.getElementById('checkIncludeNetBcast'),
     cidrFeedback: document.getElementById('cidrFeedback'),
     cidrTableBody: document.getElementById('cidrTableBody'),
+
+    // Edit CIDR Modal
+    editCidrModal: document.getElementById('editCidrModal'),
+    btnCloseEditCidrModal: document.getElementById('btnCloseEditCidrModal'),
+    formEditCIDR: document.getElementById('formEditCIDR'),
+    editCIDRValue: document.getElementById('editCIDRValue'),
+    editCIDRDesc: document.getElementById('editCIDRDesc'),
+    radioIntervalDefault: document.getElementById('radioIntervalDefault'),
+    radioIntervalCustom: document.getElementById('radioIntervalCustom'),
+    editCustomIntervalWrapper: document.getElementById('editCustomIntervalWrapper'),
+    editCIDRInterval: document.getElementById('editCIDRInterval'),
+    spanGlobalDefaultLabel: document.getElementById('spanGlobalDefaultLabel'),
+    editIntervalHint: document.getElementById('editIntervalHint'),
+    editCIDREnabled: document.getElementById('editCIDREnabled'),
+    editCIDRNetBcast: document.getElementById('editCIDRNetBcast'),
+    btnCancelEditCIDR: document.getElementById('btnCancelEditCIDR'),
+    btnSaveEditCIDR: document.getElementById('btnSaveEditCIDR'),
 
     // Exclusions Modal
     exclusionsModal: document.getElementById('exclusionsModal'),
@@ -220,6 +238,8 @@
     inputTimeout: document.getElementById('inputTimeout'),
     inputFailThreshold: document.getElementById('inputFailThreshold'),
     inputConcurrency: document.getElementById('inputConcurrency'),
+    settingsSubnetsList: document.getElementById('settingsSubnetsList'),
+    btnSettingsOpenSubnets: document.getElementById('btnSettingsOpenSubnets'),
 
     // Toast Container
     toastContainer: document.getElementById('toastContainer'),
@@ -242,29 +262,44 @@
   // Initialize Application
   async function init() {
     setupEventListeners();
-    await Promise.all([
-      fetchSettings(),
-      fetchDiscoveryStatus(),
-      fetchCIDRs(),
-      fetchExclusions(),
-      fetchSummary(),
-      fetchSubnetsMatrix(),
-      fetchOutliers(),
-      fetchHosts(1),
-      fetchAlerts()
-    ]);
+    try {
+      await Promise.all([
+        fetchSettings(),
+        fetchDiscoveryStatus(),
+        fetchCIDRs(),
+        fetchExclusions(),
+        fetchSummary(),
+        fetchSubnetsMatrix(),
+        fetchOutliers(),
+        fetchHosts(1),
+        fetchAlerts()
+      ]);
+    } catch (e) {
+      console.error('Initialization fetch error:', e);
+    }
     connectSSE();
     renderAll();
 
-    // Periodic auto-sync (every 5 seconds)
+    // Periodic auto-sync (every 3 seconds)
     setInterval(() => {
       fetchSummary();
       if (state.currentView === 'matrix') {
         fetchSubnetsMatrix();
       } else if (state.currentView === 'outliers') {
         fetchOutliers();
+      } else if (state.currentView === 'explorer') {
+        fetchHosts(state.currentPage);
       }
-    }, 5000);
+      if (state.selectedHostIP && el.hostDetailModal && el.hostDetailModal.style.display !== 'none') {
+        apiFetch(`/api/hosts/${state.selectedHostIP}`).then(async res => {
+          if (res.ok) {
+            const h = await res.json();
+            state.selectedHostData = h;
+            populateHostDetailModal(h);
+          }
+        }).catch(() => {});
+      }
+    }, 3000);
   }
 
   // Master View Navigation
@@ -407,6 +442,38 @@
       triggerDiscovery();
     });
 
+    // Edit Subnet Modal
+    if (el.btnCloseEditCidrModal) el.btnCloseEditCidrModal.addEventListener('click', closeEditCIDRModal);
+    if (el.btnCancelEditCIDR) el.btnCancelEditCIDR.addEventListener('click', closeEditCIDRModal);
+    if (el.formEditCIDR) el.formEditCIDR.addEventListener('submit', handleSaveEditCIDR);
+    if (el.radioIntervalDefault) {
+      el.radioIntervalDefault.addEventListener('change', () => {
+        if (el.radioIntervalDefault.checked) {
+          if (el.editCustomIntervalWrapper) el.editCustomIntervalWrapper.style.display = 'none';
+          const defaultSec = state.settings.intervalSec || 60;
+          if (el.editIntervalHint) el.editIntervalHint.textContent = `Subnet inherits the global fallback interval of ${defaultSec} seconds from Settings.`;
+        }
+      });
+    }
+    if (el.radioIntervalCustom) {
+      el.radioIntervalCustom.addEventListener('change', () => {
+        if (el.radioIntervalCustom.checked) {
+          if (el.editCustomIntervalWrapper) el.editCustomIntervalWrapper.style.display = 'block';
+          if (el.editCIDRInterval && !el.editCIDRInterval.value) {
+            el.editCIDRInterval.value = (state.settings.intervalSec || 60);
+          }
+          if (el.editIntervalHint) el.editIntervalHint.textContent = 'Custom interval: probes for this subnet will dispatch at this rate.';
+          if (el.editCIDRInterval) el.editCIDRInterval.focus();
+        }
+      });
+    }
+    if (el.btnSettingsOpenSubnets) {
+      el.btnSettingsOpenSubnets.addEventListener('click', () => {
+        closeSettingsModal();
+        openCIDRModal();
+      });
+    }
+
     // Exclusions Modal
     el.btnOpenExclusions.addEventListener('click', openExclusionsModal);
     el.btnCloseExclusionsModal.addEventListener('click', closeExclusionsModal);
@@ -477,12 +544,17 @@
   }
 
   let currentSSE = null;
+  let sseReconnectTimer = null;
 
   // SSE Stream Connection
   function connectSSE() {
     if (currentSSE) {
       currentSSE.close();
       currentSSE = null;
+    }
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
     }
     let sseUrl = '/api/stream';
     const token = getAPIToken();
@@ -502,7 +574,26 @@
       state.sseConnected = false;
       el.liveStatusBadge.classList.add('disconnected');
       el.liveStatusText.textContent = 'RECONNECTING...';
+      if (!sseReconnectTimer) {
+        sseReconnectTimer = setTimeout(() => {
+          sseReconnectTimer = null;
+          connectSSE();
+        }, 3000);
+      }
     };
+
+    sse.addEventListener('desync', () => {
+      console.warn('SSE desync event received, performing full state refresh');
+      fetchSummary();
+      if (state.currentView === 'matrix') {
+        fetchSubnetsMatrix();
+      } else if (state.currentView === 'outliers') {
+        fetchOutliers();
+      } else if (state.currentView === 'explorer') {
+        fetchHosts(state.currentPage);
+      }
+      fetchAlerts();
+    });
 
     sse.addEventListener('summary_update', (e) => {
       try {
@@ -695,6 +786,7 @@
       if (res.ok) {
         state.cidrs = await res.json();
         renderCIDRTable();
+        renderSettingsSubnetsList();
       }
     } catch (e) {
       console.error('Failed to fetch CIDRs:', e);
@@ -812,12 +904,12 @@
   // -------------------------------------------------------------
 
   function renderAll() {
-    renderKPIs();
-    renderSubnetMatrix();
-    renderOutliers();
-    renderHosts();
-    renderCIDRTable();
-    renderExclusionTable();
+    try { renderKPIs(); } catch (e) { console.error('renderKPIs error:', e); }
+    try { renderSubnetMatrix(); } catch (e) { console.error('renderSubnetMatrix error:', e); }
+    try { renderOutliers(); } catch (e) { console.error('renderOutliers error:', e); }
+    try { renderHosts(); } catch (e) { console.error('renderHosts error:', e); }
+    try { renderCIDRTable(); } catch (e) { console.error('renderCIDRTable error:', e); }
+    try { renderExclusionTable(); } catch (e) { console.error('renderExclusionTable error:', e); }
   }
 
   function renderKPIs() {
@@ -881,7 +973,6 @@
   // -------------------------------------------------------------
 
   function renderSubnetMatrix() {
-    el.matrixGridContainer.innerHTML = '';
     const blocks = state.subnetsMatrix || [];
 
     el.matrixSubnetCount.textContent = `${blocks.length} Subnet${blocks.length === 1 ? '' : 's'} Monitored`;
@@ -901,9 +992,34 @@
       return;
     }
 
+    const emptyState = el.matrixGridContainer.querySelector('.empty-state');
+    if (emptyState) emptyState.remove();
+
+    const existingCards = new Map();
+    el.matrixGridContainer.querySelectorAll('.subnet-matrix-card').forEach(card => {
+      if (card.dataset.cidr) {
+        existingCards.set(card.dataset.cidr, card);
+      }
+    });
+
+    const activeCidrs = new Set();
     blocks.forEach(block => {
-      const card = createSubnetMatrixCard(block);
-      el.matrixGridContainer.appendChild(card);
+      const cidr = block.cidr ?? block.CIDR ?? 'Subnet';
+      activeCidrs.add(cidr);
+
+      const existingCard = existingCards.get(cidr);
+      if (existingCard) {
+        updateSubnetMatrixCard(existingCard, block);
+      } else {
+        const newCard = createSubnetMatrixCard(block);
+        el.matrixGridContainer.appendChild(newCard);
+      }
+    });
+
+    existingCards.forEach((card, cidr) => {
+      if (!activeCidrs.has(cidr)) {
+        card.remove();
+      }
     });
   }
 
@@ -936,21 +1052,37 @@
 
     const hasOutage = offlineCount > 0;
     card.className = `subnet-matrix-card ${hasOutage ? 'has-outage' : ''}`;
+    card.dataset.cidr = cidr;
 
-    let healthClass = 'good';
-    if (healthPct < 90) healthClass = 'bad';
-    else if (healthPct < 98) healthClass = 'warn';
+    const defaultSec = state.settings.intervalSec || 60;
+    const cidrCfg = state.cidrs.find(c => c.cidr === cidr);
+    const isCustom = cidrCfg && cidrCfg.intervalSec > 0;
+    const intervalVal = isCustom ? cidrCfg.intervalSec : defaultSec;
+    const intervalBadgeHtml = `<button type="button" class="matrix-interval-badge ${isCustom ? 'custom' : 'default'}" data-cidr="${escapeHtml(cidr)}" title="Ping interval: ${intervalVal}s ${isCustom ? '(Custom override)' : '(Global default)'}. Click to edit subnet.">⏱️ ${intervalVal}s</button>`;
+
+    const healthClass = healthPct >= 99.0 ? 'good' : (healthPct >= 80.0 ? 'warn' : 'bad');
 
     card.innerHTML = `
       <div class="matrix-card-header">
         <div class="matrix-card-title">
-          <span class="matrix-cidr-label">${escapeHtml(cidr)}</span>
+          <div class="d-flex align-center gap-2">
+            <span class="matrix-cidr-label">${escapeHtml(cidr)}</span>
+            ${intervalBadgeHtml}
+          </div>
           <span class="matrix-cidr-stats">${onlineCount} UP · ${offlineCount} DOWN · ${avgLatencyMs ? avgLatencyMs.toFixed(1) + 'ms' : '--'} avg (${cells.length} discovered)</span>
         </div>
         <span class="matrix-health-pill ${healthClass}">${healthPct.toFixed(1)}% Health</span>
       </div>
       <div class="matrix-cells-grid"></div>
     `;
+
+    const badgeBtn = card.querySelector('.matrix-interval-badge');
+    if (badgeBtn) {
+      badgeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openEditCIDRModal(cidr);
+      });
+    }
 
     const grid = card.querySelector('.matrix-cells-grid');
 
@@ -990,6 +1122,79 @@
     });
 
     return card;
+  }
+
+  function updateSubnetMatrixCard(card, block) {
+    const offlineCount = block.offlineCount ?? block.OfflineCount ?? 0;
+    const onlineCount = block.onlineCount ?? block.OnlineCount ?? 0;
+    const healthPct = block.healthPct ?? block.HealthPct ?? 100.0;
+    const avgLatencyMs = block.avgLatencyMs ?? block.AvgLatencyMs ?? 0;
+    const cidr = block.cidr ?? block.CIDR ?? 'Subnet';
+    const cells = block.cells ?? block.Cells ?? [];
+
+    const hasOutage = offlineCount > 0;
+    card.classList.toggle('has-outage', hasOutage);
+
+    const defaultSec = state.settings.intervalSec || 60;
+    const cidrCfg = state.cidrs.find(c => c.cidr === cidr);
+    const isCustom = cidrCfg && cidrCfg.intervalSec > 0;
+    const intervalVal = isCustom ? cidrCfg.intervalSec : defaultSec;
+
+    const badge = card.querySelector('.matrix-interval-badge');
+    if (badge) {
+      badge.className = `matrix-interval-badge ${isCustom ? 'custom' : 'default'}`;
+      badge.textContent = `⏱️ ${intervalVal}s`;
+    }
+
+    const statsEl = card.querySelector('.matrix-cidr-stats');
+    if (statsEl) {
+      statsEl.textContent = `${onlineCount} UP · ${offlineCount} DOWN · ${avgLatencyMs ? avgLatencyMs.toFixed(1) + 'ms' : '--'} avg (${cells.length} discovered)`;
+    }
+
+    const healthPill = card.querySelector('.matrix-health-pill');
+    if (healthPill) {
+      const healthClass = healthPct >= 99.0 ? 'good' : (healthPct >= 80.0 ? 'warn' : 'bad');
+      healthPill.className = `matrix-health-pill ${healthClass}`;
+      healthPill.textContent = `${healthPct.toFixed(1)}% Health`;
+    }
+
+    const grid = card.querySelector('.matrix-cells-grid, .matrix-single-host-view');
+    if (!grid) return;
+
+    if (cells.length === 1) {
+      const cellData = cells[0];
+      const status = cellData.status ?? cellData.Status ?? 'PENDING';
+      const latencyMs = cellData.latencyMs ?? cellData.LatencyMs ?? 0;
+      const rttText = status === 'UP' ? `${latencyMs.toFixed(2)} ms` : status;
+      const cellEl = grid.querySelector('.matrix-cell');
+      if (cellEl) cellEl.className = `matrix-cell ${getCellClass(cellData)}`;
+      const rttSpan = grid.querySelector('.font-mono.text-xs span:last-child');
+      if (rttSpan) rttSpan.textContent = rttText;
+    } else {
+      const cellEls = grid.querySelectorAll('.matrix-cell');
+      if (cellEls.length === cells.length) {
+        for (let i = 0; i < cells.length; i++) {
+          const cellData = cells[i];
+          const cEl = cellEls[i];
+          const newClass = `matrix-cell ${getCellClass(cellData)}`;
+          if (cEl.className !== newClass) {
+            cEl.className = newClass;
+          }
+        }
+      } else {
+        grid.className = 'matrix-cells-grid';
+        grid.innerHTML = '';
+        cells.forEach(cellData => {
+          const ip = cellData.ip ?? cellData.IP ?? '';
+          const cellEl = document.createElement('div');
+          cellEl.className = `matrix-cell ${getCellClass(cellData)}`;
+          cellEl.addEventListener('mouseenter', (e) => showMatrixTooltip(e, cellData));
+          cellEl.addEventListener('mouseleave', hideMatrixTooltip);
+          cellEl.addEventListener('click', () => openHostDetailModal(ip));
+          grid.appendChild(cellEl);
+        });
+      }
+    }
   }
 
   function showMatrixTooltip(e, cell) {
@@ -1407,6 +1612,8 @@
 
   async function openHostDetailModal(ip) {
     state.selectedHostIP = ip;
+    if (el.detailHostIP) el.detailHostIP.textContent = ip;
+    if (el.detailHostAlias) el.detailHostAlias.textContent = 'Loading host details...';
     el.hostDetailModal.style.display = 'flex';
 
     try {
@@ -1454,8 +1661,14 @@
   }
 
   function populateHostDetailModal(h) {
-    el.detailHostIP.textContent = h.ip;
-    el.detailHostAlias.textContent = h.alias ? `${h.alias} (${h.cidr || 'Scope'})` : (h.cidr || 'Single Monitored Target');
+    if (!h) return;
+    if (el.detailHostIP) el.detailHostIP.textContent = h.ip || state.selectedHostIP || '';
+    const defaultSec = state.settings.intervalSec || 60;
+    const cidrCfg = state.cidrs.find(c => c.cidr === h.cidr);
+    const isCustom = cidrCfg && cidrCfg.intervalSec > 0;
+    const intervalVal = isCustom ? cidrCfg.intervalSec : defaultSec;
+    const intervalStr = ` • ⏱️ ${intervalVal}s interval`;
+    el.detailHostAlias.textContent = (h.alias ? `${h.alias} (${h.cidr || 'Scope'})` : (h.cidr || 'Single Monitored Target')) + intervalStr;
 
     // Status dot
     el.detailStatusDot.className = 'status-indicator-lg';
@@ -1825,24 +2038,43 @@
     if (state.cidrs.length === 0) {
       el.cidrTableBody.innerHTML = `
         <tr>
-          <td colspan="5" style="text-align: center; color: var(--text-muted);">No CIDRs configured. Add a subnet above.</td>
+          <td colspan="6" style="text-align: center; color: var(--text-muted);">No CIDRs configured. Add a subnet above.</td>
         </tr>
       `;
       return;
     }
 
     state.cidrs.forEach(c => {
+      const defaultSec = state.settings.intervalSec || 60;
+      const isCustom = c.intervalSec && c.intervalSec > 0;
+      const intervalLabel = isCustom ? `${c.intervalSec}s` : `Default (${defaultSec}s)`;
+
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td><strong class="font-mono">${escapeHtml(c.cidr)}</strong></td>
         <td>${escapeHtml(c.description || '--')}</td>
+        <td>
+          <button type="button" class="badge-interval-btn ${isCustom ? 'is-custom' : 'is-default'} btn-edit-interval-badge" data-cidr="${escapeHtml(c.cidr)}" title="Click to modify ping interval for this subnet">
+            <span class="font-mono">${intervalLabel}</span>
+            <span style="font-size: 0.8rem; margin-left: 2px;">✎</span>
+          </button>
+        </td>
         <td><span class="status-pill ${c.enabled ? 'pill-up' : 'pill-excl'}">${c.enabled ? 'Active' : 'Disabled'}</span></td>
         <td class="text-xs text-muted">${c.includeNetAndBcast ? 'Yes' : 'No'}</td>
-        <td>
-          <button class="btn btn-sm btn-outline btn-scan-cidr" data-cidr="${c.cidr}" title="Trigger discovery sweep on this subnet">Scan</button>
-          <button class="btn btn-sm btn-outline text-down btn-del-cidr" data-cidr="${c.cidr}">Delete</button>
+        <td style="white-space: nowrap;">
+          <button type="button" class="btn btn-sm btn-primary btn-edit-cidr" data-cidr="${escapeHtml(c.cidr)}">Edit</button>
+          <button type="button" class="btn btn-sm btn-outline btn-scan-cidr" data-cidr="${escapeHtml(c.cidr)}" title="Trigger discovery sweep on this subnet">Scan</button>
+          <button type="button" class="btn btn-sm btn-outline text-down btn-del-cidr" data-cidr="${escapeHtml(c.cidr)}">Delete</button>
         </td>
       `;
+
+      tr.querySelector('.btn-edit-interval-badge').addEventListener('click', () => {
+        openEditCIDRModal(c.cidr);
+      });
+
+      tr.querySelector('.btn-edit-cidr').addEventListener('click', () => {
+        openEditCIDRModal(c.cidr);
+      });
 
       tr.querySelector('.btn-scan-cidr').addEventListener('click', () => {
         closeCIDRModal();
@@ -1868,23 +2100,171 @@
     });
   }
 
+  // -------------------------------------------------------------
+  // EDIT CIDR MODAL
+  // -------------------------------------------------------------
+
+  function openEditCIDRModal(cidr) {
+    const c = state.cidrs.find(x => x.cidr === cidr);
+    if (!c) {
+      showToast(`CIDR ${cidr} not found`, 'error');
+      return;
+    }
+
+    const defaultSec = state.settings.intervalSec || 60;
+    if (el.spanGlobalDefaultLabel) {
+      el.spanGlobalDefaultLabel.textContent = `${defaultSec}s`;
+    }
+
+    if (el.editCIDRValue) el.editCIDRValue.value = c.cidr;
+    if (el.editCIDRDesc) el.editCIDRDesc.value = c.description || '';
+    if (el.editCIDREnabled) el.editCIDREnabled.checked = c.enabled !== false;
+    if (el.editCIDRNetBcast) el.editCIDRNetBcast.checked = !!c.includeNetAndBcast;
+
+    if (c.intervalSec && c.intervalSec > 0) {
+      if (el.radioIntervalCustom) el.radioIntervalCustom.checked = true;
+      if (el.editCustomIntervalWrapper) el.editCustomIntervalWrapper.style.display = 'block';
+      if (el.editCIDRInterval) el.editCIDRInterval.value = c.intervalSec;
+      if (el.editIntervalHint) el.editIntervalHint.textContent = `Custom interval: probes for ${c.cidr} will dispatch every ${c.intervalSec} seconds.`;
+    } else {
+      if (el.radioIntervalDefault) el.radioIntervalDefault.checked = true;
+      if (el.editCustomIntervalWrapper) el.editCustomIntervalWrapper.style.display = 'none';
+      if (el.editCIDRInterval) el.editCIDRInterval.value = '';
+      if (el.editIntervalHint) el.editIntervalHint.textContent = `Subnet inherits the global fallback interval of ${defaultSec} seconds from Settings.`;
+    }
+
+    if (el.editCidrModal) el.editCidrModal.style.display = 'flex';
+  }
+
+  function closeEditCIDRModal() {
+    if (el.editCidrModal) el.editCidrModal.style.display = 'none';
+  }
+
+  async function handleSaveEditCIDR(e) {
+    e.preventDefault();
+    const cidr = el.editCIDRValue.value;
+    const desc = el.editCIDRDesc.value.trim();
+    const enabled = el.editCIDREnabled.checked;
+    const incNetBcast = el.editCIDRNetBcast.checked;
+    const isCustom = el.radioIntervalCustom.checked;
+
+    let intervalSec = 0;
+    if (isCustom) {
+      const parsed = parseFloat(el.editCIDRInterval.value);
+      if (isNaN(parsed) || parsed < 0.5) {
+        showToast('Please enter a valid interval of at least 0.5 seconds', 'error');
+        if (el.editCIDRInterval) el.editCIDRInterval.focus();
+        return;
+      }
+      intervalSec = parsed;
+    }
+
+    const payload = {
+      cidr: cidr,
+      description: desc,
+      enabled: enabled,
+      includeNetAndBcast: incNetBcast,
+      intervalSec: intervalSec
+    };
+
+    try {
+      const res = await apiFetch('/api/cidrs', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (res.ok) {
+        const defaultSec = state.settings.intervalSec || 60;
+        const msgInterval = intervalSec > 0 ? `${intervalSec}s` : `Default (${defaultSec}s)`;
+        showToast(`Updated ${cidr} (Interval: ${msgInterval})`, 'success');
+        closeEditCIDRModal();
+        await Promise.all([
+          fetchCIDRs(),
+          fetchSubnetsMatrix(),
+          fetchOutliers(),
+          fetchHosts(state.currentPage),
+          fetchSummary()
+        ]);
+        renderCIDRTable();
+      } else {
+        const data = await res.json();
+        showToast(data.error || 'Failed to update subnet', 'error');
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  function renderSettingsSubnetsList() {
+    if (!el.settingsSubnetsList) return;
+    el.settingsSubnetsList.innerHTML = '';
+
+    if (!state.cidrs || state.cidrs.length === 0) {
+      el.settingsSubnetsList.innerHTML = `
+        <div style="color: var(--text-muted); font-size: 0.75rem; text-align: center; padding: 0.5rem;">
+          No subnets configured yet. Click 'Manage Subnets' to add.
+        </div>
+      `;
+      return;
+    }
+
+    const defaultSec = state.settings.intervalSec || 60;
+    state.cidrs.forEach(c => {
+      const isCustom = c.intervalSec && c.intervalSec > 0;
+      const intervalText = isCustom ? `${c.intervalSec}s (Custom)` : `${defaultSec}s (Default)`;
+
+      const item = document.createElement('div');
+      item.className = 'settings-subnet-item';
+      item.innerHTML = `
+        <div class="settings-subnet-info">
+          <strong class="font-mono text-xs">${escapeHtml(c.cidr)}</strong>
+          ${c.description ? `<span class="text-xs text-muted">(${escapeHtml(c.description)})</span>` : ''}
+        </div>
+        <div class="settings-subnet-actions">
+          <span class="badge-interval-btn ${isCustom ? 'is-custom' : 'is-default'}" style="font-size: 0.7rem; padding: 0.15rem 0.45rem;">
+            ${intervalText}
+          </span>
+          <button type="button" class="btn btn-xs btn-outline btn-settings-edit-cidr" data-cidr="${escapeHtml(c.cidr)}">Edit</button>
+        </div>
+      `;
+
+      item.querySelector('.btn-settings-edit-cidr').addEventListener('click', (e) => {
+        e.preventDefault();
+        closeSettingsModal();
+        openEditCIDRModal(c.cidr);
+      });
+
+      el.settingsSubnetsList.appendChild(item);
+    });
+  }
+
   async function handleAddCIDR(e) {
     e.preventDefault();
     const cidr = el.inputCIDR.value.trim();
     const desc = el.inputCIDRDesc.value.trim();
     const incNetBcast = el.checkIncludeNetBcast.checked;
+    const intervalRaw = el.inputCIDRInterval ? el.inputCIDRInterval.value.trim() : '';
 
     if (!cidr) return;
+
+    const payload = {
+      cidr: cidr,
+      description: desc,
+      includeNetAndBcast: incNetBcast
+    };
+    if (intervalRaw !== '') {
+      const parsedInterval = parseFloat(intervalRaw);
+      if (!isNaN(parsedInterval) && parsedInterval > 0) {
+        payload.intervalSec = parsedInterval;
+      }
+    }
 
     try {
       const res = await apiFetch('/api/cidrs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          cidr: cidr,
-          description: desc,
-          includeNetAndBcast: incNetBcast
-        })
+        body: JSON.stringify(payload)
       });
 
       const data = await res.json();
@@ -1892,6 +2272,7 @@
         showToast(`Added CIDR ${cidr} (${data.totalHosts} total capacity)`, 'success');
         el.inputCIDR.value = '';
         el.inputCIDRDesc.value = '';
+        if (el.inputCIDRInterval) el.inputCIDRInterval.value = '';
         el.cidrFeedback.textContent = '';
         await Promise.all([
           fetchCIDRs(),
@@ -2007,6 +2388,7 @@
     el.inputTimeout.value = s.timeoutMs || 1000;
     el.inputFailThreshold.value = s.failThreshold || 2;
     el.inputConcurrency.value = s.concurrency || 100;
+    renderSettingsSubnetsList();
     el.settingsModal.style.display = 'flex';
   }
 
@@ -2036,6 +2418,8 @@
         state.settings = payload;
         showToast('Settings saved and engine re-configured', 'success');
         closeSettingsModal();
+        renderCIDRTable();
+        renderSubnetMatrix();
         fetchSummary();
       }
     } catch (err) {

@@ -16,6 +16,7 @@ type CIDRConfig struct {
 	Description        string    `json:"description"`
 	Enabled            bool      `json:"enabled"`
 	IncludeNetAndBcast bool      `json:"includeNetAndBcast"`
+	IntervalSec        float64   `json:"intervalSec,omitempty"` // 0 disables override (inherits global default)
 	CreatedAt          time.Time `json:"createdAt"`
 }
 
@@ -250,6 +251,14 @@ func (s *Store) GetCIDRs() []CIDRConfig {
 func (s *Store) AddOrUpdateCIDR(c CIDRConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if c.IntervalSec < 0 {
+		c.IntervalSec = 0
+	} else if c.IntervalSec > 0 && c.IntervalSec < 0.5 {
+		c.IntervalSec = 0.5
+	} else if c.IntervalSec > 3600 {
+		c.IntervalSec = 3600
+	}
 
 	var found bool
 	for i, existing := range s.data.CIDRs {

@@ -1554,3 +1554,165 @@ func TestSettingsMaxMetricHostsClamping(t *testing.T) {
 		t.Errorf("expected MaxMetricHosts clamped to 500000 for 600000, got %d", res.MaxMetricHosts)
 	}
 }
+
+func TestCIDRIntervalEndpointsAndSSEHeartbeat(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dinis-server-interval-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "data.json")
+	st, err := store.NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+
+	coord := NewCoordinator(st)
+	srv := NewServer(coord, "")
+
+	// 1. POST /api/cidrs with custom intervalSec
+	postPayload := `{"cidr":"192.168.100.0/24","description":"VLAN 100","intervalSec":2.5}`
+	req := httptest.NewRequest(http.MethodPost, "/api/cidrs", strings.NewReader(postPayload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on POST /api/cidrs, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var postRes struct {
+		CIDR store.CIDRConfig `json:"cidr"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&postRes); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if postRes.CIDR.IntervalSec != 2.5 {
+		t.Errorf("expected IntervalSec=2.5, got %f", postRes.CIDR.IntervalSec)
+	}
+
+	// 2. PUT /api/cidrs to update intervalSec
+	putPayload := `{"cidr":"192.168.100.0/24","intervalSec":5.0}`
+	req = httptest.NewRequest(http.MethodPut, "/api/cidrs", strings.NewReader(putPayload))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on PUT /api/cidrs, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var putRes store.CIDRConfig
+	if err := json.NewDecoder(rec.Body).Decode(&putRes); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if putRes.IntervalSec != 5.0 {
+		t.Errorf("expected updated IntervalSec=5.0, got %f", putRes.IntervalSec)
+	}
+
+	// 3. GET /api/cidrs verifies persistence
+	req = httptest.NewRequest(http.MethodGet, "/api/cidrs", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	var getRes []store.CIDRConfig
+	if err := json.NewDecoder(rec.Body).Decode(&getRes); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	var found bool
+	for _, c := range getRes {
+		if c.CIDR == "192.168.100.0/24" {
+			found = true
+			if c.IntervalSec != 5.0 {
+				t.Errorf("expected GET /api/cidrs to return IntervalSec=5.0, got %f", c.IntervalSec)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected 192.168.100.0/24 in GET /api/cidrs list")
+	}
+
+	// 4. Test decoupled 1-second SSE heartbeat
+	coord.Start()
+	defer coord.Stop()
+
+	sseReq := httptest.NewRequest(http.MethodGet, "/api/stream", nil)
+	sseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sseReq = sseReq.WithContext(sseCtx)
+
+	sseServer := httptest.NewServer(srv)
+	defer sseServer.Close()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(sseServer.URL + "/api/stream")
+	if err != nil {
+		t.Fatalf("failed to connect to SSE stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 1024)
+	n, err := resp.Body.Read(buf)
+	if err != nil && n == 0 {
+		t.Fatalf("failed to read SSE stream: %v", err)
+	}
+	received := string(buf[:n])
+	if !strings.Contains(received, "event: summary_update") {
+		t.Errorf("expected initial/heartbeat summary_update event, got:\n%s", received)
+	}
+}
+
+func TestRebuildTargetListLongestPrefixMatch(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Parent subnet @ 10s interval
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "192.168.1.0/24",
+		Enabled:     true,
+		IntervalSec: 10.0,
+	})
+
+	// 2. Specific host override @ 2s interval
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "192.168.1.50/32",
+		Enabled:     true,
+		IntervalSec: 2.0,
+	})
+
+	now := time.Now()
+	// Add discovered hosts with legacy/deviating CIDR tags
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		IP:             "192.168.1.10",
+		CIDR:           "192.168.1.10/32",
+		DiscoveredAt:   now,
+		LastDiscovered: now,
+		IsStatic:       false,
+	})
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		IP:             "192.168.1.50",
+		CIDR:           "Static",
+		DiscoveredAt:   now,
+		LastDiscovered: now,
+		IsStatic:       true,
+	})
+
+	coord.RebuildTargetList()
+
+	// 192.168.1.10 must be normalized to parent 192.168.1.0/24
+	h1, ok1 := coord.pinger.GetHost("192.168.1.10")
+	if !ok1 {
+		t.Fatalf("expected 192.168.1.10 to exist in pinger")
+	}
+	if h1.CIDR != "192.168.1.0/24" {
+		t.Errorf("expected 192.168.1.10 to be mapped to 192.168.1.0/24, got %q", h1.CIDR)
+	}
+
+	// 192.168.1.50 must match more specific /32 override
+	h2, ok2 := coord.pinger.GetHost("192.168.1.50")
+	if !ok2 {
+		t.Fatalf("expected 192.168.1.50 to exist in pinger")
+	}
+	if h2.CIDR != "192.168.1.50/32" {
+		t.Errorf("expected 192.168.1.50 to be mapped to 192.168.1.50/32, got %q", h2.CIDR)
+	}
+}
+
+

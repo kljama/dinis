@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dinis/pkg/timeseries"
@@ -91,6 +92,14 @@ type CycleSummary struct {
 	Timestamp      time.Time `json:"timestamp"`
 }
 
+type subnetRunner struct {
+	cidr     string
+	interval time.Duration
+	inFlight int32
+	wakeChan chan struct{}
+	stopChan chan struct{}
+}
+
 // Engine runs the periodic, high-concurrency ICMP probing loops across targets.
 type Engine struct {
 	mu      sync.RWMutex
@@ -99,13 +108,18 @@ type Engine struct {
 	prober  *SingleProber
 	tsStore *timeseries.Store
 
-	hosts map[string]*HostState // IP -> HostState
+	hosts           map[string]*HostState
+	subnetIntervals map[string]time.Duration
+	subnetRunners   map[string]*subnetRunner
+	runnerWg        sync.WaitGroup
+
+	workChan chan string
+	workerWg sync.WaitGroup
 
 	// Callbacks
 	BeforeStateChange func(host *HostState, oldStatus, newStatus HostStatus)
 	OnHostUpdated     func(host *HostState)
 	OnStateChange     func(host *HostState, oldStatus, newStatus HostStatus)
-	OnCycleComplete   func(summary *CycleSummary)
 	OnProbeRecorded   func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time)
 
 	wakeChan chan struct{}
@@ -139,11 +153,13 @@ func NewEngine(cfg EngineConfig) *Engine {
 	}
 
 	return &Engine{
-		config:   cfg,
-		prober:   NewSingleProber(),
-		tsStore:  timeseries.NewStoreWithLimit(maxMetricHosts),
-		hosts:    make(map[string]*HostState),
-		wakeChan: make(chan struct{}, 1),
+		config:          cfg,
+		prober:          NewSingleProber(),
+		tsStore:         timeseries.NewStoreWithLimit(maxMetricHosts),
+		hosts:           make(map[string]*HostState),
+		subnetIntervals: make(map[string]time.Duration),
+		subnetRunners:   make(map[string]*subnetRunner),
+		wakeChan:        make(chan struct{}, 1),
 	}
 }
 
@@ -152,11 +168,15 @@ func (e *Engine) GetTimeseriesStore() *timeseries.Store {
 	return e.tsStore
 }
 
-// Wake signals the background loop to immediately start a cycle.
+// Wake signals all subnet runners to immediately start a cycle.
 func (e *Engine) Wake() {
-	select {
-	case e.wakeChan <- struct{}{}:
-	default:
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, sr := range e.subnetRunners {
+		select {
+		case sr.wakeChan <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -167,14 +187,25 @@ func (e *Engine) UpdateConfig(cfg EngineConfig) {
 	if cfg.MaxMetricHosts > 0 && e.tsStore != nil {
 		e.tsStore.SetCapacity(cfg.MaxMetricHosts)
 	}
+	e.reconcileRunnersUnsafe()
 	e.mu.Unlock()
 	e.Wake()
 }
 
-// SetHosts updates the target host map.
-func (e *Engine) SetHosts(hosts map[string]*HostState) {
+// SetTargetsAndIntervals updates both the target host map and per-subnet intervals atomically.
+// If subnetIntervals is nil, existing subnet intervals are preserved.
+func (e *Engine) SetTargetsAndIntervals(hosts map[string]*HostState, subnetIntervals map[string]time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if subnetIntervals != nil {
+		e.subnetIntervals = make(map[string]time.Duration, len(subnetIntervals))
+		for cidr, interval := range subnetIntervals {
+			if interval > 0 {
+				e.subnetIntervals[cidr] = interval
+			}
+		}
+	}
 
 	// Merge existing stats if present
 	newMap := make(map[string]*HostState, len(hosts))
@@ -227,6 +258,26 @@ func (e *Engine) SetHosts(hosts map[string]*HostState) {
 		}
 		e.tsStore.PruneHosts(activeIPs)
 	}
+
+	e.reconcileRunnersUnsafe()
+}
+
+// SetHosts updates the target host map, retaining existing subnet intervals atomically.
+func (e *Engine) SetHosts(hosts map[string]*HostState) {
+	e.SetTargetsAndIntervals(hosts, nil)
+}
+
+func (e *Engine) effectiveIntervalUnsafe(cidr string) time.Duration {
+	if interval, ok := e.subnetIntervals[cidr]; ok && interval > 0 {
+		if interval < 500*time.Millisecond {
+			return 500 * time.Millisecond
+		}
+		return interval
+	}
+	if e.config.Interval < 500*time.Millisecond {
+		return 500 * time.Millisecond
+	}
+	return e.config.Interval
 }
 
 // GetHost returns a copy of the host state for an IP.
@@ -268,6 +319,7 @@ func (e *Engine) GetSummary() CycleSummary {
 
 	var sumLatency float64
 	var upWithLatency int
+	subnetCounts := make(map[string]int)
 
 	for _, h := range e.hosts {
 		switch h.Status {
@@ -285,14 +337,17 @@ func (e *Engine) GetSummary() CycleSummary {
 			summary.PendingCount++
 		}
 
-		if !h.IsExcluded && h.Status == StatusDown {
-			if h.AlertAcknowledged {
-				summary.AckCount++
-			}
-			if h.AlertActive {
-				summary.AlertsActive++
-				if !h.AlertAcknowledged {
-					summary.AlertsUnack++
+		if !h.IsExcluded {
+			subnetCounts[h.CIDR]++
+			if h.Status == StatusDown {
+				if h.AlertAcknowledged {
+					summary.AckCount++
+				}
+				if h.AlertActive {
+					summary.AlertsActive++
+					if !h.AlertAcknowledged {
+						summary.AlertsUnack++
+					}
 				}
 			}
 		}
@@ -302,21 +357,37 @@ func (e *Engine) GetSummary() CycleSummary {
 		summary.AvgLatencyMs = math.Round((sumLatency/float64(upWithLatency))*100) / 100
 	}
 
-	// Calculate pacing rates
+	// Calculate pacing rates across subnets
 	activeTargets := summary.TotalTargets - summary.ExcludedCount
-	if activeTargets > 0 && e.config.Interval > 0 {
-		summary.PacketsPerSec = math.Round((float64(activeTargets)/e.config.Interval.Seconds())*10) / 10
-		reserveTail := e.config.Timeout
-		if reserveTail > e.config.Interval/2 {
-			reserveTail = e.config.Interval / 2
+	if activeTargets > 0 {
+		var totalPacketsPerSec float64
+		var sumWeightedPace float64
+		var totalPacedHosts int
+
+		for cidr, count := range subnetCounts {
+			interval := e.effectiveIntervalUnsafe(cidr)
+			if interval > 0 && count > 0 {
+				totalPacketsPerSec += float64(count) / interval.Seconds()
+
+				reserveTail := e.config.Timeout
+				if reserveTail > interval/2 {
+					reserveTail = interval / 2
+				}
+				dispatchWindow := interval - reserveTail
+				if dispatchWindow < 100*time.Millisecond {
+					dispatchWindow = interval
+				}
+				paceDelay := dispatchWindow / time.Duration(count)
+				sumWeightedPace += (float64(paceDelay.Microseconds()) / 1000.0) * float64(count)
+				totalPacedHosts += count
+			}
 		}
-		dispatchWindow := e.config.Interval - reserveTail
-		if dispatchWindow < 100*time.Millisecond {
-			dispatchWindow = e.config.Interval
+
+		if totalPacketsPerSec > 0 {
+			summary.PacketsPerSec = math.Round(totalPacketsPerSec*10) / 10
 		}
-		if activeTargets > 1 {
-			paceDelay := dispatchWindow / time.Duration(activeTargets)
-			summary.PacedDelayMs = math.Round((float64(paceDelay.Microseconds())/1000.0)*100) / 100
+		if totalPacedHosts > 0 {
+			summary.PacedDelayMs = math.Round((sumWeightedPace/float64(totalPacedHosts))*100) / 100
 		}
 	}
 
@@ -343,7 +414,64 @@ func (e *Engine) TriggerSweep() {
 	e.Wake()
 }
 
-// Start starts the background polling loop.
+func (e *Engine) reconcileRunnersUnsafe() {
+	if e.ctx == nil {
+		return
+	}
+
+	neededRunners := make(map[string]time.Duration)
+	for cidr, interval := range e.subnetIntervals {
+		if interval > 0 {
+			neededRunners[cidr] = interval
+		} else {
+			neededRunners[cidr] = e.config.Interval
+		}
+	}
+
+	// Check if we need default runner for unassigned/static targets
+	hasUnassigned := false
+	for _, h := range e.hosts {
+		if h.CIDR == "" {
+			hasUnassigned = true
+			break
+		}
+		if _, exists := neededRunners[h.CIDR]; !exists {
+			hasUnassigned = true
+			break
+		}
+	}
+	if hasUnassigned || len(neededRunners) == 0 {
+		neededRunners[""] = e.config.Interval
+	}
+
+	// Stop runners no longer needed, and update interval in-place if changed
+	for cidr, r := range e.subnetRunners {
+		expectedInterval, exists := neededRunners[cidr]
+		if !exists {
+			close(r.stopChan)
+			delete(e.subnetRunners, cidr)
+		} else if expectedInterval != r.interval {
+			r.interval = expectedInterval
+		}
+	}
+
+	// Start new runners
+	for cidr, interval := range neededRunners {
+		if _, running := e.subnetRunners[cidr]; !running {
+			sr := &subnetRunner{
+				cidr:     cidr,
+				interval: interval,
+				wakeChan: make(chan struct{}, 1),
+				stopChan: make(chan struct{}),
+			}
+			e.subnetRunners[cidr] = sr
+			e.runnerWg.Add(1)
+			go e.runSubnetLoop(sr)
+		}
+	}
+}
+
+// Start starts the background polling loops and shared worker pool.
 func (e *Engine) Start() {
 	e.mu.Lock()
 	if e.ctx != nil {
@@ -354,27 +482,111 @@ func (e *Engine) Start() {
 	if e.tsStore != nil {
 		e.tsStore.Start()
 	}
-	e.mu.Unlock()
 
-	e.wg.Add(1)
-	go e.runLoop()
+	numWorkers := e.config.Concurrency
+	if numWorkers <= 0 {
+		numWorkers = 100
+	}
+	workChan := make(chan string, numWorkers*2)
+	e.workChan = workChan
+	e.workerWg.Add(numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		go e.workerLoop(workChan)
+	}
+
+	e.reconcileRunnersUnsafe()
+	e.mu.Unlock()
 }
 
-// Stop stops the background polling loop and closes prober socket resources.
+// Stop stops all background polling loops and closes prober socket resources.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if e.cancel != nil {
 		e.cancel()
+	}
+	for cidr, r := range e.subnetRunners {
+		close(r.stopChan)
+		delete(e.subnetRunners, cidr)
 	}
 	if e.tsStore != nil {
 		e.tsStore.Stop()
 	}
 	e.mu.Unlock()
 
-	e.wg.Wait()
+	e.runnerWg.Wait()
+
+	e.mu.Lock()
+	if e.workChan != nil {
+		close(e.workChan)
+	}
+	e.mu.Unlock()
+
+	e.workerWg.Wait()
+
+	e.mu.Lock()
+	e.workChan = nil
+	e.ctx = nil
+	e.cancel = nil
+	e.mu.Unlock()
 
 	if e.prober != nil {
 		e.prober.Close()
+	}
+}
+
+func (e *Engine) workerLoop(workChan <-chan string) {
+	defer e.workerWg.Done()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case ip, ok := <-workChan:
+			if !ok {
+				return
+			}
+			e.probeAndApply(ip)
+		}
+	}
+}
+
+func (e *Engine) probeAndApply(ip string) {
+	e.mu.RLock()
+	timeout := e.config.Timeout
+	ctx := e.ctx
+	e.mu.RUnlock()
+
+	probeCtx := context.Background()
+	if ctx != nil {
+		probeCtx = ctx
+	}
+
+	res := e.prober.Probe(probeCtx, ip, timeout)
+
+	e.mu.Lock()
+	h, exists := e.hosts[ip]
+	if !exists || h.IsExcluded {
+		e.mu.Unlock()
+		return
+	}
+
+	oldStatus := h.Status
+	e.applyResult(h, res)
+	newStatus := h.Status
+	statusChanged := (oldStatus != newStatus)
+
+	if statusChanged && e.BeforeStateChange != nil {
+		e.BeforeStateChange(h, oldStatus, newStatus)
+	}
+
+	cpy := *h
+	cpy.LatencyHistory = append([]float64(nil), h.LatencyHistory...)
+	e.mu.Unlock()
+
+	if statusChanged && e.OnStateChange != nil {
+		e.OnStateChange(&cpy, oldStatus, newStatus)
+	}
+	if e.OnHostUpdated != nil {
+		e.OnHostUpdated(&cpy)
 	}
 }
 
@@ -419,27 +631,26 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 	return res
 }
 
-func (e *Engine) runLoop() {
-	defer e.wg.Done()
-
-	// Drain any pre-startup wake signal so the initial cycle starts cleanly
-	select {
-	case <-e.wakeChan:
-	default:
-	}
+func (e *Engine) runSubnetLoop(sr *subnetRunner) {
+	defer e.runnerWg.Done()
 
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
+		case <-sr.stopChan:
+			return
 		default:
 		}
 
 		cycleStart := time.Now()
-		e.runCycle()
+		e.runSubnetCycle(sr)
 
 		e.mu.RLock()
-		interval := e.config.Interval
+		interval := sr.interval
+		if interval <= 0 {
+			interval = e.config.Interval
+		}
 		e.mu.RUnlock()
 
 		elapsed := time.Since(cycleStart)
@@ -448,39 +659,45 @@ func (e *Engine) runLoop() {
 			select {
 			case <-e.ctx.Done():
 				return
-			case <-e.wakeChan:
+			case <-sr.stopChan:
+				return
+			case <-sr.wakeChan:
 			case <-time.After(remaining):
 			}
 		}
 	}
 }
 
-func (e *Engine) runCycle() {
-	e.cycleMu.Lock()
-	defer e.cycleMu.Unlock()
+func (e *Engine) runSubnetCycle(sr *subnetRunner) {
+	if !atomic.CompareAndSwapInt32(&sr.inFlight, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&sr.inFlight, 0)
 
 	e.mu.RLock()
-	targets := make([]string, 0, len(e.hosts))
+	targets := make([]string, 0)
 	for ip, h := range e.hosts {
 		if !h.IsExcluded {
-			targets = append(targets, ip)
+			if sr.cidr == "" {
+				if _, hasExplicit := e.subnetIntervals[h.CIDR]; !hasExplicit {
+					targets = append(targets, ip)
+				}
+			} else if h.CIDR == sr.cidr {
+				targets = append(targets, ip)
+			}
 		}
 	}
-	concurrency := e.config.Concurrency
 	timeout := e.config.Timeout
-	interval := e.config.Interval
+	interval := sr.interval
+	if interval <= 0 {
+		interval = e.config.Interval
+	}
 	e.mu.RUnlock()
 
 	if len(targets) == 0 {
-		summary := e.GetSummary()
-		if e.OnCycleComplete != nil {
-			e.OnCycleComplete(&summary)
-		}
 		return
 	}
 
-	// Calculate pacing window and delay between feeding target probes.
-	// We reserve a tail buffer for timeout so the last dispatched probe completes before the cycle window ends.
 	reserveTail := timeout
 	if reserveTail > interval/2 {
 		reserveTail = interval / 2
@@ -493,89 +710,21 @@ func (e *Engine) runCycle() {
 	var paceDelay time.Duration
 	if len(targets) > 1 && dispatchWindow > 0 {
 		paceDelay = dispatchWindow / time.Duration(len(targets))
-		if paceDelay > 50*time.Millisecond {
-			paceDelay = 50 * time.Millisecond
-		}
 	}
 
-	numWorkers := concurrency
-	if numWorkers > len(targets) {
-		numWorkers = len(targets)
-	}
-	if numWorkers <= 0 {
-		numWorkers = 1
-	}
-
-	workChan := make(chan string, numWorkers*2)
-	var cycleWg sync.WaitGroup
-	cycleWg.Add(numWorkers)
-
-	e.mu.RLock()
-	ctx := e.ctx
-	e.mu.RUnlock()
-
-	var ctxDone <-chan struct{}
-	probeCtx := context.Background()
-	if ctx != nil {
-		ctxDone = ctx.Done()
-		probeCtx = ctx
-	}
-
-	for w := 0; w < numWorkers; w++ {
-		go func() {
-			defer cycleWg.Done()
-			for ip := range workChan {
-				select {
-				case <-ctxDone:
-					return
-				default:
-				}
-
-				res := e.prober.Probe(probeCtx, ip, timeout)
-
-				e.mu.Lock()
-				h, exists := e.hosts[ip]
-				if !exists || h.IsExcluded {
-					e.mu.Unlock()
-					continue
-				}
-
-				oldStatus := h.Status
-				e.applyResult(h, res)
-				newStatus := h.Status
-				statusChanged := (oldStatus != newStatus)
-
-				if statusChanged && e.BeforeStateChange != nil {
-					e.BeforeStateChange(h, oldStatus, newStatus)
-				}
-
-				cpy := *h
-				cpy.LatencyHistory = append([]float64(nil), h.LatencyHistory...)
-				e.mu.Unlock()
-
-				if statusChanged && e.OnStateChange != nil {
-					e.OnStateChange(&cpy, oldStatus, newStatus)
-				}
-				if e.OnHostUpdated != nil {
-					e.OnHostUpdated(&cpy)
-				}
-			}
-		}()
-	}
-
-	// Paced feeder: dispatch target IPs smoothly across the interval window
 	var paceTimer *time.Timer
 	if paceDelay > 0 {
 		paceTimer = time.NewTimer(paceDelay)
 		defer paceTimer.Stop()
 	}
+
 	for _, ip := range targets {
 		select {
-		case <-ctxDone:
-			close(workChan)
-			cycleWg.Wait()
+		case <-e.ctx.Done():
 			return
-		case workChan <- ip:
+		case <-sr.stopChan:
+			return
+		case e.workChan <- ip:
 		}
 
 		if paceTimer != nil {
@@ -587,21 +736,14 @@ func (e *Engine) runCycle() {
 			}
 			paceTimer.Reset(paceDelay)
 			select {
-			case <-ctxDone:
-				close(workChan)
-				cycleWg.Wait()
+			case <-e.ctx.Done():
 				return
+			case <-sr.stopChan:
+				return
+			case <-sr.wakeChan:
 			case <-paceTimer.C:
 			}
 		}
-	}
-	close(workChan)
-
-	cycleWg.Wait()
-
-	summary := e.GetSummary()
-	if e.OnCycleComplete != nil {
-		e.OnCycleComplete(&summary)
 	}
 }
 

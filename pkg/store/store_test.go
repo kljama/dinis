@@ -320,3 +320,62 @@ func TestStoreFileLock(t *testing.T) {
 	}
 	_ = s3.Close()
 }
+
+func TestCIDRIntervalSec(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dinis-store-interval-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "data.json")
+	s, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	// 1. Add CIDR with custom interval
+	err = s.AddOrUpdateCIDR(CIDRConfig{
+		CIDR:        "10.50.0.0/24",
+		Description: "Fast Poll Subnet",
+		Enabled:     true,
+		IntervalSec: 2.5,
+	})
+	if err != nil {
+		t.Fatalf("failed to add CIDR: %v", err)
+	}
+
+	// 2. Add CIDR with clamped interval (> 3600 -> 3600)
+	err = s.AddOrUpdateCIDR(CIDRConfig{
+		CIDR:        "10.60.0.0/24",
+		Description: "Slow Poll Subnet",
+		Enabled:     true,
+		IntervalSec: 99999,
+	})
+	if err != nil {
+		t.Fatalf("failed to add CIDR: %v", err)
+	}
+
+	_ = s.Close()
+
+	// 3. Reload and verify
+	s2, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to reload store: %v", err)
+	}
+	defer s2.Close()
+
+	for _, c := range s2.GetCIDRs() {
+		if c.CIDR == "10.50.0.0/24" {
+			if c.IntervalSec != 2.5 {
+				t.Errorf("expected IntervalSec=2.5, got %f", c.IntervalSec)
+			}
+		}
+		if c.CIDR == "10.60.0.0/24" {
+			if c.IntervalSec != 3600 {
+				t.Errorf("expected IntervalSec=3600, got %f", c.IntervalSec)
+			}
+		}
+	}
+}
+

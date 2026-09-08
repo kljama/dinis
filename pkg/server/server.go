@@ -103,17 +103,16 @@ func NewCoordinator(st *store.Store) *Coordinator {
 	p.BeforeStateChange = c.handleBeforeStateChange
 	p.OnStateChange = c.handleStateChange
 	p.OnHostUpdated = c.handleHostUpdated
-	p.OnCycleComplete = c.handleCycleComplete
 
-	// Wire alert manager callbacks
+	// Wire alert manager callbacks (broadcast asynchronously to decouple from engine lock)
 	altMgr.OnAlertTriggered = func(a *alerts.Alert) {
-		c.broadcastEvent("alert_fired", a)
+		go c.broadcastEvent("alert_fired", a)
 	}
 	altMgr.OnAlertAcknowledged = func(a *alerts.Alert) {
-		c.broadcastEvent("alert_acknowledged", a)
+		go c.broadcastEvent("alert_acknowledged", a)
 	}
 	altMgr.OnAlertResolved = func(a *alerts.Alert) {
-		c.broadcastEvent("alert_resolved", a)
+		go c.broadcastEvent("alert_resolved", a)
 	}
 
 	// Initial sync of hosts from storage
@@ -226,31 +225,55 @@ func (c *Coordinator) RebuildTargetList() {
 		log.Printf("[DINIS] Error pruning unmanaged discovered hosts from disk: %v", err)
 	}
 
+	type parsedCIDR struct {
+		cidr      string
+		ipNet     *net.IPNet
+		prefixLen int
+	}
+	var parsedCIDRs []parsedCIDR
+	for _, cfg := range cidrs {
+		if !cfg.Enabled {
+			continue
+		}
+		_, ipNet, err := net.ParseCIDR(cfg.CIDR)
+		if err == nil && ipNet != nil {
+			ones, _ := ipNet.Mask.Size()
+			parsedCIDRs = append(parsedCIDRs, parsedCIDR{
+				cidr:      cfg.CIDR,
+				ipNet:     ipNet,
+				prefixLen: ones,
+			})
+		}
+	}
+
 	hostMap := make(map[string]*pinger.HostState)
 
 	for ip, disc := range discovered {
-		if !disc.IsStatic && !validCIDRs[disc.CIDR] {
-			continue
-		}
-
-		hostCIDR := disc.CIDR
-		if hostCIDR == "" || hostCIDR == "Static" {
-			parsedIP := net.ParseIP(ip)
-			found := false
-			if parsedIP != nil {
-				for _, cfg := range cidrs {
-					if !cfg.Enabled {
-						continue
-					}
-					_, ipNet, err := net.ParseCIDR(cfg.CIDR)
-					if err == nil && ipNet.Contains(parsedIP) {
-						hostCIDR = cfg.CIDR
-						found = true
-						break
+		// Determine best matching enabled CIDR for this IP (longest-prefix match)
+		var matchedCIDR string
+		var maxPrefixLen int = -1
+		parsedIP := net.ParseIP(ip)
+		if parsedIP != nil {
+			for _, pc := range parsedCIDRs {
+				if pc.ipNet.Contains(parsedIP) {
+					if pc.prefixLen > maxPrefixLen {
+						maxPrefixLen = pc.prefixLen
+						matchedCIDR = pc.cidr
 					}
 				}
 			}
-			if !found {
+		}
+
+		// If the host is not static and doesn't belong to any valid enabled CIDR, skip it
+		if !disc.IsStatic && matchedCIDR == "" && !validCIDRs[disc.CIDR] {
+			continue
+		}
+
+		hostCIDR := matchedCIDR
+		if hostCIDR == "" {
+			if disc.CIDR != "" && disc.CIDR != "Static" {
+				hostCIDR = disc.CIDR
+			} else {
 				hostCIDR = ip + "/32"
 			}
 		}
@@ -326,7 +349,18 @@ func (c *Coordinator) RebuildTargetList() {
 		return !exists || h.IsExcluded
 	})
 
-	c.pinger.SetHosts(hostMap)
+	subnetIntervals := make(map[string]time.Duration)
+	for _, cfg := range cidrs {
+		if cfg.Enabled && cfg.IntervalSec > 0 {
+			d := time.Duration(cfg.IntervalSec * float64(time.Second))
+			if d < 500*time.Millisecond {
+				d = 500 * time.Millisecond
+			}
+			subnetIntervals[cfg.CIDR] = d
+		}
+	}
+
+	c.pinger.SetTargetsAndIntervals(hostMap, subnetIntervals)
 	c.pinger.Wake()
 
 	c.discMu.Lock()
@@ -691,17 +725,17 @@ func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatu
 func (c *Coordinator) handleHostUpdated(h *pinger.HostState) {
 	// Per-packet SSE broadcasting is decoupled to enable 20,000+ host scalability.
 	// State transitions and associated alert lifecycle are handled authoritatively via handleStateChange.
-	// Aggregated metrics are broadcasted at cycle completion via handleCycleComplete.
-}
-
-func (c *Coordinator) handleCycleComplete(summary *pinger.CycleSummary) {
-	c.discMu.RLock()
-	summary.SubnetCapacity = c.discoveryStatus.SubnetCapacity
-	c.discMu.RUnlock()
-	c.broadcastEvent("summary_update", summary)
+	// Aggregated metrics are broadcasted at 1s cadence via heartbeatLoop.
 }
 
 func (c *Coordinator) broadcastEvent(eventType string, data interface{}) {
+	c.clientsMu.RLock()
+	if len(c.sseClients) == 0 {
+		c.clientsMu.RUnlock()
+		return
+	}
+	c.clientsMu.RUnlock()
+
 	payload, err := json.Marshal(data)
 	if err != nil {
 		return
@@ -741,25 +775,45 @@ func (c *Coordinator) broadcastEvent(eventType string, data interface{}) {
 }
 
 func (c *Coordinator) heartbeatLoop() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+
+	keepaliveCounter := 0
 
 	for {
 		select {
 		case <-c.stopChan:
 			return
 		case <-ticker.C:
-			pingMsg := []byte(": keepalive\n\n")
-			c.broadcastMu.Lock()
+			// Emit live system summary update every 1 second if SSE clients are connected
 			c.clientsMu.RLock()
-			for ch := range c.sseClients {
-				select {
-				case ch <- pingMsg:
-				default:
-				}
-			}
+			hasClients := len(c.sseClients) > 0
 			c.clientsMu.RUnlock()
-			c.broadcastMu.Unlock()
+
+			if hasClients {
+				summary := c.pinger.GetSummary()
+				c.discMu.RLock()
+				summary.SubnetCapacity = c.discoveryStatus.SubnetCapacity
+				c.discMu.RUnlock()
+				c.broadcastEvent("summary_update", summary)
+			}
+
+			// Emit keepalive comment every 15 seconds to prevent proxy timeout
+			keepaliveCounter++
+			if keepaliveCounter >= 15 {
+				keepaliveCounter = 0
+				pingMsg := []byte(": keepalive\n\n")
+				c.broadcastMu.Lock()
+				c.clientsMu.RLock()
+				for ch := range c.sseClients {
+					select {
+					case ch <- pingMsg:
+					default:
+					}
+				}
+				c.clientsMu.RUnlock()
+				c.broadcastMu.Unlock()
+			}
 		}
 	}
 }
@@ -1349,10 +1403,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial greeting / sync state
 	summary := s.coord.pinger.GetSummary()
+	s.coord.discMu.RLock()
+	summary.SubnetCapacity = s.coord.discoveryStatus.SubnetCapacity
+	s.coord.discMu.RUnlock()
 	sumBytes, _ := json.Marshal(summary)
 	_ = rc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_, _ = fmt.Fprintf(w, "event: summary_update\ndata: %s\n\n", string(sumBytes))
 	flusher.Flush()
+	_ = rc.SetWriteDeadline(time.Time{})
 
 	ctx := r.Context()
 	for {
@@ -1369,6 +1427,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
+			_ = rc.SetWriteDeadline(time.Time{})
 		}
 	}
 }
@@ -1639,14 +1698,38 @@ func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
 
 	hosts := s.coord.pinger.GetAllHosts()
 	hostsBySubnet := make(map[string][]timeseries.SubnetMatrixCell)
+	cidrPrefixCache := make(map[string]int)
 
 	for _, h := range hosts {
-		subnetKey := getSubnetGroupKey(h)
-
+		cidr := strings.TrimSpace(h.CIDR)
 		parsedIP := net.ParseIP(h.IP).To4()
 		hostIdx := 0
 		if parsedIP != nil {
 			hostIdx = int(parsedIP[3])
+		}
+
+		var subnetKey string
+		if cidr == "" || cidr == "Static" {
+			subnetKey = h.IP + "/32"
+		} else {
+			prefixLen, cached := cidrPrefixCache[cidr]
+			if !cached {
+				_, ipNet, err := net.ParseCIDR(cidr)
+				if err == nil && ipNet != nil {
+					prefixLen, _ = ipNet.Mask.Size()
+				} else {
+					prefixLen = -1
+				}
+				cidrPrefixCache[cidr] = prefixLen
+			}
+
+			if prefixLen >= 24 || prefixLen == -1 {
+				subnetKey = cidr
+			} else if parsedIP != nil {
+				subnetKey = fmt.Sprintf("%d.%d.%d.0/24", parsedIP[0], parsedIP[1], parsedIP[2])
+			} else {
+				subnetKey = cidr
+			}
 		}
 
 		cell := timeseries.SubnetMatrixCell{
@@ -1854,10 +1937,11 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var req struct {
-			CIDR               string `json:"cidr"`
-			Description        string `json:"description"`
-			Enabled            *bool  `json:"enabled"`
-			IncludeNetAndBcast bool   `json:"includeNetAndBcast"`
+			CIDR               string   `json:"cidr"`
+			Description        string   `json:"description"`
+			Enabled            *bool    `json:"enabled"`
+			IncludeNetAndBcast bool     `json:"includeNetAndBcast"`
+			IntervalSec        *float64 `json:"intervalSec"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
 			writeDecodeError(w, err)
@@ -1876,11 +1960,24 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 			enabled = *req.Enabled
 		}
 
+		var intervalSec float64
+		if req.IntervalSec != nil {
+			intervalSec = *req.IntervalSec
+			if intervalSec < 0 {
+				intervalSec = 0
+			} else if intervalSec > 0 && intervalSec < 0.5 {
+				intervalSec = 0.5
+			} else if intervalSec > 3600 {
+				intervalSec = 3600
+			}
+		}
+
 		cidrCfg := store.CIDRConfig{
 			CIDR:               info.CIDR,
 			Description:        req.Description,
 			Enabled:            enabled,
 			IncludeNetAndBcast: req.IncludeNetAndBcast,
+			IntervalSec:        intervalSec,
 			CreatedAt:          time.Now(),
 		}
 
@@ -1901,6 +1998,67 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 			"cidr":       cidrCfg,
 			"totalHosts": info.TotalHosts,
 		})
+
+	case http.MethodPut:
+		var req struct {
+			CIDR               string   `json:"cidr"`
+			Description        *string  `json:"description"`
+			Enabled            *bool    `json:"enabled"`
+			IncludeNetAndBcast *bool    `json:"includeNetAndBcast"`
+			IntervalSec        *float64 `json:"intervalSec"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeDecodeError(w, err)
+			return
+		}
+
+		if req.CIDR == "" {
+			writeError(w, http.StatusBadRequest, "Missing CIDR parameter")
+			return
+		}
+
+		cidrs := s.coord.store.GetCIDRs()
+		var targetCfg *store.CIDRConfig
+		for _, c := range cidrs {
+			if c.CIDR == req.CIDR {
+				cpy := c
+				targetCfg = &cpy
+				break
+			}
+		}
+		if targetCfg == nil {
+			writeError(w, http.StatusNotFound, "CIDR not found")
+			return
+		}
+
+		if req.Description != nil {
+			targetCfg.Description = *req.Description
+		}
+		if req.Enabled != nil {
+			targetCfg.Enabled = *req.Enabled
+		}
+		if req.IncludeNetAndBcast != nil {
+			targetCfg.IncludeNetAndBcast = *req.IncludeNetAndBcast
+		}
+		if req.IntervalSec != nil {
+			iv := *req.IntervalSec
+			if iv < 0 {
+				iv = 0
+			} else if iv > 0 && iv < 0.5 {
+				iv = 0.5
+			} else if iv > 3600 {
+				iv = 3600
+			}
+			targetCfg.IntervalSec = iv
+		}
+
+		if err := s.coord.store.AddOrUpdateCIDR(*targetCfg); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		s.coord.RebuildTargetList()
+		writeJSON(w, http.StatusOK, targetCfg)
 
 	case http.MethodDelete:
 		cidr := r.URL.Query().Get("cidr")
@@ -2152,6 +2310,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			HistorySize:    25,
 			MaxMetricHosts: req.MaxMetricHosts,
 		})
+		s.coord.RebuildTargetList()
 
 		s.coord.discMu.Lock()
 		s.coord.discoveryStatus.IntervalMin = req.DiscoveryIntervalMin

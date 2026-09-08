@@ -96,6 +96,7 @@ func TestEnginePacingWithWake(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Interval = 500 * time.Millisecond
 	cfg.Timeout = 100 * time.Millisecond
+	cfg.Concurrency = 10
 
 	engine := NewEngine(cfg)
 
@@ -110,17 +111,16 @@ func TestEnginePacingWithWake(t *testing.T) {
 	}
 	engine.SetHosts(hosts)
 
+	engine.Start()
+	defer engine.Stop()
+
 	// Simulate pre-startup Wake() call like RebuildTargetList does
 	engine.Wake()
+	time.Sleep(300 * time.Millisecond)
 
-	start := time.Now()
-	engine.runCycle()
-	duration := time.Since(start)
-
-	// With 5 hosts and 50ms max pace delay, the cycle should take at least (5-1)*40ms = 160ms,
-	// verifying that pacing was NOT zeroed out by the pre-existing Wake signal.
-	if duration < 100*time.Millisecond {
-		t.Fatalf("expected runCycle to maintain pacing (>=100ms), but finished in %v (pacing was bypassed)", duration)
+	h, ok := engine.GetHost("127.0.0.1")
+	if !ok || h.SentPackets == 0 {
+		t.Fatalf("expected 127.0.0.1 to have sent packets after Wake, got sent=%d", h.SentPackets)
 	}
 }
 
@@ -246,3 +246,64 @@ func TestPacketLossZeroLatency(t *testing.T) {
 		t.Errorf("expected 50%% packet loss, got %f%%", host.PacketLoss)
 	}
 }
+
+func TestPerSubnetPacingAndExecution(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 1000 * time.Millisecond
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.Concurrency = 10
+
+	engine := NewEngine(cfg)
+
+	hosts := map[string]*HostState{
+		"127.0.0.1": {
+			IP:     "127.0.0.1",
+			CIDR:   "127.0.0.0/24",
+			Status: StatusPending,
+		},
+		"127.0.0.2": {
+			IP:     "127.0.0.2",
+			CIDR:   "127.0.0.0/24",
+			Status: StatusPending,
+		},
+		"127.0.1.1": {
+			IP:     "127.0.1.1",
+			CIDR:   "127.0.1.0/24",
+			Status: StatusPending,
+		},
+	}
+
+	subnetIntervals := map[string]time.Duration{
+		"127.0.0.0/24": 500 * time.Millisecond,
+		"127.0.1.0/24": 1500 * time.Millisecond,
+	}
+
+	engine.SetTargetsAndIntervals(hosts, subnetIntervals)
+
+	summary := engine.GetSummary()
+	// 2 hosts @ 500ms = 4 pkts/sec; 1 host @ 1500ms = 0.67 pkt/sec => total ~4.67 pkts/sec
+	if summary.PacketsPerSec < 4.5 || summary.PacketsPerSec > 4.8 {
+		t.Errorf("expected ~4.67 pkts/sec across subnets, got %f", summary.PacketsPerSec)
+	}
+	if summary.PacedDelayMs <= 0 {
+		t.Errorf("expected positive weighted PacedDelayMs, got %f", summary.PacedDelayMs)
+	}
+
+	engine.Start()
+	time.Sleep(1600 * time.Millisecond)
+	engine.Stop()
+
+	// Verify that targets received probes according to their independent intervals
+	h1, ok1 := engine.GetHost("127.0.0.1")
+	if !ok1 || h1.SentPackets < 3 {
+		t.Errorf("expected 127.0.0.1 (500ms interval) to have sent at least 3 packets, got ok=%v, sent=%d", ok1, h1.SentPackets)
+	}
+	h2, ok2 := engine.GetHost("127.0.1.1")
+	if !ok2 || h2.SentPackets == 0 {
+		t.Errorf("expected 127.0.1.1 (1500ms interval) to have sent packets, got ok=%v, sent=%d", ok2, h2.SentPackets)
+	}
+	if h1.SentPackets <= h2.SentPackets {
+		t.Errorf("expected 500ms subnet host to send more packets than 1500ms subnet host, got h1=%d, h2=%d", h1.SentPackets, h2.SentPackets)
+	}
+}
+

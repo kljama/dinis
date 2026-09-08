@@ -1896,3 +1896,137 @@ body {
   color: #fff;
 }
 
+/* ==========================================================================
+   Subnet Interval & Management UI Components
+   ========================================================================== */
+
+.custom-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.custom-radio input[type="radio"] {
+  cursor: pointer;
+  accent-color: var(--color-primary);
+}
+
+.badge-interval-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.badge-interval-btn:hover {
+  border-color: var(--color-primary);
+  background: rgba(56, 189, 248, 0.1);
+}
+
+.badge-interval-btn.is-custom {
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--color-up);
+  border-color: rgba(16, 185, 129, 0.35);
+  font-weight: 600;
+}
+
+.badge-interval-btn.is-default {
+  color: var(--text-secondary);
+}
+
+.badge-interval-btn .edit-icon {
+  width: 12px;
+  height: 12px;
+  opacity: 0.6;
+  transition: opacity 0.15s ease;
+}
+
+.badge-interval-btn:hover .edit-icon {
+  opacity: 1;
+}
+
+.matrix-interval-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-full);
+  font-size: 0.68rem;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: 1px solid transparent;
+}
+
+.matrix-interval-badge.custom {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.matrix-interval-badge.default {
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.25);
+}
+
+.matrix-interval-badge:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.matrix-interval-badge.custom:hover {
+  background: rgba(16, 185, 129, 0.25);
+}
+
+.matrix-interval-badge.default:hover {
+  background: rgba(56, 189, 248, 0.22);
+}
+
+.settings-subnets-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 190px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem;
+  margin-top: 0.4rem;
+  margin-bottom: 0.8rem;
+}
+
+.settings-subnet-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.35rem 0.6rem;
+  border-radius: 4px;
+  background: var(--bg-surface);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.settings-subnet-info {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings-subnet-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+

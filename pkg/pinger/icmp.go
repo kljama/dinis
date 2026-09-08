@@ -403,6 +403,8 @@ func (p *SingleProber) execProbe(ctx context.Context, ipStr string, timeout time
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout+500*time.Millisecond)
 	defer cancel()
 
+	atomic.AddUint64(&p.seq, 1)
+
 	start := time.Now()
 	out, err := exec.CommandContext(cmdCtx, "ping", "-c", "1", "-W", strconv.Itoa(timeoutSec), ipStr).CombinedOutput()
 	rtt := time.Since(start)

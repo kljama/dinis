@@ -440,6 +440,10 @@
                 <label for="inputCIDRDesc">Label / Subnet Description</label>
                 <input type="text" id="inputCIDRDesc" placeholder="e.g. Production Web DMZ">
               </div>
+              <div class="form-group" style="max-width: 180px;">
+                <label for="inputCIDRInterval">Ping Interval (s)</label>
+                <input type="number" id="inputCIDRInterval" step="0.5" min="0.5" max="3600" placeholder="Default (Settings)">
+              </div>
             </div>
 
             <div class="form-row form-options">
@@ -468,8 +472,9 @@
                 <tr>
                   <th>CIDR Range</th>
                   <th>Description</th>
-                  <th>Discovered / Capacity</th>
-                  <th>Added</th>
+                  <th>Ping Interval</th>
+                  <th>Status</th>
+                  <th>Net / Bcast</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -479,6 +484,78 @@
             </table>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Edit Subnet Modal -->
+    <div id="editCidrModal" class="modal-overlay" style="display:none;">
+      <div class="modal modal-md">
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <div class="modal-icon icon-network">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+              </svg>
+            </div>
+            <div>
+              <h3>Edit Subnet Configuration</h3>
+              <p>Configure ping interval, label, and probing status for this subnet</p>
+            </div>
+          </div>
+          <button class="modal-close" id="btnCloseEditCidrModal">&times;</button>
+        </div>
+
+        <form id="formEditCIDR" class="modal-body">
+          <div class="form-group">
+            <label>CIDR Range / Target IP</label>
+            <input type="text" id="editCIDRValue" class="font-mono" readonly style="background: rgba(255, 255, 255, 0.05); cursor: not-allowed; border-color: rgba(255, 255, 255, 0.1);">
+          </div>
+
+          <div class="form-group">
+            <label for="editCIDRDesc">Subnet Label / Description</label>
+            <input type="text" id="editCIDRDesc" placeholder="e.g. Production Web DMZ">
+          </div>
+
+          <div class="form-group">
+            <label>Subnet Ping Interval</label>
+            <div class="d-flex align-center gap-3 mb-2" style="margin-bottom: 0.6rem;">
+              <label class="custom-radio">
+                <input type="radio" name="editIntervalChoice" id="radioIntervalDefault" value="default" checked>
+                <span>Use Global Default (<strong id="spanGlobalDefaultLabel">60s</strong>)</span>
+              </label>
+              <label class="custom-radio">
+                <input type="radio" name="editIntervalChoice" id="radioIntervalCustom" value="custom">
+                <span>Custom Interval</span>
+              </label>
+            </div>
+            <div id="editCustomIntervalWrapper" style="display: none;">
+              <div class="d-flex align-center gap-2">
+                <input type="number" id="editCIDRInterval" step="0.5" min="0.5" max="3600" placeholder="e.g. 5.0" style="max-width: 140px;">
+                <span class="text-sm text-muted">seconds per cycle</span>
+              </div>
+            </div>
+            <span class="field-hint" id="editIntervalHint">Inheriting global interval from Settings.</span>
+          </div>
+
+          <div class="form-group">
+            <label class="custom-checkbox">
+              <input type="checkbox" id="editCIDREnabled" checked>
+              <span>Enable continuous ICMP probing for this subnet</span>
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label class="custom-checkbox">
+              <input type="checkbox" id="editCIDRNetBcast">
+              <span>Include Network (.0) & Broadcast (.255) host addresses</span>
+            </label>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline" id="btnCancelEditCIDR">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btnSaveEditCIDR">Save Subnet</button>
+          </div>
+        </form>
       </div>
     </div>
 
@@ -587,7 +664,7 @@
           <div class="modal-title-group">
             <div class="status-indicator-lg" id="detailStatusDot"></div>
             <div>
-              <h3 id="detailHostIP">192.168.1.1</h3>
+              <h3 id="detailHostIP">--</h3>
               <p id="detailHostAlias">Host Label / Scope</p>
             </div>
           </div>
@@ -745,9 +822,9 @@
           </div>
 
           <div class="form-group">
-            <label for="inputInterval">Live Monitor Interval (seconds)</label>
+            <label for="inputInterval">Default Subnet Ping Interval (seconds)</label>
             <input type="number" id="inputInterval" step="0.5" min="0.5" max="3600" required>
-            <span class="field-hint">How often to ping discovered active targets (e.g. 60.0s).</span>
+            <span class="field-hint">Fallback ping interval for subnets without a custom interval override (e.g. 60.0s).</span>
           </div>
 
           <div class="form-group">
@@ -768,10 +845,19 @@
             <span class="field-hint">Concurrent goroutines for parallel probing (default 100).</span>
           </div>
 
+          <div class="modal-section-title d-flex justify-between align-center mt-3">
+            <span>Subnet Intervals & Overrides</span>
+            <button type="button" id="btnSettingsOpenSubnets" class="btn btn-xs btn-outline">Manage Subnets</button>
+          </div>
+          <div id="settingsSubnetsList" class="settings-subnets-list">
+            <!-- Dynamically populated -->
+          </div>
+
           <div class="modal-footer">
             <button type="button" class="btn btn-outline" id="btnCancelSettings">Cancel</button>
             <button type="submit" class="btn btn-primary">Save Settings</button>
           </div>
+        </form>
       </div>
     </div>
 
