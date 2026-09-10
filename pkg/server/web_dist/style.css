@@ -1994,6 +1994,19 @@ body {
   background: rgba(56, 189, 248, 0.22);
 }
 
+.matrix-parent-label {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 0.1rem 0.4rem;
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+
 .settings-subnets-list {
   display: flex;
   flex-direction: column;

@@ -37,16 +37,20 @@ type SubnetMatrixCell struct {
 
 // SubnetMatrixBlock represents a /24 subnet containing up to 256 cells and aggregate statistics.
 type SubnetMatrixBlock struct {
-	CIDR          string             `json:"cidr"`
-	TotalHosts    int                `json:"totalHosts"`
-	OnlineCount   int                `json:"onlineCount"`
-	OfflineCount  int                `json:"offlineCount"`
-	PendingCount  int                `json:"pendingCount"`
-	ExcludedCount int                `json:"excludedCount"`
-	AvgLatencyMs  float64            `json:"avgLatencyMs"`
-	P95LatencyMs  float64            `json:"p95LatencyMs"`
-	HealthPct     float64            `json:"healthPct"`
-	Cells         []SubnetMatrixCell `json:"cells"`
+	CIDR              string             `json:"cidr"`
+	ParentCIDR        string             `json:"parentCidr,omitempty"`
+	ParentDescription string             `json:"parentDescription,omitempty"`
+	IntervalSec       float64            `json:"intervalSec"`
+	IsCustomInterval  bool               `json:"isCustomInterval"`
+	TotalHosts        int                `json:"totalHosts"`
+	OnlineCount       int                `json:"onlineCount"`
+	OfflineCount      int                `json:"offlineCount"`
+	PendingCount      int                `json:"pendingCount"`
+	ExcludedCount     int                `json:"excludedCount"`
+	AvgLatencyMs      float64            `json:"avgLatencyMs"`
+	P95LatencyMs      float64            `json:"p95LatencyMs"`
+	HealthPct         float64            `json:"healthPct"`
+	Cells             []SubnetMatrixCell `json:"cells"`
 }
 
 const DefaultMaxHosts = 5000

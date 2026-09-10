@@ -1714,3 +1714,159 @@ func TestRebuildTargetListLongestPrefixMatch(t *testing.T) {
 		t.Errorf("expected 192.168.1.50 to be mapped to 192.168.1.50/32, got %q", h2.CIDR)
 	}
 }
+
+func TestSubnetsMatrixInheritsParentInterval(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.DeleteCIDR("127.0.0.1/32")
+	_ = coord.store.DeleteCIDR("1.1.1.1/32")
+	_ = coord.store.DeleteCIDR("8.8.8.8/32")
+	_ = coord.store.RemoveDiscoveredHost("127.0.0.1")
+	_ = coord.store.RemoveDiscoveredHost("1.1.1.1")
+	_ = coord.store.RemoveDiscoveredHost("8.8.8.8")
+
+	// Configure a /22 subnet with custom interval 30.0s and description
+	err := coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.0.0.0/22",
+		Description: "HQ Corporate Network",
+		Enabled:     true,
+		IntervalSec: 30.0,
+		CreatedAt:   time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("failed to add CIDR: %v", err)
+	}
+
+	now := time.Now()
+	// Add hosts across different /24 blocks within the /22
+	hosts := []string{"10.0.0.5", "10.0.1.10", "10.0.2.15", "10.0.3.20"}
+	for _, ip := range hosts {
+		_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+			IP:             ip,
+			CIDR:           "10.0.0.0/22",
+			DiscoveredAt:   now,
+			LastDiscovered: now,
+			IsStatic:       false,
+		})
+	}
+
+	coord.RebuildTargetList()
+
+	// Query /api/subnets/matrix
+	req := httptest.NewRequest(http.MethodGet, "/api/subnets/matrix", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for subnets matrix, got %d", rec.Code)
+	}
+
+	var matrix []timeseries.SubnetMatrixBlock
+	if err := json.NewDecoder(rec.Body).Decode(&matrix); err != nil {
+		t.Fatalf("failed to decode matrix: %v", err)
+	}
+
+	// Should have 4 /24 blocks: 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24
+	if len(matrix) != 4 {
+		t.Fatalf("expected 4 subnet matrix blocks for /22, got %d", len(matrix))
+	}
+
+	expectedBlocks := map[string]bool{
+		"10.0.0.0/24": true,
+		"10.0.1.0/24": true,
+		"10.0.2.0/24": true,
+		"10.0.3.0/24": true,
+	}
+
+	for _, block := range matrix {
+		if !expectedBlocks[block.CIDR] {
+			t.Errorf("unexpected block CIDR: %s", block.CIDR)
+		}
+		if block.ParentCIDR != "10.0.0.0/22" {
+			t.Errorf("block %s: expected ParentCIDR '10.0.0.0/22', got %q", block.CIDR, block.ParentCIDR)
+		}
+		if block.ParentDescription != "HQ Corporate Network" {
+			t.Errorf("block %s: expected ParentDescription 'HQ Corporate Network', got %q", block.CIDR, block.ParentDescription)
+		}
+		if block.IntervalSec != 30.0 {
+			t.Errorf("block %s: expected IntervalSec 30.0, got %f", block.CIDR, block.IntervalSec)
+		}
+		if !block.IsCustomInterval {
+			t.Errorf("block %s: expected IsCustomInterval true, got false", block.CIDR)
+		}
+		if block.TotalHosts != 1 {
+			t.Errorf("block %s: expected TotalHosts 1, got %d", block.CIDR, block.TotalHosts)
+		}
+	}
+}
+
+func TestSubnetsMatrixWithSpecificOverride(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.DeleteCIDR("127.0.0.1/32")
+	_ = coord.store.DeleteCIDR("1.1.1.1/32")
+	_ = coord.store.DeleteCIDR("8.8.8.8/32")
+	_ = coord.store.RemoveDiscoveredHost("127.0.0.1")
+	_ = coord.store.RemoveDiscoveredHost("1.1.1.1")
+	_ = coord.store.RemoveDiscoveredHost("8.8.8.8")
+
+	// Configure parent /22 with 30s interval
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.0.0.0/22",
+		Description: "HQ Range",
+		Enabled:     true,
+		IntervalSec: 30.0,
+		CreatedAt:   time.Now(),
+	})
+
+	// Configure specific /24 override with 10s interval
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.0.1.0/24",
+		Description: "Server VLAN",
+		Enabled:     true,
+		IntervalSec: 10.0,
+		CreatedAt:   time.Now(),
+	})
+
+	now := time.Now()
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		IP:             "10.0.0.5",
+		CIDR:           "10.0.0.0/22",
+		DiscoveredAt:   now,
+		LastDiscovered: now,
+	})
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		IP:             "10.0.1.10",
+		CIDR:           "10.0.1.0/24",
+		DiscoveredAt:   now,
+		LastDiscovered: now,
+	})
+
+	coord.RebuildTargetList()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/subnets/matrix", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+
+	var matrix []timeseries.SubnetMatrixBlock
+	if err := json.NewDecoder(rec.Body).Decode(&matrix); err != nil {
+		t.Fatalf("failed to decode matrix: %v", err)
+	}
+
+	if len(matrix) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(matrix))
+	}
+
+	for _, b := range matrix {
+		if b.CIDR == "10.0.0.0/24" {
+			if b.ParentCIDR != "10.0.0.0/22" || b.IntervalSec != 30.0 {
+				t.Errorf("10.0.0.0/24: expected parent 10.0.0.0/22 with interval 30.0, got parent %s with interval %f", b.ParentCIDR, b.IntervalSec)
+			}
+		} else if b.CIDR == "10.0.1.0/24" {
+			if b.ParentCIDR != "10.0.1.0/24" || b.IntervalSec != 10.0 {
+				t.Errorf("10.0.1.0/24: expected parent 10.0.1.0/24 with interval 10.0, got parent %s with interval %f", b.ParentCIDR, b.IntervalSec)
+			}
+		}
+	}
+}

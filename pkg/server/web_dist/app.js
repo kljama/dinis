@@ -1054,19 +1054,38 @@
     card.className = `subnet-matrix-card ${hasOutage ? 'has-outage' : ''}`;
     card.dataset.cidr = cidr;
 
+    const parentCidr = block.parentCidr || block.ParentCIDR || (function() {
+      const match = findParentCIDR(cidr);
+      return match ? match.cidr : cidr;
+    })();
+
+    const cidrCfg = state.cidrs.find(c => c.cidr === parentCidr || c.cidr === cidr);
     const defaultSec = state.settings.intervalSec || 60;
-    const cidrCfg = state.cidrs.find(c => c.cidr === cidr);
-    const isCustom = cidrCfg && cidrCfg.intervalSec > 0;
-    const intervalVal = isCustom ? cidrCfg.intervalSec : defaultSec;
-    const intervalBadgeHtml = `<button type="button" class="matrix-interval-badge ${isCustom ? 'custom' : 'default'}" data-cidr="${escapeHtml(cidr)}" title="Ping interval: ${intervalVal}s ${isCustom ? '(Custom override)' : '(Global default)'}. Click to edit subnet.">⏱️ ${intervalVal}s</button>`;
+    const isCustom = (cidrCfg && cidrCfg.intervalSec > 0) || !!(block.isCustomInterval ?? block.IsCustomInterval);
+    const intervalVal = (cidrCfg && cidrCfg.intervalSec > 0)
+      ? cidrCfg.intervalSec
+      : (block.intervalSec ?? block.IntervalSec ?? defaultSec);
+
+    const isSubBlock = parentCidr && parentCidr !== cidr;
+    const badgeTitle = isSubBlock
+      ? `Ping interval: ${intervalVal}s ${isCustom ? `(Custom override inherited from ${parentCidr})` : `(Global default inherited from ${parentCidr})`}. Click to edit parent subnet.`
+      : `Ping interval: ${intervalVal}s ${isCustom ? '(Custom override)' : '(Global default)'}. Click to edit subnet.`;
+
+    const intervalBadgeHtml = `<button type="button" class="matrix-interval-badge ${isCustom ? 'custom' : 'default'}" data-cidr="${escapeHtml(parentCidr)}" title="${escapeHtml(badgeTitle)}">⏱️ ${intervalVal}s</button>`;
 
     const healthClass = healthPct >= 99.0 ? 'good' : (healthPct >= 80.0 ? 'warn' : 'bad');
+
+    const parentDesc = (cidrCfg && cidrCfg.description) || block.parentDescription || block.ParentDescription || '';
+    const parentLabelHtml = isSubBlock
+      ? `<span class="matrix-parent-label text-xs font-mono" title="Part of parent subnet ${escapeHtml(parentCidr)}${parentDesc ? ' (' + escapeHtml(parentDesc) + ')' : ''}">(part of ${escapeHtml(parentCidr)})</span>`
+      : '';
 
     card.innerHTML = `
       <div class="matrix-card-header">
         <div class="matrix-card-title">
-          <div class="d-flex align-center gap-2">
+          <div class="d-flex align-center gap-2 flex-wrap">
             <span class="matrix-cidr-label">${escapeHtml(cidr)}</span>
+            ${parentLabelHtml}
             ${intervalBadgeHtml}
           </div>
           <span class="matrix-cidr-stats">${onlineCount} UP · ${offlineCount} DOWN · ${avgLatencyMs ? avgLatencyMs.toFixed(1) + 'ms' : '--'} avg (${cells.length} discovered)</span>
@@ -1080,7 +1099,7 @@
     if (badgeBtn) {
       badgeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        openEditCIDRModal(cidr);
+        openEditCIDRModal(parentCidr);
       });
     }
 
@@ -1135,15 +1154,28 @@
     const hasOutage = offlineCount > 0;
     card.classList.toggle('has-outage', hasOutage);
 
+    const parentCidr = block.parentCidr || block.ParentCIDR || (function() {
+      const match = findParentCIDR(cidr);
+      return match ? match.cidr : cidr;
+    })();
+
+    const cidrCfg = state.cidrs.find(c => c.cidr === parentCidr || c.cidr === cidr);
     const defaultSec = state.settings.intervalSec || 60;
-    const cidrCfg = state.cidrs.find(c => c.cidr === cidr);
-    const isCustom = cidrCfg && cidrCfg.intervalSec > 0;
-    const intervalVal = isCustom ? cidrCfg.intervalSec : defaultSec;
+    const isCustom = (cidrCfg && cidrCfg.intervalSec > 0) || !!(block.isCustomInterval ?? block.IsCustomInterval);
+    const intervalVal = (cidrCfg && cidrCfg.intervalSec > 0)
+      ? cidrCfg.intervalSec
+      : (block.intervalSec ?? block.IntervalSec ?? defaultSec);
+
+    const isSubBlock = parentCidr && parentCidr !== cidr;
 
     const badge = card.querySelector('.matrix-interval-badge');
     if (badge) {
       badge.className = `matrix-interval-badge ${isCustom ? 'custom' : 'default'}`;
       badge.textContent = `⏱️ ${intervalVal}s`;
+      badge.dataset.cidr = parentCidr;
+      badge.title = isSubBlock
+        ? `Ping interval: ${intervalVal}s ${isCustom ? `(Custom override inherited from ${parentCidr})` : `(Global default inherited from ${parentCidr})`}. Click to edit parent subnet.`
+        : `Ping interval: ${intervalVal}s ${isCustom ? '(Custom override)' : '(Global default)'}. Click to edit subnet.`;
     }
 
     const statsEl = card.querySelector('.matrix-cidr-stats');
@@ -2121,16 +2153,21 @@
     if (el.editCIDREnabled) el.editCIDREnabled.checked = c.enabled !== false;
     if (el.editCIDRNetBcast) el.editCIDRNetBcast.checked = !!c.includeNetAndBcast;
 
+    const prefixMatch = c.cidr.match(/\/(\d+)$/);
+    const prefixLen = prefixMatch ? parseInt(prefixMatch[1], 10) : 32;
+    const isParentNet = prefixLen < 24 && prefixLen >= 0;
+    const parentNote = isParentNet ? ` (Subnet settings apply to all child /24 blocks in the matrix overview)` : '';
+
     if (c.intervalSec && c.intervalSec > 0) {
       if (el.radioIntervalCustom) el.radioIntervalCustom.checked = true;
       if (el.editCustomIntervalWrapper) el.editCustomIntervalWrapper.style.display = 'block';
       if (el.editCIDRInterval) el.editCIDRInterval.value = c.intervalSec;
-      if (el.editIntervalHint) el.editIntervalHint.textContent = `Custom interval: probes for ${c.cidr} will dispatch every ${c.intervalSec} seconds.`;
+      if (el.editIntervalHint) el.editIntervalHint.textContent = `Custom interval: probes for ${c.cidr} will dispatch every ${c.intervalSec} seconds${parentNote}.`;
     } else {
       if (el.radioIntervalDefault) el.radioIntervalDefault.checked = true;
       if (el.editCustomIntervalWrapper) el.editCustomIntervalWrapper.style.display = 'none';
       if (el.editCIDRInterval) el.editCIDRInterval.value = '';
-      if (el.editIntervalHint) el.editIntervalHint.textContent = `Subnet inherits the global fallback interval of ${defaultSec} seconds from Settings.`;
+      if (el.editIntervalHint) el.editIntervalHint.textContent = `Subnet inherits the global fallback interval of ${defaultSec} seconds from Settings${parentNote}.`;
     }
 
     if (el.editCidrModal) el.editCidrModal.style.display = 'flex';
@@ -2482,6 +2519,40 @@
       toast.style.opacity = '0';
       setTimeout(() => toast.remove(), 200);
     }, 4000);
+  }
+
+  function parseIPv4(ipStr) {
+    if (!ipStr) return null;
+    const parts = ipStr.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(p => isNaN(p) || p < 0 || p > 255)) return null;
+    return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
+  }
+
+  function findParentCIDR(blockCidr) {
+    if (!blockCidr || !state.cidrs) return null;
+    const [ipPart] = blockCidr.split('/');
+    const ipUint = parseIPv4(ipPart);
+    if (ipUint === null) return null;
+
+    let bestMatch = null;
+    let maxPrefix = -1;
+
+    for (const c of state.cidrs) {
+      if (!c.cidr) continue;
+      const [netStr, maskStr] = c.cidr.split('/');
+      const netUint = parseIPv4(netStr);
+      const prefix = parseInt(maskStr, 10);
+      if (netUint === null || isNaN(prefix) || prefix < 0 || prefix > 32) continue;
+
+      const mask = prefix === 0 ? 0 : (~((1 << (32 - prefix)) - 1)) >>> 0;
+      if ((ipUint & mask) === (netUint & mask)) {
+        if (prefix > maxPrefix) {
+          maxPrefix = prefix;
+          bestMatch = c;
+        }
+      }
+    }
+    return bestMatch;
   }
 
   function escapeHtml(str) {

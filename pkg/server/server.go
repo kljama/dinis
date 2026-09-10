@@ -1665,29 +1665,34 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func getSubnetGroupKey(h *pinger.HostState) string {
+func getSubnetGroupKeyAndParent(h *pinger.HostState) (subnetKey string, parentCIDR string) {
 	cidr := strings.TrimSpace(h.CIDR)
 	if cidr == "" || cidr == "Static" {
-		return h.IP + "/32"
+		return h.IP + "/32", cidr
 	}
 
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil || ipNet == nil {
-		return cidr
+		return cidr, cidr
 	}
 
 	ones, _ := ipNet.Mask.Size()
 	// If prefix length is 24 or more (e.g. /24, /28, /29, /30, /32), preserve exact subnet
 	if ones >= 24 {
-		return cidr
+		return cidr, cidr
 	}
 
 	// For large CIDRs (/16, /20, /22), group by /24 sub-blocks
 	ip4 := net.ParseIP(h.IP).To4()
 	if ip4 != nil {
-		return fmt.Sprintf("%d.%d.%d.0/24", ip4[0], ip4[1], ip4[2])
+		return fmt.Sprintf("%d.%d.%d.0/24", ip4[0], ip4[1], ip4[2]), cidr
 	}
-	return cidr
+	return cidr, cidr
+}
+
+func getSubnetGroupKey(h *pinger.HostState) string {
+	key, _ := getSubnetGroupKeyAndParent(h)
+	return key
 }
 
 func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
@@ -1698,38 +1703,18 @@ func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
 
 	hosts := s.coord.pinger.GetAllHosts()
 	hostsBySubnet := make(map[string][]timeseries.SubnetMatrixCell)
-	cidrPrefixCache := make(map[string]int)
+	subnetParentMap := make(map[string]string)
 
 	for _, h := range hosts {
-		cidr := strings.TrimSpace(h.CIDR)
 		parsedIP := net.ParseIP(h.IP).To4()
 		hostIdx := 0
 		if parsedIP != nil {
 			hostIdx = int(parsedIP[3])
 		}
 
-		var subnetKey string
-		if cidr == "" || cidr == "Static" {
-			subnetKey = h.IP + "/32"
-		} else {
-			prefixLen, cached := cidrPrefixCache[cidr]
-			if !cached {
-				_, ipNet, err := net.ParseCIDR(cidr)
-				if err == nil && ipNet != nil {
-					prefixLen, _ = ipNet.Mask.Size()
-				} else {
-					prefixLen = -1
-				}
-				cidrPrefixCache[cidr] = prefixLen
-			}
-
-			if prefixLen >= 24 || prefixLen == -1 {
-				subnetKey = cidr
-			} else if parsedIP != nil {
-				subnetKey = fmt.Sprintf("%d.%d.%d.0/24", parsedIP[0], parsedIP[1], parsedIP[2])
-			} else {
-				subnetKey = cidr
-			}
+		subnetKey, parentCIDR := getSubnetGroupKeyAndParent(h)
+		if _, exists := subnetParentMap[subnetKey]; !exists && parentCIDR != "" {
+			subnetParentMap[subnetKey] = parentCIDR
 		}
 
 		cell := timeseries.SubnetMatrixCell{
@@ -1746,6 +1731,42 @@ func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
 	}
 
 	matrix := timeseries.GenerateSubnetMatrix(hostsBySubnet)
+
+	// Enrich matrix blocks with parent CIDR and inherited interval metadata
+	cidrs := s.coord.store.GetCIDRs()
+	cidrMap := make(map[string]store.CIDRConfig, len(cidrs))
+	for _, c := range cidrs {
+		cidrMap[c.CIDR] = c
+	}
+
+	settings := s.coord.store.GetSettings()
+	defaultSec := settings.IntervalSec
+	if defaultSec <= 0 {
+		defaultSec = 60.0
+	}
+
+	for i := range matrix {
+		parentCIDR, ok := subnetParentMap[matrix[i].CIDR]
+		if !ok || parentCIDR == "" {
+			parentCIDR = matrix[i].CIDR
+		}
+		matrix[i].ParentCIDR = parentCIDR
+
+		if cfg, exists := cidrMap[parentCIDR]; exists {
+			matrix[i].ParentDescription = cfg.Description
+			if cfg.IntervalSec > 0 {
+				matrix[i].IntervalSec = cfg.IntervalSec
+				matrix[i].IsCustomInterval = true
+			} else {
+				matrix[i].IntervalSec = defaultSec
+				matrix[i].IsCustomInterval = false
+			}
+		} else {
+			matrix[i].IntervalSec = defaultSec
+			matrix[i].IsCustomInterval = false
+		}
+	}
+
 	writeJSON(w, http.StatusOK, matrix)
 }
 
