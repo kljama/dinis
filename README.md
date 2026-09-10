@@ -17,31 +17,31 @@ DINIS is an ICMP network monitoring daemon with an embedded web interface and RE
   *(If neither socket permission is available, DINIS falls back to executing the system `ping` utility.)*
 - **Docker & Docker Compose** (optional, for containerized deployment)
 
-## Installation & Setup
+## Installation & Deployment
 
-### Build from Source
+### Method 1: Standalone Binary
 
-```bash
-go build -o dinis main.go
-```
+1. Build from source:
+   ```bash
+   go build -o dinis main.go
+   ```
 
-### Run with Docker Compose
+2. Start the daemon:
+   ```bash
+   ./dinis -port 8080 -data data/dinis.json
+   ```
+
+Once running, access the web dashboard at `http://localhost:8080`.
+
+### Method 2: Docker Compose
 
 ```bash
 docker compose up -d
 ```
 
-Once running, access the web dashboard at `http://localhost` (or `http://<server-ip>`). Remote traffic is routed through the Nginx reverse proxy, which also exposes InfluxDB 3 at `http://<server-ip>:8181` for external Grafana access.
+Once running, access the web dashboard at `http://localhost` (or `http://<server-ip>`). Remote traffic is routed through the Nginx reverse proxy, which also exposes InfluxDB 3 at `http://<server-ip>:8181` for external Grafana access and the InfluxDB 3 Explorer Web UI at `http://<server-ip>:8888`.
 
 ## Usage / Quickstart
-
-### Start the Daemon (Standalone Binary)
-
-```bash
-./dinis -port 8080 -data data/dinis.json
-```
-
-Once running, access the web dashboard at `http://localhost:8080`.
 
 ### REST API Examples
 
@@ -84,22 +84,26 @@ curl -N http://localhost:8080/api/stream
 | `GET` | `/health`, `/api/health` | Health check endpoint |
 | `GET` | `/api/summary` | Aggregate host counts, latency averages, and scan status |
 | `GET` | `/api/stream` | Server-Sent Events (SSE) event stream |
-| `GET`, `POST` | `/api/cidrs` | List or add monitored CIDR blocks |
-| `DELETE` | `/api/cidrs/{cidr}` | Remove a monitored CIDR block |
+| `GET`, `POST`, `PUT` | `/api/cidrs` | List, add, or update monitored CIDR blocks |
+| `DELETE` | `/api/cidrs` | Remove a monitored CIDR block (`?cidr=...` or JSON body) |
 | `GET` | `/api/discovery/status` | Current discovery scan status |
 | `POST` | `/api/discovery/run` | Trigger an asynchronous discovery sweep |
 | `GET` | `/api/hosts` | Paginated host list (supports `status`, `search`, `sort`) |
-| `GET`, `PUT`, `DELETE` | `/api/hosts/{ip}` | Get host detail, update alias/notes, or un-enroll |
+| `GET` | `/api/hosts/{ip}` | Get host detail |
+| `GET` | `/api/hosts/{ip}/history` | Historical probe latency and loss (`?window=1h`) |
 | `POST` | `/api/hosts/{ip}/ping` | Immediate single-host probe (rate-limited) |
 | `POST` | `/api/hosts/{ip}/promote` | Mark discovered host as static monitored target |
+| `PUT`, `POST` | `/api/hosts/{ip}/meta` | Update host alias and notes |
+| `DELETE` | `/api/hosts/{ip}/enrollment` | Un-enroll host from active monitoring |
+| `GET` | `/api/subnets/matrix` | Subnet heatmap matrix |
+| `GET` | `/api/outliers` | Degraded and high-jitter host list (`?limit=50`) |
 | `GET`, `POST` | `/api/exclusions` | List or create exclusion rules |
-| `DELETE` | `/api/exclusions/{id}` | Delete an exclusion rule |
+| `DELETE` | `/api/exclusions` | Delete an exclusion rule (`?rule=...` or JSON body) |
 | `GET` | `/api/alerts` | Active incident alerts |
-| `POST` | `/api/alerts/ack` | Acknowledge active alert |
+| `POST` | `/api/alerts/acknowledge` | Acknowledge active alert |
+| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active alerts |
 | `GET` | `/api/alerts/history` | Historical resolved alerts |
-| `GET`, `PUT` | `/api/settings` | Read or update runtime engine settings |
-| `GET` | `/api/matrix` | Subnet heatmap matrix |
-| `GET` | `/api/export/csv` | Export current host inventory as CSV |
+| `GET`, `PUT`, `POST` | `/api/settings` | Read or update runtime engine settings |
 
 ## Configuration
 
@@ -184,7 +188,7 @@ To visualize DINIS probe metrics in your existing Grafana installation:
 .
 ├── main.go               # Program entrypoint, CLI flag configuration, and service coordinator
 ├── Dockerfile            # Multi-stage build definition for alpine-based container
-├── docker-compose.yml    # Service definition for DINIS, InfluxDB 3 Core, and Nginx reverse proxy
+├── docker-compose.yml    # Service definition for DINIS, InfluxDB 3 Core, InfluxDB 3 Explorer, and Nginx reverse proxy
 ├── docker/
 │   └── nginx/            # Nginx reverse proxy configuration and virtual host definitions
 ├── verify_e2e.py         # End-to-end integration and API verification test script
