@@ -247,6 +247,48 @@ func TestPacketLossZeroLatency(t *testing.T) {
 	}
 }
 
+func TestCumulativePacketLoss(t *testing.T) {
+	cfg := EngineConfig{
+		Interval:      100 * time.Millisecond,
+		Timeout:       50 * time.Millisecond,
+		FailThreshold: 2,
+		HistorySize:   5,
+	}
+	engine := NewEngine(cfg)
+
+	host := &HostState{
+		IP: "192.168.1.1",
+	}
+
+	// 1 failure
+	engine.applyResult(host, PingResult{
+		IP:      "192.168.1.1",
+		Success: false,
+		Error:   "timeout",
+	})
+	if host.PacketLoss != 100.0 {
+		t.Fatalf("expected 100%% loss after 1 failed probe, got %f%%", host.PacketLoss)
+	}
+
+	// 9 successes
+	for i := 0; i < 9; i++ {
+		engine.applyResult(host, PingResult{
+			IP:        "192.168.1.1",
+			Success:   true,
+			LatencyMs: 10.0,
+		})
+	}
+
+	// Total: 10 sent, 9 received, 1 lost => 10% packet loss
+	// Even though HistorySize is 5 and the failure rolled out of LatencyHistory
+	if host.SentPackets != 10 || host.RecvPackets != 9 {
+		t.Fatalf("expected sent=10 recv=9, got sent=%d recv=%d", host.SentPackets, host.RecvPackets)
+	}
+	if host.PacketLoss != 10.0 {
+		t.Errorf("expected cumulative packet loss of 10.0%%, got %f%%", host.PacketLoss)
+	}
+}
+
 func TestPerSubnetPacingAndExecution(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Interval = 1000 * time.Millisecond

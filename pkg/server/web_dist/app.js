@@ -1714,7 +1714,7 @@
     el.detailAvgRTT.textContent = h.avgLatencyMs > 0 ? `${h.avgLatencyMs.toFixed(2)} ms` : '--';
     el.detailMaxRTT.textContent = h.maxLatencyMs > 0 ? `${h.maxLatencyMs.toFixed(2)} ms` : '--';
     el.detailLoss.textContent = `${h.packetLoss}%`;
-    el.detailPackets.textContent = `${h.recvPackets || 0} / ${h.sentPackets || 0}`;
+    el.detailPackets.textContent = `${h.sentPackets || 0} / ${h.recvPackets || 0}`;
     el.detailLastSeen.textContent = h.lastSeen ? formatTimeAgo(new Date(h.lastSeen)) : 'Never';
 
     // Latency chart

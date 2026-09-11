@@ -819,16 +819,8 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 		}
 	}
 
-	// Compute packet loss percentage over recent rolling history window
-	if len(h.LatencyHistory) > 0 {
-		lostCount := 0
-		for _, lat := range h.LatencyHistory {
-			if lat < 0 {
-				lostCount++
-			}
-		}
-		h.PacketLoss = math.Round((float64(lostCount)/float64(len(h.LatencyHistory)))*1000) / 10
-	} else if h.SentPackets > 0 && h.SentPackets >= h.RecvPackets {
+	// Compute cumulative packet loss percentage
+	if h.SentPackets > 0 && h.SentPackets >= h.RecvPackets {
 		lost := float64(h.SentPackets - h.RecvPackets)
 		h.PacketLoss = math.Round((lost/float64(h.SentPackets))*1000) / 10
 	} else {
