@@ -282,12 +282,10 @@ func (c *Coordinator) RebuildTargetList() {
 		meta := allMeta[ip]
 		alias := meta.Alias
 		if alias == "" {
-			if info, ok := cidrMap[hostCIDR]; ok && info.TotalHosts == 1 {
-				for _, cfg := range cidrs {
-					if cfg.CIDR == hostCIDR && cfg.Description != "" {
-						alias = cfg.Description
-						break
-					}
+			for _, cfg := range cidrs {
+				if cfg.CIDR == hostCIDR && cfg.Description != "" {
+					alias = cfg.Description
+					break
 				}
 			}
 		}
