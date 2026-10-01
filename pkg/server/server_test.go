@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"dinis/pkg/alerts"
 	"dinis/pkg/pinger"
 	"dinis/pkg/store"
 	"dinis/pkg/timeseries"
@@ -1868,5 +1869,184 @@ func TestSubnetsMatrixWithSpecificOverride(t *testing.T) {
 				t.Errorf("10.0.1.0/24: expected parent 10.0.1.0/24 with interval 10.0, got parent %s with interval %f", b.ParentCIDR, b.IntervalSec)
 			}
 		}
+	}
+}
+
+func TestPromoteHostLongestPrefixCIDR(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Add broad /16 CIDR first, then specific /24 CIDR
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.200.0.0/16",
+		Description: "Broad Campus",
+		Enabled:     true,
+	})
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.200.5.0/24",
+		Description: "Data Center Lab",
+		Enabled:     true,
+	})
+
+	// Promote an undiscovered IP inside the /24
+	req := httptest.NewRequest(http.MethodPost, "/api/hosts/10.200.5.99/promote", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 promoting host, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify store has longest prefix CIDR 10.200.5.0/24, not 10.200.0.0/16
+	discHosts := coord.store.GetDiscoveredHosts()
+	h, exists := discHosts["10.200.5.99"]
+	if !exists {
+		t.Fatalf("expected 10.200.5.99 in discovered hosts")
+	}
+	if h.CIDR != "10.200.5.0/24" {
+		t.Errorf("expected promoted host CIDR 10.200.5.0/24, got %q", h.CIDR)
+	}
+}
+
+func TestHostMetaAlertSynchronization(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.150.0.0/24",
+		Description: "Testing Subnet",
+		Enabled:     true,
+	})
+	now := time.Now()
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		IP:             "10.150.0.10",
+		CIDR:           "10.150.0.0/24",
+		DiscoveredAt:   now,
+		LastDiscovered: now,
+		IsStatic:       true,
+	})
+	coord.RebuildTargetList()
+
+	// 1. Trigger an alert when host has no custom alias
+	coord.alerts.Trigger("10.150.0.10", "", "10.150.0.0/24", "Connection timeout")
+	alt, ok := coord.alerts.GetAlertForIP("10.150.0.10")
+	if !ok || alt.Alias != "" {
+		t.Fatalf("expected initial alert with empty alias, got: %+v", alt)
+	}
+
+	// 2. User updates host metadata via /api/hosts/{ip}/meta
+	metaBody := `{"alias":"Primary Gateway","notes":"Rack A"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/hosts/10.150.0.10/meta", strings.NewReader(metaBody))
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from meta update, got %d", rec.Code)
+	}
+
+	// 3. Verify active alert now carries the updated alias
+	updatedAlt, ok := coord.alerts.GetAlertForIP("10.150.0.10")
+	if !ok {
+		t.Fatalf("expected active alert to still exist")
+	}
+	if updatedAlt.Alias != "Primary Gateway" {
+		t.Errorf("expected alert alias to be updated to 'Primary Gateway', got %q", updatedAlt.Alias)
+	}
+}
+
+func TestOutlierHostAliasPropagation(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{
+		CIDR:        "10.100.0.0/24",
+		Description: "Office",
+		Enabled:     true,
+	})
+	now := time.Now()
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{
+		IP:             "10.100.0.7",
+		CIDR:           "10.100.0.0/24",
+		DiscoveredAt:   now,
+		LastDiscovered: now,
+	})
+	_ = coord.store.SetHostMeta(store.HostMeta{
+		IP:    "10.100.0.7",
+		Alias: "Print Server",
+	})
+	coord.RebuildTargetList()
+
+	// Record degraded metrics to produce an outlier
+	ts := coord.pinger.GetTimeseriesStore()
+	ts.Record("10.100.0.7", now, 250.0, true)
+	ts.Record("10.100.0.7", now.Add(time.Second), 0, false)
+	ts.Record("10.100.0.7", now.Add(2*time.Second), 300.0, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/outliers", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/outliers, got %d", rec.Code)
+	}
+
+	var outliers []timeseries.OutlierHost
+	if err := json.NewDecoder(rec.Body).Decode(&outliers); err != nil {
+		t.Fatalf("failed to decode outliers: %v", err)
+	}
+
+	var found *timeseries.OutlierHost
+	for i := range outliers {
+		if outliers[i].IP == "10.100.0.7" {
+			found = &outliers[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected 10.100.0.7 to be in outliers list")
+	}
+	if found.Alias != "Print Server" {
+		t.Errorf("expected outlier alias 'Print Server', got %q", found.Alias)
+	}
+}
+
+func TestAlertHistoryLimitQueryParam(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Generate 15 alerts and resolve them so they enter history
+	for i := 1; i <= 15; i++ {
+		ip := fmt.Sprintf("10.88.0.%d", i)
+		coord.alerts.Trigger(ip, fmt.Sprintf("Host-%d", i), "10.88.0.0/24", "Loss")
+		coord.alerts.Resolve(ip)
+	}
+
+	// 1. Query with ?limit=5
+	req := httptest.NewRequest(http.MethodGet, "/api/alerts/history?limit=5", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var hist5 []*alerts.Alert
+	if err := json.NewDecoder(rec.Body).Decode(&hist5); err != nil {
+		t.Fatalf("failed to decode history: %v", err)
+	}
+	if len(hist5) != 5 {
+		t.Errorf("expected 5 history items, got %d", len(hist5))
+	}
+
+	// 2. Query with ?limit=99999 (should clamp to maxPaginationLimit)
+	req = httptest.NewRequest(http.MethodGet, "/api/alerts/history?limit=99999", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var histClamped []*alerts.Alert
+	if err := json.NewDecoder(rec.Body).Decode(&histClamped); err != nil {
+		t.Fatalf("failed to decode history: %v", err)
+	}
+	if len(histClamped) != 15 {
+		t.Errorf("expected all 15 history items when limit clamped, got %d", len(histClamped))
 	}
 }

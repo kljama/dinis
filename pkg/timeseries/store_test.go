@@ -122,12 +122,15 @@ func TestStoreIngestAndOutliers(t *testing.T) {
 	st.Record("10.0.0.2", now.Add(time.Second), 150.0, true)
 	st.Record("10.0.0.2", now.Add(2*time.Second), 10.0, true)
 
-	outliers := st.GetTopOutliers(10, func(ip string) (bool, string) { return true, "10.0.0.0/24" })
+	outliers := st.GetTopOutliers(10, func(ip string) (bool, string, string) { return true, "10.0.0.0/24", "Server 2" })
 	if len(outliers) != 1 {
 		t.Fatalf("expected 1 outlier, got %d", len(outliers))
 	}
 	if outliers[0].IP != "10.0.0.2" {
 		t.Errorf("expected outlier 10.0.0.2, got %s", outliers[0].IP)
+	}
+	if outliers[0].Alias != "Server 2" {
+		t.Errorf("expected outlier alias 'Server 2', got %s", outliers[0].Alias)
 	}
 	if outliers[0].JitterMs != 140.0 {
 		t.Errorf("expected jitter 140.0, got %f", outliers[0].JitterMs)
@@ -135,7 +138,7 @@ func TestStoreIngestAndOutliers(t *testing.T) {
 
 	// Test Pruning removes hosts from Outliers
 	st.PruneHosts(map[string]bool{"10.0.0.1": true})
-	outliersAfterPrune := st.GetTopOutliers(10, func(ip string) (bool, string) { return true, "10.0.0.0/24" })
+	outliersAfterPrune := st.GetTopOutliers(10, func(ip string) (bool, string, string) { return true, "10.0.0.0/24", "Server 2" })
 	if len(outliersAfterPrune) != 0 {
 		t.Fatalf("expected 0 outliers after pruning, got %d", len(outliersAfterPrune))
 	}

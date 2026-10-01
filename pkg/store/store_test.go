@@ -378,3 +378,69 @@ func TestCIDRIntervalSec(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreSettingsPartialDefaults(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dinis-store-settings-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "data.json")
+	s, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+
+	customSettings := AppSettings{
+		DiscoveryIntervalMin: 120,
+		IntervalSec:          15.0,
+		TimeoutMs:            2500,
+		FailThreshold:        5,
+		Concurrency:          350,
+		MaxMetricHosts:       25000,
+		AutoDiscovery:        false,
+	}
+	if err := s.UpdateSettings(customSettings); err != nil {
+		t.Fatalf("failed to update settings: %v", err)
+	}
+	_ = s.Close()
+
+	// Manually corrupt only IntervalSec to 0 in the JSON file
+	raw, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("failed to read store file: %v", err)
+	}
+	corrupted := strings.Replace(string(raw), `"intervalSec":15`, `"intervalSec":0`, 1)
+	if err := os.WriteFile(dbPath, []byte(corrupted), 0644); err != nil {
+		t.Fatalf("failed to write corrupted store file: %v", err)
+	}
+
+	// Reload store and verify custom settings are preserved, while IntervalSec reset to default
+	s2, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("failed to reload store: %v", err)
+	}
+	defer s2.Close()
+
+	loaded := s2.GetSettings()
+	if loaded.IntervalSec != 60.0 {
+		t.Errorf("expected default IntervalSec 60.0, got %f", loaded.IntervalSec)
+	}
+	if loaded.TimeoutMs != 2500 {
+		t.Errorf("expected TimeoutMs 2500 to be preserved, got %d", loaded.TimeoutMs)
+	}
+	if loaded.FailThreshold != 5 {
+		t.Errorf("expected FailThreshold 5 to be preserved, got %d", loaded.FailThreshold)
+	}
+	if loaded.Concurrency != 350 {
+		t.Errorf("expected Concurrency 350 to be preserved, got %d", loaded.Concurrency)
+	}
+	if loaded.MaxMetricHosts != 25000 {
+		t.Errorf("expected MaxMetricHosts 25000 to be preserved, got %d", loaded.MaxMetricHosts)
+	}
+	if loaded.AutoDiscovery != false {
+		t.Errorf("expected AutoDiscovery false to be preserved, got %v", loaded.AutoDiscovery)
+	}
+}
+

@@ -1279,6 +1279,7 @@
 
       const severity = o.severity ?? o.Severity ?? 'DEGRADED';
       const ip = o.ip ?? o.IP ?? '';
+      const alias = o.alias ?? o.Alias ?? '';
       const subnet = o.subnet ?? o.Subnet ?? '';
       const packetLossPct = o.packetLossPct ?? o.PacketLossPct ?? 0;
       const avgLatencyMs = o.avgLatencyMs ?? o.AvgLatencyMs ?? 0;
@@ -1291,7 +1292,10 @@
 
       tr.innerHTML = `
         <td><span class="severity-pill ${sevClass}">${escapeHtml(severity)}</span></td>
-        <td><strong class="font-mono">${escapeHtml(ip)}</strong></td>
+        <td>
+          <strong class="font-mono">${escapeHtml(ip)}</strong>
+          ${alias ? `<div class="text-xs text-muted font-sans">${escapeHtml(alias)}</div>` : ''}
+        </td>
         <td class="text-muted font-mono text-xs">${escapeHtml(subnet || '--')}</td>
         <td class="font-mono ${packetLossPct > 0 ? 'text-down' : ''}"><strong>${packetLossPct.toFixed(1)}%</strong></td>
         <td class="font-mono">${avgLatencyMs ? avgLatencyMs.toFixed(2) + ' ms' : '--'}</td>

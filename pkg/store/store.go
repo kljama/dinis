@@ -190,8 +190,21 @@ func (s *Store) load() error {
 	if data.Exclusions == nil {
 		data.Exclusions = make([]ExclusionConfig, 0)
 	}
+	defaults := DefaultSettings()
 	if data.Settings.IntervalSec <= 0 {
-		data.Settings = DefaultSettings()
+		data.Settings.IntervalSec = defaults.IntervalSec
+	}
+	if data.Settings.TimeoutMs <= 0 {
+		data.Settings.TimeoutMs = defaults.TimeoutMs
+	}
+	if data.Settings.FailThreshold <= 0 {
+		data.Settings.FailThreshold = defaults.FailThreshold
+	}
+	if data.Settings.Concurrency <= 0 {
+		data.Settings.Concurrency = defaults.Concurrency
+	}
+	if data.Settings.MaxMetricHosts <= 0 {
+		data.Settings.MaxMetricHosts = defaults.MaxMetricHosts
 	}
 
 	s.data = data

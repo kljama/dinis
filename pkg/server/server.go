@@ -315,6 +315,7 @@ func (c *Coordinator) RebuildTargetList() {
 			alertAckNote = activeAlert.AckNote
 			alertAckAt = activeAlert.AcknowledgedAt
 			alertStartedAt = &activeAlert.StartedAt
+			c.alerts.UpdateAlertMetadata(ip, alias, hostCIDR)
 		}
 
 		discAt := disc.DiscoveredAt
@@ -1785,11 +1786,11 @@ func (s *Server) handleOutliers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	outliers := tsStore.GetTopOutliers(limit, func(ip string) (bool, string) {
+	outliers := tsStore.GetTopOutliers(limit, func(ip string) (bool, string, string) {
 		if h, ok := s.coord.pinger.GetHost(ip); ok && !h.IsExcluded {
-			return true, h.CIDR
+			return true, h.CIDR, h.Alias
 		}
-		return false, ""
+		return false, "", ""
 	})
 
 	writeJSON(w, http.StatusOK, outliers)
@@ -1889,14 +1890,18 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			}
 		} else {
 			cidrs := s.coord.store.GetCIDRs()
+			maxPrefix := -1
 			for _, c := range cidrs {
 				if !c.Enabled {
 					continue
 				}
 				_, ipNet, err := net.ParseCIDR(c.CIDR)
 				if err == nil && ipNet.Contains(parsedIP) {
-					cidr = c.CIDR
-					break
+					ones, _ := ipNet.Mask.Size()
+					if ones > maxPrefix {
+						maxPrefix = ones
+						cidr = c.CIDR
+					}
 				}
 			}
 		}
@@ -2197,7 +2202,16 @@ func (s *Server) handleAlertHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	history := s.coord.alerts.GetAlertHistory(100)
+	limit := 100
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+			if limit > maxPaginationLimit {
+				limit = maxPaginationLimit
+			}
+		}
+	}
+	history := s.coord.alerts.GetAlertHistory(limit)
 	writeJSON(w, http.StatusOK, history)
 }
 

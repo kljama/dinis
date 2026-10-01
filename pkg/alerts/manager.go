@@ -74,6 +74,12 @@ func (m *Manager) Trigger(ip, alias, cidr, lastErr string) *Alert {
 	if existing, exists := m.activeAlerts[ip]; exists {
 		existing.LastError = lastErr
 		existing.DurationSec = int64(now.Sub(existing.StartedAt).Seconds())
+		if alias != "" {
+			existing.Alias = alias
+		}
+		if cidr != "" {
+			existing.CIDR = cidr
+		}
 		cpy := *existing
 		m.mu.Unlock()
 		return &cpy
@@ -301,4 +307,21 @@ func (m *Manager) GetAlertForIP(ip string) (*Alert, bool) {
 	}
 	cpy := *a
 	return &cpy, true
+}
+
+// UpdateAlertMetadata synchronizes alias and CIDR on an active alert.
+func (m *Manager) UpdateAlertMetadata(ip, alias, cidr string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if existing, exists := m.activeAlerts[ip]; exists {
+		if alias != "" {
+			existing.Alias = alias
+		}
+		if cidr != "" {
+			existing.CIDR = cidr
+		}
+		return true
+	}
+	return false
 }

@@ -164,3 +164,45 @@ func BenchmarkResolveIfCleanup(b *testing.B) {
 		})
 	}
 }
+
+func TestAlertMetadataUpdateAndRetrigger(t *testing.T) {
+	mgr := NewManager(50)
+
+	// Initial trigger with empty alias and base CIDR
+	alt1 := mgr.Trigger("10.0.0.5", "", "10.0.0.0/16", "Packet loss")
+	if alt1.Alias != "" || alt1.CIDR != "10.0.0.0/16" {
+		t.Fatalf("unexpected initial alert: %+v", alt1)
+	}
+
+	// 1. Re-trigger with updated alias and narrower CIDR
+	alt2 := mgr.Trigger("10.0.0.5", "Web Server", "10.0.0.0/24", "Connection refused")
+	if alt2.Alias != "Web Server" {
+		t.Errorf("expected updated alias 'Web Server', got %q", alt2.Alias)
+	}
+	if alt2.CIDR != "10.0.0.0/24" {
+		t.Errorf("expected updated CIDR '10.0.0.0/24', got %q", alt2.CIDR)
+	}
+	if alt2.LastError != "Connection refused" {
+		t.Errorf("expected updated LastError, got %q", alt2.LastError)
+	}
+
+	// 2. Direct metadata update via UpdateAlertMetadata
+	ok := mgr.UpdateAlertMetadata("10.0.0.5", "Production Web Server", "10.0.0.0/24")
+	if !ok {
+		t.Fatalf("expected UpdateAlertMetadata to return true")
+	}
+
+	active, exists := mgr.GetAlertForIP("10.0.0.5")
+	if !exists {
+		t.Fatalf("expected active alert for 10.0.0.5")
+	}
+	if active.Alias != "Production Web Server" {
+		t.Errorf("expected alias 'Production Web Server', got %q", active.Alias)
+	}
+
+	// Update for non-existent IP returns false
+	if mgr.UpdateAlertMetadata("192.168.99.99", "Ghost", "192.168.99.0/24") {
+		t.Errorf("expected false for unknown IP")
+	}
+}
+

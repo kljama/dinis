@@ -14,6 +14,7 @@ import (
 // OutlierHost represents a monitored endpoint showing degraded performance, packet loss, or high jitter.
 type OutlierHost struct {
 	IP            string  `json:"ip"`
+	Alias         string  `json:"alias,omitempty"`
 	Subnet        string  `json:"subnet"`
 	AvgLatencyMs  float64 `json:"avgLatencyMs"`
 	P95LatencyMs  float64 `json:"p95LatencyMs"`
@@ -283,7 +284,7 @@ func (s *Store) PruneHosts(activeIPs map[string]bool) {
 }
 
 // GetTopOutliers returns hosts exhibiting high packet loss, latency spikes, or severe jitter.
-func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, string)) []OutlierHost {
+func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (valid bool, subnet string, alias string)) []OutlierHost {
 	s.mu.RLock()
 	ips := make([]string, 0, len(s.rawBuffers))
 	for ip := range s.rawBuffers {
@@ -294,12 +295,14 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, s
 	var outliers []OutlierHost
 	for _, ip := range ips {
 		subnet := ""
+		alias := ""
 		if isValidHostFn != nil {
-			valid, sub := isValidHostFn(ip)
+			valid, sub, al := isValidHostFn(ip)
 			if !valid {
 				continue
 			}
 			subnet = sub
+			alias = al
 		}
 
 		s.mu.RLock()
@@ -329,6 +332,7 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (bool, s
 
 			outliers = append(outliers, OutlierHost{
 				IP:            ip,
+				Alias:         alias,
 				Subnet:        subnet,
 				AvgLatencyMs:  math.Round(avgLat*100) / 100,
 				P95LatencyMs:  math.Round(p95Lat*100) / 100,
