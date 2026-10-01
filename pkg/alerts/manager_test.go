@@ -205,4 +205,3 @@ func TestAlertMetadataUpdateAndRetrigger(t *testing.T) {
 		t.Errorf("expected false for unknown IP")
 	}
 }
-

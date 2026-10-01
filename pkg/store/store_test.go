@@ -443,4 +443,3 @@ func TestStoreSettingsPartialDefaults(t *testing.T) {
 		t.Errorf("expected AutoDiscovery false to be preserved, got %v", loaded.AutoDiscovery)
 	}
 }
-
