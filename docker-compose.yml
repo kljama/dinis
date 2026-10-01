@@ -106,3 +106,9 @@ volumes:
   influxdb3-data:
   dinis-data:
   influxdb-explorer-data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
