@@ -2252,3 +2252,65 @@ func TestOutliersEmptyListIsJSONArray(t *testing.T) {
 		t.Errorf("expected empty JSON array, got %q", rec.Body.String())
 	}
 }
+
+func TestSingleIPTargetDeleteAndDisableStopMonitoring(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	do := func(method, path, body string) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: expected 200, got %d: %s", method, path, rec.Code, rec.Body.String())
+		}
+	}
+	monitored := func(ip string) bool {
+		_, ok := coord.pinger.GetHost(ip)
+		return ok
+	}
+
+	// Single-IP target is monitored as soon as it is added
+	do(http.MethodPost, "/api/cidrs", `{"cidr":"192.0.2.7/32","description":"Single target"}`)
+	if !monitored("192.0.2.7") {
+		t.Fatalf("expected 192.0.2.7 to be monitored after adding its CIDR")
+	}
+
+	// Disabling the CIDR stops monitoring; re-enabling restores it
+	do(http.MethodPut, "/api/cidrs", `{"cidr":"192.0.2.7/32","enabled":false}`)
+	if monitored("192.0.2.7") {
+		t.Errorf("expected 192.0.2.7 not to be monitored while its CIDR is disabled")
+	}
+	do(http.MethodPut, "/api/cidrs", `{"cidr":"192.0.2.7/32","enabled":true}`)
+	if !monitored("192.0.2.7") {
+		t.Errorf("expected 192.0.2.7 to be monitored again after re-enabling its CIDR")
+	}
+
+	// Deleting the CIDR stops monitoring and removes the stored target
+	do(http.MethodDelete, "/api/cidrs?cidr=192.0.2.7/32", "")
+	if monitored("192.0.2.7") {
+		t.Errorf("expected 192.0.2.7 not to be monitored after deleting its CIDR")
+	}
+	if _, ok := coord.store.GetDiscoveredHost("192.0.2.7"); ok {
+		t.Errorf("expected stored target for 192.0.2.7 to be removed")
+	}
+
+	// A host promoted within a larger range survives deletion of that range
+	do(http.MethodPost, "/api/cidrs", `{"cidr":"198.51.100.0/24","description":"Range"}`)
+	do(http.MethodPost, "/api/hosts/198.51.100.20/promote", "")
+	do(http.MethodDelete, "/api/cidrs?cidr=198.51.100.0/24", "")
+	if !monitored("198.51.100.20") {
+		t.Errorf("expected promoted host 198.51.100.20 to stay monitored after its range was deleted")
+	}
+
+	// A disabled single-IP target inside another enabled range is still monitored via that range
+	do(http.MethodPost, "/api/cidrs", `{"cidr":"203.0.113.0/24","description":"Covering range"}`)
+	do(http.MethodPost, "/api/cidrs", `{"cidr":"203.0.113.9/32","description":"Inner target"}`)
+	do(http.MethodPut, "/api/cidrs", `{"cidr":"203.0.113.9/32","enabled":false}`)
+	h, ok := coord.pinger.GetHost("203.0.113.9")
+	if !ok || h.CIDR != "203.0.113.0/24" {
+		t.Errorf("expected 203.0.113.9 to stay monitored under 203.0.113.0/24, got ok=%v host=%+v", ok, h)
+	}
+}

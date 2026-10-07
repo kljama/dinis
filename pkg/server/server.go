@@ -196,13 +196,20 @@ func (c *Coordinator) RebuildTargetList() {
 	totalCapacity := 0
 	var newStaticHosts []store.DiscoveredHost
 
+	// IPs of single-IP CIDR targets that are disabled. Their static entries are kept
+	// (so re-enabling restores them) but they are not monitored.
+	disabledSingleIPs := make(map[string]bool)
+
 	for _, cfg := range cidrs {
 		allConfiguredCIDRs[cfg.CIDR] = true
-		if !cfg.Enabled {
-			continue
-		}
 		info, err := network.ParseCIDR(cfg.CIDR, cfg.IncludeNetAndBcast)
 		if err != nil {
+			continue
+		}
+		if !cfg.Enabled {
+			if info.TotalHosts == 1 {
+				disabledSingleIPs[info.IPs[0]] = true
+			}
 			continue
 		}
 		validCIDRs[cfg.CIDR] = true
@@ -280,6 +287,10 @@ func (c *Coordinator) RebuildTargetList() {
 
 		// If the host is not static and doesn't belong to any valid enabled CIDR, skip it
 		if !disc.IsStatic && matchedCIDR == "" && !validCIDRs[disc.CIDR] {
+			continue
+		}
+		// A disabled single-IP target is not monitored unless another enabled CIDR covers it
+		if disabledSingleIPs[ip] && matchedCIDR == "" {
 			continue
 		}
 
@@ -409,6 +420,31 @@ func (c *Coordinator) invalidateSnapshots() {
 	c.snapMu.Lock()
 	clear(c.snapCache)
 	c.snapMu.Unlock()
+}
+
+// DeleteCIDR removes a CIDR configuration and stops monitoring the hosts it enrolled.
+// Hosts discovered in the range are pruned by RebuildTargetList. A single-IP CIDR's
+// target is stored as a static host (which survives pruning), so it is removed here.
+// Hosts promoted within a larger range are kept.
+func (c *Coordinator) DeleteCIDR(cidr string) error {
+	singleIP := ""
+	if info, err := network.ParseCIDR(cidr, false); err == nil && info.TotalHosts == 1 {
+		singleIP = info.IPs[0]
+	}
+
+	if err := c.store.DeleteCIDR(cidr); err != nil {
+		return err
+	}
+	if singleIP != "" {
+		if h, ok := c.store.GetDiscoveredHost(singleIP); ok && h.IsStatic {
+			if err := c.store.RemoveDiscoveredHost(singleIP); err != nil {
+				return err
+			}
+		}
+	}
+
+	c.RebuildTargetList()
+	return nil
 }
 
 // RunDiscovery performs a concurrent ICMP discovery sweep across candidate IPs in the CIDR ranges.
@@ -2227,12 +2263,11 @@ func (s *Server) handleCIDRs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := s.coord.store.DeleteCIDR(cidr); err != nil {
+		if err := s.coord.DeleteCIDR(cidr); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 
-		s.coord.RebuildTargetList()
 		writeJSON(w, http.StatusOK, map[string]string{"message": "CIDR deleted successfully"})
 
 	default:

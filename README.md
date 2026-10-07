@@ -1,29 +1,62 @@
 # DINIS
 
-DINIS is an ICMP network monitoring daemon with an embedded web interface and REST API. It discovers active hosts across CIDR ranges, runs periodic ICMP probes to track latency and packet loss, and can export metrics to InfluxDB 3.
+DINIS is an ICMP network monitoring daemon with an embedded web dashboard and REST API. You give it IPv4 CIDR ranges and single IPs. It finds the hosts that answer ping, keeps probing them, tracks latency and packet loss, raises alerts when hosts go down, and can export every probe result to InfluxDB 3.
+
+## How it works
+
+- **Discovery.** A configured CIDR is not pinged in full on every cycle. A discovery sweep pings every address in the range once (750 ms timeout), and only the hosts that answer are enrolled for continuous monitoring. Sweeps run:
+  - 5 seconds after startup, if `autoDiscovery` is on
+  - every `discoveryIntervalMin` minutes (default 240)
+  - when a CIDR is added, if `autoDiscovery` is on
+  - on demand
+  
+  Addresses matching an exclusion rule are skipped. Single-IP targets (`/32`) are always monitored, whether or not they answer.
+- **Enrolled hosts stay monitored.** A host that stops answering is not removed: it goes DOWN and raises an alert. Monitoring stops when you delete or disable the host's CIDR, or add an exclusion for it. Un-enrolling a discovered host only lasts until the next sweep finds it again. See [Removing targets](#removing-targets).
+- **Probing.** Each subnet is probed every `intervalSec` seconds (default 60; per-CIDR overrides down to 0.5 s). Probes are spread evenly across the interval instead of sent in a burst.
+  - A host starts as `PENDING` and becomes `UP` on its first reply.
+  - It becomes `DOWN` after `failThreshold` consecutive failures (default 2).
+  - Packet loss shown per host is cumulative since DINIS started.
+- **Alerts.** Every host that goes `DOWN` gets an alert, which resolves automatically when the host recovers. Operators can acknowledge alerts with a name and a note. Alerts are shown in the dashboard only; DINIS sends no email, webhook or other notifications.
+- **What is stored where.**
+  - The JSON data file holds CIDRs, exclusions, discovered hosts, host aliases and notes, and settings.
+  - Everything else lives in memory and is lost on restart:
+    - live host status
+    - active alerts and the last 500 resolved alerts
+    - latency history: the last 120 raw samples, 1-minute rollups for 2 hours, and hourly rollups for 30 days per host
+  - Use the InfluxDB export for long-term data.
+  - A `<data file>.lock` file prevents two DINIS processes from sharing one data file.
+
+### Limits and defaults to know about
+
+- **IPv4 only.** An IPv6 address is accepted as a `/128` target but every probe of it fails, so it shows as DOWN.
+- **At most a /16 per CIDR entry** (65,536 addresses). Larger ranges are rejected; add several entries instead.
+- **Default targets.** On first start (no data file yet) DINIS adds three targets: `127.0.0.1`, `1.1.1.1` and `8.8.8.8`. Delete their CIDR entries if you don't want DINIS to ping public resolvers.
+- **History limit.** Latency history is kept for at most `maxMetricHosts` hosts (default 10,000). Hosts beyond the limit are still probed and alerted on, but have no history charts.
 
 ## Prerequisites
 
-- **Go**: 1.26 or later (for building from source)
-- **Linux Network Permissions**: ICMP socket access via unprivileged ping sockets or raw socket capabilities:
-  - *Option 1 (Unprivileged ICMP)*:
+- **Go** 1.26.5 or later (for building from source; see `go.mod`).
+- **ICMP socket permission on Linux.** DINIS tries an unprivileged ping socket first, then a raw socket:
+  - *Option 1 (unprivileged ICMP):*
     ```bash
     sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
     ```
-  - *Option 2 (`CAP_NET_RAW` capability)*:
+    This setting is lost on reboot. To keep it, add `net.ipv4.ping_group_range = 0 2147483647` to a file in `/etc/sysctl.d/`.
+  - *Option 2 (`CAP_NET_RAW` capability):*
     ```bash
     sudo setcap cap_net_raw+ep ./dinis
     ```
-  *(If neither socket permission is available, DINIS falls back to executing the system `ping` utility.)*
-- **Docker & Docker Compose** (optional, for containerized deployment)
+  
+  If neither is available, DINIS falls back to running the system `ping` command once per probe. That needs `ping` installed and is much slower, so only use it for small setups.
+- **Docker and Docker Compose** (optional, for the containerized stack).
 
 ## Installation & Deployment
 
-### Method 1: Standalone Binary
+### Method 1: Standalone binary
 
 1. Build from source:
    ```bash
-   go build -o dinis main.go
+   go build -o dinis .
    ```
 
 2. Start the daemon:
@@ -31,48 +64,65 @@ DINIS is an ICMP network monitoring daemon with an embedded web interface and RE
    ./dinis -port 8080 -data data/dinis.json
    ```
 
-Once running, access the web dashboard at `http://localhost:8080`.
+The dashboard is then at `http://localhost:8080`.
+
+DINIS listens on all interfaces (`0.0.0.0`) by default and has no authentication unless `-api-token` is set. Read [Security notes](#security-notes) before exposing it.
+
+In this mode, InfluxDB export is off unless you pass `-influxdb-url`.
 
 ### Method 2: Docker Compose
 
 ```bash
+cp .env.example .env   # then edit .env, at least INFLUXDB3_TOKEN and DINIS_API_TOKEN
 docker compose up -d
 ```
 
-Once running, access the web dashboard at `http://localhost` (or `http://<server-ip>`). Remote traffic is routed through the Nginx reverse proxy, which also exposes InfluxDB 3 at `http://<server-ip>:8181` for external Grafana access and the InfluxDB 3 Explorer Web UI at `http://<server-ip>:8888`.
+The stack runs four containers:
+
+| Service | Reachable at | Notes |
+|---|---|---|
+| Nginx → DINIS | `http://<server-ip>` (port `NGINX_HTTP_PORT`, default 80) | Dashboard and REST API, via the reverse proxy |
+| Nginx → InfluxDB 3 Explorer | `http://<server-ip>:8888` (`NGINX_EXPLORER_PORT`) | Runs in admin mode **with no login** |
+| InfluxDB 3 Core | `http://<server-ip>:8181` (`INFLUXDB3_PORT`) | Published directly on the host, not through Nginx |
+| DINIS | internal only (`dinis:8080`) | Has the `NET_RAW` capability for ICMP |
+
+Notes:
+- In the compose stack, InfluxDB export is always on (`INFLUXDB3_URL` defaults to `http://influxdb3:8181`).
+- If `INFLUXDB3_TOKEN` is empty, InfluxDB runs with authentication disabled while still published on port 8181.
+- `.env.example` contains a placeholder token (`apiv3_dinis_secret_token`). Replace it with your own value.
 
 ## Usage / Quickstart
 
-### REST API Examples
+### REST API examples
 
-Add a CIDR range for discovery and monitoring:
+Add a CIDR range. If auto-discovery is on, adding it also starts a discovery sweep of that range:
 ```bash
 curl -X POST http://localhost:8080/api/cidrs \
   -H "Content-Type: application/json" \
   -d '{"cidr": "192.168.1.0/24", "description": "LAN"}'
 ```
 
-Trigger an immediate discovery scan:
+Start a discovery sweep of all enabled CIDRs. Send `{"cidr": "192.168.1.0/24"}` as the body to sweep a single range. You can start at most one sweep every 30 seconds; extra requests get `429`:
 ```bash
 curl -X POST http://localhost:8080/api/discovery/run
 ```
 
-Get system summary metrics:
+Get summary metrics:
 ```bash
 curl http://localhost:8080/api/summary
 ```
 
-List monitored hosts:
+List monitored hosts (paginated):
 ```bash
-curl "http://localhost:8080/api/hosts?page=1&limit=50&status=UP"
+curl "http://localhost:8080/api/hosts?page=1&limit=50&status=up&sort=status"
 ```
 
-Send an on-demand ping probe to a specific host:
+Probe a host once, right now. This works for any IPv4 address and updates the host's state if it is monitored. Each target IP can be probed at most once per second (`429` otherwise):
 ```bash
 curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 ```
 
-Listen to real-time events via Server-Sent Events (SSE):
+Listen to real-time events (Server-Sent Events):
 ```bash
 curl -N http://localhost:8080/api/stream
 ```
@@ -81,135 +131,246 @@ curl -N http://localhost:8080/api/stream
 
 When `DINIS_API_TOKEN` is set, every `/api/*` request must send the token in a header, either `Authorization: Bearer <token>` or `X-API-Key: <token>`. Tokens in the query string (`?token=`) are not accepted, so they never end up in URLs or proxy access logs.
 
+Two kinds of request stay public: the health checks (`/health`, `/api/health`) and the dashboard's static files. In the dashboard, enter the token with the key button in the header; it is stored in your browser.
+
 Browsers can't set headers on `EventSource`, so the SSE stream uses a short-lived ticket instead. Request one with the token, then open the stream within 30 seconds. Each ticket works for one connection:
 ```bash
 TICKET=$(curl -s -X POST -H "Authorization: Bearer $DINIS_API_TOKEN" http://localhost:8080/api/stream/ticket | jq -r .ticket)
 curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 ```
 
-### API Endpoints Overview
+### API endpoints overview
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health`, `/api/health` | Health check endpoint |
-| `GET` | `/api/summary` | Aggregate host counts, latency averages, and scan status |
-| `GET` | `/api/stream` | Server-Sent Events (SSE) event stream (`?ticket=` when a token is configured) |
+| `GET` | `/health`, `/api/health` | Health check (always public; always returns `{"status":"ok"}`) |
+| `GET` | `/api/summary` | Host counts by status, alert counts, average latency, probe rate (packets/s and pacing) and total subnet capacity |
+| `GET` | `/api/stream` | Server-Sent Events stream (`?ticket=` when a token is configured) |
 | `POST` | `/api/stream/ticket` | Issue a single-use, 30 s stream ticket (requires the API token header) |
-| `GET`, `POST`, `PUT` | `/api/cidrs` | List, add, or update monitored CIDR blocks |
-| `DELETE` | `/api/cidrs` | Remove a monitored CIDR block (`?cidr=...` or JSON body) |
-| `GET` | `/api/discovery/status` | Current discovery scan status |
-| `POST` | `/api/discovery/run` | Trigger an asynchronous discovery sweep |
-| `GET` | `/api/hosts` | Paginated host list (supports `status`, `search`, `sort`) |
-| `GET` | `/api/hosts/{ip}` | Get host detail |
-| `GET` | `/api/hosts/{ip}/history` | Historical probe latency and loss (`?window=1h`) |
-| `POST` | `/api/hosts/{ip}/ping` | Immediate single-host probe (rate-limited) |
-| `POST` | `/api/hosts/{ip}/promote` | Mark discovered host as static monitored target |
-| `PUT`, `POST` | `/api/hosts/{ip}/meta` | Update host alias and notes |
-| `DELETE` | `/api/hosts/{ip}/enrollment` | Un-enroll host from active monitoring |
-| `GET` | `/api/subnets/matrix` | Subnet heatmap matrix |
-| `GET` | `/api/outliers` | Degraded and high-jitter host list (`?limit=50`) |
-| `GET`, `POST` | `/api/exclusions` | List or create exclusion rules |
+| `GET` | `/api/cidrs` | List configured CIDRs |
+| `POST` | `/api/cidrs` | Add (or overwrite) a CIDR: `cidr`, `description`, `enabled`, `includeNetAndBcast`, `intervalSec` |
+| `PUT` | `/api/cidrs` | Update fields of an existing CIDR (only the fields you send) |
+| `DELETE` | `/api/cidrs` | Remove a CIDR (`?cidr=...` or JSON body) and stop monitoring the hosts it enrolled (promoted hosts are kept) |
+| `GET` | `/api/discovery/status` | Discovery state: running or not, last and next run, counts |
+| `POST` | `/api/discovery/run` | Start a discovery sweep (optional `{"cidr": ...}`; max one per 30 s) |
+| `GET` | `/api/hosts` | Host list; see query parameters below |
+| `GET` | `/api/hosts/{ip}` | Host detail, including alias and notes |
+| `GET` | `/api/hosts/{ip}/history` | Latency and loss history (`?window=1h`) |
+| `POST` | `/api/hosts/{ip}/ping` | Probe one IPv4 address now (max 1 per second per IP) |
+| `POST` | `/api/hosts/{ip}/promote` | Make a host a static target, monitored even if the range it belongs to is deleted |
+| `PUT`, `POST` | `/api/hosts/{ip}/meta` | Set alias and notes. Both are replaced, so an omitted field is cleared |
+| `DELETE` | `/api/hosts/{ip}/enrollment` | Remove a discovered or promoted host from the monitored set; see [Removing targets](#removing-targets) |
+| `GET` | `/api/subnets/matrix` | Subnet heatmap: hosts grouped by subnet (ranges larger than /24 are split into /24 blocks), with per-block health |
+| `GET` | `/api/outliers` | Hosts with packet loss, high latency or high jitter (`?limit=50`, max 500) |
+| `GET` | `/api/exclusions` | List exclusion rules |
+| `POST` | `/api/exclusions` | Add (or overwrite) an exclusion: `rule` (IP or CIDR), `reason`, `enabled` |
 | `DELETE` | `/api/exclusions` | Delete an exclusion rule (`?rule=...` or JSON body) |
-| `GET` | `/api/alerts` | Active incident alerts |
-| `POST` | `/api/alerts/acknowledge` | Acknowledge active alert |
-| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active alerts |
-| `GET` | `/api/alerts/history` | Historical resolved alerts |
-| `GET`, `PUT`, `POST` | `/api/settings` | Read or update runtime engine settings (partial updates: omitted fields keep their current values) |
+| `GET` | `/api/alerts` | Active alerts |
+| `POST` | `/api/alerts/acknowledge` | Acknowledge one alert: `ip` or `id`, plus `ackBy` and `note` |
+| `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active alerts: `ackBy`, `note` |
+| `GET` | `/api/alerts/history` | Resolved alerts, newest first (`?limit=100`, max 500) |
+| `GET`, `PUT`, `POST` | `/api/settings` | Read or update runtime settings; see below |
+
+**`/api/hosts` query parameters.**
+- With no parameters, the response is a plain JSON array of all hosts.
+- With any parameter, it is `{"total", "page", "limit", "totalPages", "hosts"}`.
+- Parameters:
+
+  | Parameter | Values |
+  |---|---|
+  | `page` | 1-based page number |
+  | `limit` | page size, default 50, max 500 |
+  | `status` | `all`, `up`, `down` (unacknowledged), `ack` (acknowledged DOWN), `pending`, `excluded` |
+  | `search` | matches IP, alias, CIDR, notes or exclusion reason |
+  | `sort` | `ip-asc`, `ip-desc`, `status`, `latency-asc`, `latency-desc`, `loss` |
+  | `lightweight` | `true` leaves out each host's recent latency list |
+
+**History windows.**
+- `window` takes a Go duration, e.g. `30m`, `1h`, `24h` or `168h`.
+- Windows up to 2 hours return 1-minute rollups; longer windows return hourly rollups, up to 30 days.
+- History is in memory only. It starts empty after a restart, and hourly points first appear after an hour of uptime.
+
+**Probe response.** `/api/hosts/{ip}/ping` returns `{"IP", "Success", "Latency", "LatencyMs", "Error", "Timestamp"}`. Note the capitalised keys, unlike the other endpoints.
+
+### Removing targets
+
+- **Single-IP target (a `/32` CIDR entry).**
+  - Delete the CIDR entry to remove the target.
+  - Disable it to pause monitoring while keeping its settings. If a larger enabled CIDR also contains the address, the host stays monitored as part of that range.
+  - Un-enrolling has no effect while the CIDR entry exists.
+- **Host discovered in a larger CIDR.**
+  - Deleting or disabling the CIDR stops monitoring all hosts discovered in it.
+  - To stop one host for good, add an exclusion for it.
+  - Un-enrolling (`DELETE /api/hosts/{ip}/enrollment`) only lasts until the next discovery sweep finds the host again.
+- **Promoted host.**
+  - Promoted hosts are kept when the range they belong to is deleted or disabled.
+  - Un-enroll the host to remove it. If it is inside a configured range and still answers, discovery enrolls it again as an ordinary host; add an exclusion to prevent that.
+  - Promoting a single-IP target changes nothing: it is removed when its CIDR entry is deleted.
+
+### Settings
+
+`GET /api/settings` returns the current values. `PUT` or `POST` updates them: fields you leave out keep their current values. Out-of-range values are adjusted to the nearest allowed value. A zero or negative `timeoutMs`, `failThreshold`, `concurrency` or `maxMetricHosts` resets that field to its default.
+
+| Field | Default | Range | Meaning |
+|---|---|---|---|
+| `intervalSec` | `60` | 0.5–3600 | Default probe interval per host; CIDRs can override it |
+| `timeoutMs` | `1000` | up to 30000 | Probe timeout |
+| `failThreshold` | `2` | 1–100 | Consecutive failed probes before a host is `DOWN` |
+| `concurrency` | `100` | 1–1024 | Parallel probes; changes apply immediately |
+| `discoveryIntervalMin` | `240` | ≥ 0 | Minutes between automatic discovery sweeps; `0` turns them off |
+| `autoDiscovery` | `true` | — | Whether to sweep at startup and when a CIDR is added |
+| `maxMetricHosts` | `10000` | 500–500000 | Hosts that keep latency history |
+
+Settings are saved to the data file. `-max-metric-hosts` / `DINIS_MAX_METRIC_HOSTS`, if set, overrides `maxMetricHosts` at every start.
+
+### Live events (SSE)
+
+`/api/stream` sends these events:
+
+| Event | When |
+|---|---|
+| `summary_update` | Every second; same content as `/api/summary` |
+| `host_state_change` | A host changed status (e.g. UP → DOWN) |
+| `host_update` | A host was updated by an alert acknowledgement |
+| `alert_fired`, `alert_acknowledged`, `alert_resolved` | Alert lifecycle |
+| `discovery_started`, `discovery_completed` | Discovery sweeps |
+| `desync` | The client fell behind and should reload its data |
+
+A keepalive comment is sent every 15 seconds.
 
 ## Configuration
 
-### Command-Line Flags
+### Command-line flags
 
-| Flag | Environment Variable | Default | Description |
+| Flag | Environment variable | Default | Description |
 |---|---|---|---|
-| `-port` | `DINIS_PORT` | `8080` | HTTP listen port for API and web dashboard |
-| `-host` | `DINIS_HOST` | `0.0.0.0` | HTTP listen address |
-| `-data` | `DINIS_DATA` | `data/dinis.json` | Path to persistent JSON database file |
-| `-static` | `DINIS_STATIC` | `""` | Directory path for static web assets (overrides embedded assets) |
-| `-api-token` | `DINIS_API_TOKEN` | `""` | Optional API authentication token required for REST endpoints |
-| `-allowed-hosts` | `DINIS_ALLOWED_HOSTS` | `""` | Comma-separated list of allowed Host header values (DNS rebinding protection) |
-| `-allowed-client-ips` | `DINIS_ALLOWED_CLIENT_IPS` | `""` | Comma-separated list of allowed client IPs/CIDRs |
-| `-trusted-proxies` | `DINIS_TRUSTED_PROXIES` | `""` | Comma-separated trusted proxy IPs/CIDRs or preset ('docker'/'private') |
-| `-allowed-origins` | `DINIS_ALLOWED_ORIGINS` | `""` | Comma-separated list of allowed CORS origins |
-| `-max-metric-hosts` | `DINIS_MAX_METRIC_HOSTS` | `0` (keep stored setting, default 10000) | Maximum hosts with in-memory time-series history. When set, overrides the stored setting on start. Hosts beyond the limit are still probed and alerted on, but get no history |
-| `-influxdb-url` | `INFLUXDB3_URL` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
-| `-influxdb-bucket` | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB database/bucket name |
-| `-influxdb-token` | `INFLUXDB3_TOKEN` | `""` | InfluxDB authentication token (must start with `apiv3_` if set) |
+| `-port` | `DINIS_PORT` | `8080` | HTTP listen port for the API and dashboard |
+| `-host` | `DINIS_HOST` | `0.0.0.0` | HTTP listen address (all interfaces by default) |
+| `-data` | `DINIS_DATA` | `data/dinis.json` | Path to the JSON data file (created with default targets if missing) |
+| `-static` | `DINIS_STATIC` | `""` | Serve dashboard files from this directory instead of the built-in ones |
+| `-api-token` | `DINIS_API_TOKEN` | `""` | API token; when empty, the API has no authentication |
+| `-allowed-hosts` | `DINIS_ALLOWED_HOSTS` | `""` | Comma-separated allowed `Host` header values (DNS rebinding protection). `localhost`, `127.0.0.1` and `::1` are always allowed; `*` allows any |
+| `-allowed-client-ips` | `DINIS_ALLOWED_CLIENT_IPS` | `""` | Comma-separated client IPs/CIDRs allowed to use the dashboard and API. Loopback is always allowed |
+| `-trusted-proxies` | `DINIS_TRUSTED_PROXIES` | `""` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For`, `X-Real-IP` and `X-Forwarded-Host` headers are trusted. The presets `docker` and `private` are identical: they trust all private and loopback ranges. See [Security notes](#security-notes) |
+| `-allowed-origins` | `DINIS_ALLOWED_ORIGINS` | `""` | Comma-separated allowed CORS origins. Same-host origins and `localhost`/`127.0.0.1` origins on any port are always allowed |
+| `-max-metric-hosts` | `DINIS_MAX_METRIC_HOSTS` | `0` | Hosts that keep latency history. `0` keeps the saved setting (default 10,000); any other value overrides it at start |
+| `-influxdb-url` | `INFLUXDB3_URL` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`); empty turns export off |
+| `-influxdb-bucket` | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB database name |
+| `-influxdb-token` | `INFLUXDB3_TOKEN` | `""` | InfluxDB token, sent as `Authorization: Bearer` |
 | `-version` | — | `false` | Print version and exit |
 
-### Environment Variables (Docker Compose)
+### Environment variables (Docker Compose)
 
 | Variable | Default | Description |
 |---|---|---|
-| `NGINX_HTTP_PORT` | `80` | Host port mapped to Nginx for the DINIS dashboard & REST API |
-| `INFLUXDB3_PORT` | `8181` | Host port mapped directly to InfluxDB 3 Core (HTTP API & Flight SQL) |
-| `DINIS_PORT` | `8080` | Internal container port for DINIS |
-| `DINIS_DATA` | `/data/dinis.json` | Storage file path inside the container |
-| `DINIS_API_TOKEN` | `""` | Optional API authentication token required for REST endpoints |
-| `DINIS_ALLOWED_HOSTS` | `""` | Allowed Host header values for DNS rebinding defense |
-| `DINIS_ALLOWED_CLIENT_IPS`| `""` | Client IP/CIDR whitelist for dashboard & API access |
-| `DINIS_TRUSTED_PROXIES` | `docker` | Trusted reverse proxy IPs/CIDRs permitted to provide `X-Forwarded-For`/`Host` |
+| `NGINX_HTTP_PORT` | `80` | Host port for the DINIS dashboard and REST API (via Nginx) |
+| `NGINX_EXPLORER_PORT` | `8888` | Host port for the InfluxDB 3 Explorer UI (via Nginx) |
+| `INFLUXDB3_PORT` | `8181` | Host port mapped directly to InfluxDB 3 Core (HTTP API and Flight SQL) |
+| `DINIS_PORT` | `8080` | DINIS port inside the container. Leave at `8080`: the Nginx config and health checks expect it |
+| `DINIS_DATA` | `/data/dinis.json` | Data file path inside the container (on the `dinis-data` volume) |
+| `DINIS_API_TOKEN` | `""` | API token; empty means no authentication |
+| `DINIS_ALLOWED_HOSTS` | `""` | Allowed `Host` header values |
+| `DINIS_ALLOWED_CLIENT_IPS` | `""` | Client IP/CIDR allow-list |
+| `DINIS_TRUSTED_PROXIES` | `docker` | Trusted proxies (the `docker` preset trusts all private ranges) |
 | `DINIS_ALLOWED_ORIGINS` | `""` | Allowed CORS origins |
-| `DINIS_MAX_METRIC_HOSTS` | `""` | Maximum hosts with in-memory time-series history (empty keeps the stored setting, default 10000) |
-| `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB 3 Core endpoint |
-| `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
-| `INFLUXDB3_TOKEN` | `""` | InfluxDB API token (must start with `apiv3_` if set) |
+| `DINIS_MAX_METRIC_HOSTS` | `""` | Hosts that keep latency history; empty keeps the saved setting |
+| `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB endpoint; export is on by default in compose |
+| `INFLUXDB3_BUCKET` | `dinis` | InfluxDB database name |
+| `INFLUXDB3_TOKEN` | `""` | InfluxDB admin token; InfluxDB requires it to start with `apiv3_`. **If empty, InfluxDB runs without authentication** |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | InfluxDB 3 node identifier |
-| `NGINX_EXPLORER_PORT` | `8888` | Host port mapped to Nginx for InfluxDB 3 Explorer Web UI |
 
-## InfluxDB 3 Explorer Web UI
+## InfluxDB data
 
-To visually browse tables, inspect probe metrics, and execute ad-hoc SQL queries against InfluxDB 3 Core without Grafana:
+Each probe result is written as one point:
+
+| | Name | Type | Notes |
+|---|---|---|---|
+| Measurement | `icmp_probe` | | |
+| Tag | `ip` | string | Probed IPv4 address |
+| Tag | `subnet` | string | CIDR the host belongs to |
+| Tag | `alias` | string | Host alias, or the CIDR description if no alias is set |
+| Field | `latency_ms` | float | Round-trip time; `0` when the probe failed |
+| Field | `success` | integer | `1` = reply received, `0` = failed |
+| Time | | ns | When the probe completed |
+
+Writes are batched every 5 seconds (or every 100 points). If InfluxDB is unreachable, up to 10 MB of points are buffered and retried.
+
+Because failed probes have `latency_ms = 0`, filter on `success` when charting latency. Example SQL:
+```sql
+SELECT time, ip, latency_ms
+FROM icmp_probe
+WHERE success = 1 AND time > now() - INTERVAL '1 hour'
+ORDER BY time
+```
+Packet loss per host is `1 - avg(success)` over a time bucket.
+
+### InfluxDB 3 Explorer web UI
+
+To browse tables and run ad-hoc SQL without Grafana:
 * Open **`http://<dinis-host-ip>:8888`** in your browser.
 * Connect with:
   - **Host URL:** `http://influxdb3:8181` (inside Docker) or `http://<dinis-host-ip>:8181`
   - **Database:** `dinis` (or `INFLUXDB3_BUCKET`)
-  - **Token:** `INFLUXDB3_TOKEN` (starts with `apiv3_`, if configured)
+  - **Token:** `INFLUXDB3_TOKEN`, if configured
 
-## Connecting an External Grafana Instance
+The Explorer runs in admin mode and has no login of its own. Anyone who can reach port 8888 can use it.
 
-To visualize DINIS probe metrics in your existing Grafana installation:
+### Connecting an external Grafana instance
 
-### Option A: Native InfluxDB 3 / Flight SQL (Recommended)
-1. In Grafana, navigate to **Connections** > **Data Sources** > **Add data source** and select **InfluxDB**.
-2. Configure settings:
+#### Option A: Native InfluxDB 3 / Flight SQL (recommended)
+1. In Grafana, go to **Connections** > **Data Sources** > **Add data source** and select **InfluxDB**.
+2. Configure:
    - **Query Language:** `SQL`
    - **URL:** `http://<dinis-host-ip>:8181`
    - **Database:** `dinis` (or the value of `INFLUXDB3_BUCKET`)
-   - **Token:** Your `INFLUXDB3_TOKEN` (starts with `apiv3_`)
-   - **Insecure Connection:** Toggle **ON** (required for cleartext HTTP/2 `h2c` without TLS)
+   - **Token:** your `INFLUXDB3_TOKEN`
+   - **Insecure Connection:** **ON** (needed for plain-text HTTP/2 without TLS)
 3. Click **Save & test**.
 
-### Option B: InfluxQL Compatibility Mode
+#### Option B: InfluxQL compatibility mode
 1. In Grafana, select **InfluxDB**.
-2. Configure settings:
+2. Configure:
    - **Query Language:** `InfluxQL`
    - **URL:** `http://<dinis-host-ip>:8181`
    - **Database:** `dinis` (or the value of `INFLUXDB3_BUCKET`)
    - **HTTP Method:** `POST`
-3. If authentication is enabled (`INFLUXDB3_TOKEN` is set):
-   - Under **Custom HTTP Headers**, click **Add header**:
-     - **Header:** `Authorization`
-     - **Value:** `Bearer <your_INFLUXDB3_TOKEN>`
+3. If `INFLUXDB3_TOKEN` is set, under **Custom HTTP Headers** click **Add header**:
+   - **Header:** `Authorization`
+   - **Value:** `Bearer <your_INFLUXDB3_TOKEN>`
 4. Click **Save & test**.
 
-## Architecture / Project Structure
+## Security notes
+
+The defaults are built for a trusted lab network. Before running DINIS anywhere else:
+
+- **Set `DINIS_API_TOKEN`.** Without it, anyone who can reach the dashboard can change CIDRs, exclusions and settings, and can make DINIS ping arbitrary addresses.
+- **Set `DINIS_ALLOWED_HOSTS`** to the hostnames you use to reach DINIS. This protects against DNS-rebinding attacks from web pages opened in an operator's browser.
+- **Narrow `DINIS_TRUSTED_PROXIES`.** The `docker`/`private` preset trusts every private address. That lets any client on a private network set its own `X-Forwarded-For` header and get past `DINIS_ALLOWED_CLIENT_IPS`. In compose, set it to the compose network instead (`172.30.0.0/24`).
+- **Protect InfluxDB.**
+  - Set a strong `INFLUXDB3_TOKEN`; don't keep the placeholder from `.env.example`.
+  - Port 8181 is published on all interfaces. Without a token, InfluxDB accepts unauthenticated reads and writes.
+- **Restrict port 8888.** The InfluxDB Explorer has no login.
+
+## Architecture / project structure
 
 ```
 .
-├── main.go               # Program entrypoint, CLI flag configuration, and service coordinator
-├── Dockerfile            # Multi-stage build definition for alpine-based container
-├── docker-compose.yml    # Service definition for DINIS, InfluxDB 3 Core, InfluxDB 3 Explorer, and Nginx reverse proxy
+├── main.go               # Entry point: parses flags/env vars and wires the components together
+├── Dockerfile            # Multi-stage build, Alpine runtime image
+├── docker-compose.yml    # DINIS, InfluxDB 3 Core, InfluxDB 3 Explorer and Nginx
+├── .env.example          # Template for docker compose settings (copy to .env)
 ├── docker/
-│   └── nginx/            # Nginx reverse proxy configuration and virtual host definitions
-├── verify_e2e.py         # End-to-end integration and API verification test script
+│   └── nginx/            # Nginx reverse proxy configuration
+├── data/                 # Default location of the JSON data file
+├── verify_e2e.py         # End-to-end API test script (run in CI against the compose stack)
+├── .github/workflows/    # CI: gofmt, go vet, race tests, config validation, e2e
 └── pkg/
-    ├── alerts/           # Alert evaluation, state transitions, and acknowledgments
-    ├── influxdb/         # InfluxDB 3 line protocol metric exporter
-    ├── network/          # CIDR parsing, IP expansion, and exclusion matching
-    ├── pinger/           # ICMP raw/datagram sockets, packet pacing, and probe engine
-    ├── server/           # HTTP handlers, REST API endpoints, and SSE event streaming
-    │   └── web_dist/     # Embedded web dashboard frontend assets
-    ├── store/            # JSON persistence layer with atomic writes
-    └── timeseries/       # In-memory metric ring buffers, rollups, and outlier detection
+    ├── alerts/           # Alert lifecycle: firing, acknowledgement, resolution, history
+    ├── influxdb/         # Batched InfluxDB 3 line-protocol exporter
+    ├── network/          # CIDR parsing, IP expansion, exclusion matching
+    ├── pinger/           # ICMP sockets, probe engine, pacing, UP/DOWN evaluation
+    ├── server/           # Coordinator (ties engine, alerts, discovery and storage together), REST API, SSE
+    │   └── web_dist/     # Embedded web dashboard
+    ├── store/            # JSON persistence with atomic writes and a single-instance lock
+    └── timeseries/       # In-memory latency history, rollups, outlier detection
 ```

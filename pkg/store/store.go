@@ -364,6 +364,14 @@ func (s *Store) GetDiscoveredHosts() map[string]DiscoveredHost {
 	return res
 }
 
+// GetDiscoveredHost returns the discovered host entry for an IP.
+func (s *Store) GetDiscoveredHost(ip string) (DiscoveredHost, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h, ok := s.data.DiscoveredHosts[ip]
+	return h, ok
+}
+
 // AddOrUpdateDiscoveredHost saves or updates a discovered host entry.
 func (s *Store) AddOrUpdateDiscoveredHost(h DiscoveredHost) error {
 	s.mu.Lock()

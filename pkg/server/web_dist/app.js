@@ -2197,7 +2197,7 @@
       });
 
       tr.querySelector('.btn-del-cidr').addEventListener('click', async () => {
-        if (confirm(`Remove CIDR ${c.cidr}? Discovered hosts under this subnet will be un-enrolled.`)) {
+        if (confirm(`Remove CIDR ${c.cidr}? Hosts monitored through this entry will no longer be monitored (promoted hosts are kept).`)) {
           await apiFetch(`/api/cidrs?cidr=${encodeURIComponent(c.cidr)}`, { method: 'DELETE' });
           showToast(`Removed CIDR ${c.cidr}`, 'info');
           await Promise.all([
