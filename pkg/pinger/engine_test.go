@@ -348,3 +348,64 @@ func TestPerSubnetPacingAndExecution(t *testing.T) {
 		t.Errorf("expected 500ms subnet host to send more packets than 1500ms subnet host, got h1=%d, h2=%d", h1.SentPackets, h2.SentPackets)
 	}
 }
+
+func TestEngineUpdateConfigResizesWorkers(t *testing.T) {
+	waitWorkers := func(e *Engine, want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if e.ActiveWorkers() == want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("expected %d active workers, got %d", want, e.ActiveWorkers())
+	}
+
+	cfg := DefaultConfig()
+	cfg.Concurrency = 2
+	engine := NewEngine(cfg)
+	engine.Start()
+	waitWorkers(engine, 2)
+
+	cfg.Concurrency = 6
+	engine.UpdateConfig(cfg)
+	waitWorkers(engine, 6)
+
+	cfg.Concurrency = 1
+	engine.UpdateConfig(cfg)
+	waitWorkers(engine, 1)
+
+	engine.Stop()
+	waitWorkers(engine, 0)
+}
+
+func TestGetAllHostsLiteOmitsHistory(t *testing.T) {
+	engine := NewEngine(DefaultConfig())
+	engine.SetHosts(map[string]*HostState{
+		"127.0.0.1": {IP: "127.0.0.1", CIDR: "127.0.0.1/32", Status: StatusPending},
+	})
+	engine.PingSingle(context.Background(), "127.0.0.1")
+
+	full := engine.GetAllHosts()
+	if len(full) != 1 || len(full[0].LatencyHistory) == 0 {
+		t.Fatalf("expected full snapshot to include latency history, got %+v", full)
+	}
+
+	lite := engine.GetAllHostsLite()
+	if len(lite) != 1 {
+		t.Fatalf("expected 1 host, got %d", len(lite))
+	}
+	if lite[0].LatencyHistory != nil {
+		t.Errorf("expected lite snapshot without latency history")
+	}
+	if lite[0].IP != "127.0.0.1" || lite[0].SentPackets != 1 {
+		t.Errorf("expected lite snapshot to carry host fields, got %+v", lite[0])
+	}
+
+	// Snapshot is a copy: mutating it must not affect engine state
+	lite[0].Alias = "mutated"
+	if h, _ := engine.GetHost("127.0.0.1"); h.Alias == "mutated" {
+		t.Errorf("expected lite snapshot to be detached from engine state")
+	}
+}

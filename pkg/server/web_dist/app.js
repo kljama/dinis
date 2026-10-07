@@ -52,6 +52,9 @@
 
     sseConnected: false,
 
+    // Unsaved edits in the host detail alias/notes form
+    metaFormDirty: false,
+
     // Throttled render flag
     renderPending: false
   };
@@ -280,16 +283,20 @@
     connectSSE();
     renderAll();
 
-    // Periodic auto-sync (every 3 seconds)
-    setInterval(() => {
-      fetchSummary();
-      if (state.currentView === 'matrix') {
-        fetchSubnetsMatrix();
-      } else if (state.currentView === 'outliers') {
-        fetchOutliers();
-      } else if (state.currentView === 'explorer') {
-        fetchHosts(state.currentPage);
+    // Refresh the visible view as soon as a backgrounded tab becomes visible again
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        scheduleRefresh('summary', currentViewKind(), 'alerts');
       }
+    });
+
+    // Periodic auto-sync (every 3 seconds) of the active view only, paused while the tab is hidden.
+    // The summary is pushed over SSE every second, so it is only polled while SSE is down.
+    setInterval(() => {
+      if (document.hidden) return;
+      const kinds = [currentViewKind()];
+      if (!state.sseConnected) kinds.push('summary');
+      scheduleRefresh(...kinds);
       if (state.selectedHostIP && el.hostDetailModal && el.hostDetailModal.style.display !== 'none') {
         apiFetch(`/api/hosts/${state.selectedHostIP}`).then(async res => {
           if (res.ok) {
@@ -300,6 +307,57 @@
         }).catch(() => {});
       }
     }, 3000);
+  }
+
+  // Coalesced data refresh. SSE events and polling request refreshes by kind; requests are
+  // batched into at most one round per second, and a fetch never overlaps itself. Without
+  // this, every host state change or alert event triggered several full-snapshot fetches,
+  // flooding the server during mass outages.
+  const REFRESH_INTERVAL_MS = 1000;
+  const refreshFetchers = {
+    summary: () => fetchSummary(),
+    matrix: () => fetchSubnetsMatrix(),
+    outliers: () => fetchOutliers(),
+    hosts: () => fetchHosts(state.currentPage),
+    alerts: () => fetchAlerts(),
+    alertHistory: () => fetchAlertHistory()
+  };
+  const pendingRefresh = new Set();
+  const inFlightRefresh = new Set();
+  let refreshTimer = null;
+
+  function scheduleRefresh(...kinds) {
+    kinds.forEach(kind => {
+      if (kind && refreshFetchers[kind]) pendingRefresh.add(kind);
+    });
+    if (pendingRefresh.size > 0 && !refreshTimer) {
+      refreshTimer = setTimeout(flushRefresh, REFRESH_INTERVAL_MS);
+    }
+  }
+
+  function flushRefresh() {
+    refreshTimer = null;
+    const kinds = Array.from(pendingRefresh);
+    pendingRefresh.clear();
+    kinds.forEach(kind => {
+      if (inFlightRefresh.has(kind)) {
+        // Still loading from the previous round; retry in the next one
+        pendingRefresh.add(kind);
+        return;
+      }
+      inFlightRefresh.add(kind);
+      Promise.resolve(refreshFetchers[kind]()).finally(() => inFlightRefresh.delete(kind));
+    });
+    if (pendingRefresh.size > 0 && !refreshTimer) {
+      refreshTimer = setTimeout(flushRefresh, REFRESH_INTERVAL_MS);
+    }
+  }
+
+  function currentViewKind() {
+    if (state.currentView === 'matrix') return 'matrix';
+    if (state.currentView === 'outliers') return 'outliers';
+    if (state.currentView === 'explorer') return 'hosts';
+    return null;
   }
 
   // Master View Navigation
@@ -488,6 +546,8 @@
     // Host Detail Modal
     el.btnCloseHostDetailModal.addEventListener('click', closeHostDetailModal);
     el.formHostMeta.addEventListener('submit', handleSaveHostMeta);
+    el.inputHostAlias.addEventListener('input', () => { state.metaFormDirty = true; });
+    el.inputHostNotes.addEventListener('input', () => { state.metaFormDirty = true; });
     el.btnDetailPingNow.addEventListener('click', handleDetailManualPing);
     el.btnDetailToggleExclude.addEventListener('click', handleDetailToggleExclude);
     el.btnDetailUnenroll.addEventListener('click', handleDetailUnenroll);
@@ -545,9 +605,35 @@
 
   let currentSSE = null;
   let sseReconnectTimer = null;
+  let sseGeneration = 0;
+
+  function markSSEDisconnected() {
+    state.sseConnected = false;
+    el.liveStatusBadge.classList.add('disconnected');
+    el.liveStatusText.textContent = 'RECONNECTING...';
+    if (!sseReconnectTimer) {
+      sseReconnectTimer = setTimeout(() => {
+        sseReconnectTimer = null;
+        connectSSE();
+      }, 3000);
+    }
+  }
+
+  // EventSource cannot send headers, so with an API token configured the stream is
+  // opened with a short-lived single-use ticket instead of putting the token in the URL.
+  async function fetchStreamTicket(token) {
+    const res = await fetch('/api/stream/ticket', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error(`ticket request failed (${res.status})`);
+    const data = await res.json();
+    return data.ticket;
+  }
 
   // SSE Stream Connection
-  function connectSSE() {
+  async function connectSSE() {
+    const generation = ++sseGeneration;
     if (currentSSE) {
       currentSSE.close();
       currentSSE = null;
@@ -559,8 +645,18 @@
     let sseUrl = '/api/stream';
     const token = getAPIToken();
     if (token) {
-      sseUrl += `?token=${encodeURIComponent(token)}`;
+      try {
+        const ticket = await fetchStreamTicket(token);
+        sseUrl += `?ticket=${encodeURIComponent(ticket)}`;
+      } catch (err) {
+        console.warn('SSE ticket error:', err);
+        if (generation === sseGeneration) markSSEDisconnected();
+        return;
+      }
     }
+    // A newer connectSSE() call superseded this one while the ticket was in flight
+    if (generation !== sseGeneration) return;
+
     const sse = new EventSource(sseUrl);
     currentSSE = sse;
 
@@ -571,28 +667,14 @@
     };
 
     sse.onerror = () => {
-      state.sseConnected = false;
-      el.liveStatusBadge.classList.add('disconnected');
-      el.liveStatusText.textContent = 'RECONNECTING...';
-      if (!sseReconnectTimer) {
-        sseReconnectTimer = setTimeout(() => {
-          sseReconnectTimer = null;
-          connectSSE();
-        }, 3000);
-      }
+      // The browser's own auto-reconnect would reuse the spent ticket; reconnect ourselves
+      if (token) sse.close();
+      markSSEDisconnected();
     };
 
     sse.addEventListener('desync', () => {
       console.warn('SSE desync event received, performing full state refresh');
-      fetchSummary();
-      if (state.currentView === 'matrix') {
-        fetchSubnetsMatrix();
-      } else if (state.currentView === 'outliers') {
-        fetchOutliers();
-      } else if (state.currentView === 'explorer') {
-        fetchHosts(state.currentPage);
-      }
-      fetchAlerts();
+      scheduleRefresh('summary', currentViewKind(), 'alerts');
     });
 
     sse.addEventListener('summary_update', (e) => {
@@ -615,14 +697,12 @@
         }
 
         scheduleRender();
-        fetchAlerts();
-        fetchSummary();
-
-        if (state.currentView === 'matrix') {
-          fetchSubnetsMatrix();
-        } else if (state.currentView === 'outliers') {
-          fetchOutliers();
+        // Summary arrives via summary_update; refetch the rest at most once per second
+        const kinds = ['alerts'];
+        if (state.currentView === 'matrix' || state.currentView === 'outliers') {
+          kinds.push(currentViewKind());
         }
+        scheduleRefresh(...kinds);
 
         if (payload.newStatus === 'DOWN') {
           showToast(`Host ${host.ip} (${host.alias || host.cidr}) is DOWN!`, 'error');
@@ -646,8 +726,7 @@
         state.discoveryStatus = payload.status;
         updateDiscoveryUI();
         showToast(`Discovery finished: ${payload.discoveredOnline} active hosts found.`, 'success');
-        fetchSubnetsMatrix();
-        fetchHosts(state.currentPage);
+        scheduleRefresh('matrix', 'hosts');
         fetchCIDRs();
       } catch (err) {
         console.error('Failed to parse discovery_completed:', err);
@@ -655,22 +734,15 @@
     });
 
     sse.addEventListener('alert_fired', () => {
-      fetchAlerts();
-      fetchOutliers();
-      fetchSummary();
+      scheduleRefresh('alerts', 'outliers');
     });
 
     sse.addEventListener('alert_acknowledged', () => {
-      fetchAlerts();
-      fetchOutliers();
-      fetchSummary();
+      scheduleRefresh('alerts', 'outliers');
     });
 
     sse.addEventListener('alert_resolved', () => {
-      fetchAlerts();
-      fetchAlertHistory();
-      fetchOutliers();
-      fetchSummary();
+      scheduleRefresh('alerts', 'alertHistory', 'outliers');
     });
   }
 
@@ -1647,6 +1719,9 @@
   // -------------------------------------------------------------
 
   async function openHostDetailModal(ip) {
+    if (state.selectedHostIP !== ip) {
+      state.metaFormDirty = false;
+    }
     state.selectedHostIP = ip;
     if (el.detailHostIP) el.detailHostIP.textContent = ip;
     if (el.detailHostAlias) el.detailHostAlias.textContent = 'Loading host details...';
@@ -1668,6 +1743,7 @@
     el.hostDetailModal.style.display = 'none';
     state.selectedHostIP = null;
     state.selectedHostData = null;
+    state.metaFormDirty = false;
   }
 
   async function loadHostHistory(ip, window) {
@@ -1728,9 +1804,11 @@
       loadHostHistory(h.ip, state.chartWindow);
     }
 
-    // Form inputs
-    el.inputHostAlias.value = h.alias || '';
-    el.inputHostNotes.value = h.notes || '';
+    // Form inputs (keep unsaved edits across periodic refreshes)
+    if (!state.metaFormDirty) {
+      el.inputHostAlias.value = h.alias || '';
+      el.inputHostNotes.value = h.notes || '';
+    }
 
     // Alert Section
     if (h.alertActive && h.status === 'DOWN') {
@@ -1860,6 +1938,7 @@
       });
 
       if (res.ok) {
+        state.metaFormDirty = false;
         showToast('Host metadata saved', 'success');
         await Promise.all([fetchHosts(state.currentPage), openHostDetailModal(state.selectedHostIP)]);
       }
@@ -2006,8 +2085,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ip: ip,
-          alertId: alertId,
-          operator: operator,
+          id: alertId,
+          ackBy: operator,
           note: note
         })
       });
@@ -2041,7 +2120,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          operator: operator,
+          ackBy: operator,
           note: 'Bulk acknowledged via dashboard'
         })
       });
@@ -2456,7 +2535,7 @@
       });
 
       if (res.ok) {
-        state.settings = payload;
+        state.settings = await res.json();
         showToast('Settings saved and engine re-configured', 'success');
         closeSettingsModal();
         renderCIDRTable();

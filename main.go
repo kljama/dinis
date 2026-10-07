@@ -50,7 +50,7 @@ func main() {
 	allowedClientIPsFlag := flag.String("allowed-client-ips", os.Getenv("DINIS_ALLOWED_CLIENT_IPS"), "Comma-separated list of allowed client IPs/CIDRs for Web UI and API access (DINIS_ALLOWED_CLIENT_IPS)")
 	trustedProxiesFlag := flag.String("trusted-proxies", os.Getenv("DINIS_TRUSTED_PROXIES"), "Comma-separated list of trusted proxy IPs/CIDRs or preset ('docker'/'private') permitted to provide X-Forwarded-For/Host (DINIS_TRUSTED_PROXIES)")
 	allowedOriginsFlag := flag.String("allowed-origins", os.Getenv("DINIS_ALLOWED_ORIGINS"), "Comma-separated list of allowed CORS origins (DINIS_ALLOWED_ORIGINS)")
-	maxMetricHostsFlag := flag.Int("max-metric-hosts", envIntOrDefault("DINIS_MAX_METRIC_HOSTS", 10000), "Maximum monitored hosts metric retention capacity before LRU eviction (DINIS_MAX_METRIC_HOSTS)")
+	maxMetricHostsFlag := flag.Int("max-metric-hosts", envIntOrDefault("DINIS_MAX_METRIC_HOSTS", 0), "Maximum hosts retained in the in-memory metric store; 0 keeps the stored setting (DINIS_MAX_METRIC_HOSTS)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 

@@ -2,7 +2,9 @@ package pinger
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 )
@@ -109,5 +111,54 @@ func TestSingleProberContextCancellation(t *testing.T) {
 	}
 	if elapsed > 200*time.Millisecond {
 		t.Errorf("expected immediate cancellation, took %v", elapsed)
+	}
+}
+
+func buildICMPError(icmpType byte, dst net.IP, ipOptions int, quotedType byte, id, seq uint16) []byte {
+	ihl := 20 + ipOptions
+	pkt := make([]byte, 8+ihl+8)
+	pkt[0] = icmpType
+	q := pkt[8:]
+	q[0] = 0x40 | byte(ihl/4)
+	q[9] = 1 // ICMP
+	copy(q[12:16], net.IPv4(10, 0, 0, 1).To4())
+	copy(q[16:20], dst.To4())
+	qi := q[ihl:]
+	qi[0] = quotedType
+	binary.BigEndian.PutUint16(qi[4:6], id)
+	binary.BigEndian.PutUint16(qi[6:8], seq)
+	return pkt
+}
+
+func TestQuotedProbeMatches(t *testing.T) {
+	target := net.ParseIP("192.0.2.10").To4()
+	other := net.ParseIP("192.0.2.99").To4()
+	const id, seq = 0x1234, 0x0042
+
+	full := buildICMPError(3, target, 0, 8, id, seq)
+
+	tests := []struct {
+		name    string
+		data    []byte
+		checkID bool
+		want    bool
+	}{
+		{"matching dest unreachable", full, true, true},
+		{"matching time exceeded", buildICMPError(11, target, 0, 8, id, seq), true, true},
+		{"quoted header with IP options", buildICMPError(3, target, 8, 8, id, seq), true, true},
+		{"wrong destination", buildICMPError(3, other, 0, 8, id, seq), true, false},
+		{"wrong sequence", buildICMPError(3, target, 0, 8, id, seq+1), true, false},
+		{"wrong id with id check", buildICMPError(3, target, 0, 8, id+1, seq), true, false},
+		{"wrong id without id check", buildICMPError(3, target, 0, 8, id+1, seq), false, true},
+		{"quoted packet not an echo request", buildICMPError(3, target, 0, 0, id, seq), true, false},
+		{"truncated quoted icmp", full[:len(full)-4], true, false},
+		{"truncated quoted ip header", full[:20], true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quotedProbeMatches(tc.data, target, id, seq, tc.checkID); got != tc.want {
+				t.Errorf("quotedProbeMatches() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

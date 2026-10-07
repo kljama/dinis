@@ -3,8 +3,10 @@ package timeseries
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestHostRingBuffer(t *testing.T) {
@@ -198,7 +200,7 @@ func TestGetSinceClockSkewNonMonotonic(t *testing.T) {
 	}
 
 	// Test RollupSeries GetSince with non-monotonic points
-	rs := NewRollupSeries(10)
+	rs := NewRollupSeries(10, time.Minute)
 	rs.Append(RollupPoint{Timestamp: now.Add(-50 * time.Second), AvgLatencyMs: 1.0})
 	rs.Append(RollupPoint{Timestamp: now.Add(-20 * time.Second), AvgLatencyMs: 2.0})
 	rs.Append(RollupPoint{Timestamp: now.Add(-40 * time.Second), AvgLatencyMs: 3.0})
@@ -409,7 +411,7 @@ func TestHostRingBufferDynamicGrowthAndWrap(t *testing.T) {
 }
 
 func TestRollupSeriesDynamicGrowthAndWrap(t *testing.T) {
-	rs := NewRollupSeries(3)
+	rs := NewRollupSeries(3, time.Minute)
 	if rs.GetAll() != nil {
 		t.Fatalf("expected nil for empty series")
 	}
@@ -442,47 +444,86 @@ func TestRollupSeriesDynamicGrowthAndWrap(t *testing.T) {
 	}
 }
 
-func TestStoreLRUEvictionAndMaxHostsLimit(t *testing.T) {
+func TestStoreMaxHostsLimitDoesNotEvictActiveHosts(t *testing.T) {
 	st := NewStoreWithLimit(3)
 	now := time.Now()
 
-	// Insert host 1, 2, 3
 	st.Record("10.0.0.1", now, 1.0, true)
 	st.Record("10.0.0.2", now, 2.0, true)
 	st.Record("10.0.0.3", now, 3.0, true)
 
-	// Access host 1 to make it most recently used (LRU order becomes: 2, 3, 1)
-	st.Record("10.0.0.1", now.Add(time.Second), 1.5, true)
-
-	// Insert host 4 -> host 2 should be evicted
+	// At capacity: a 4th host is not tracked, existing hosts keep their history
 	st.Record("10.0.0.4", now, 4.0, true)
-
-	if len(st.GetRecentRawSamples("10.0.0.2", 10)) != 0 {
-		t.Errorf("expected 10.0.0.2 to be evicted by LRU")
-	}
-	if len(st.GetRecentRawSamples("10.0.0.1", 10)) != 2 {
-		t.Errorf("expected 10.0.0.1 to remain in store with 2 samples")
-	}
-	if len(st.GetRecentRawSamples("10.0.0.3", 10)) != 1 {
-		t.Errorf("expected 10.0.0.3 to remain in store")
-	}
-	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 1 {
-		t.Errorf("expected 10.0.0.4 to be present in store")
+	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 0 {
+		t.Errorf("expected 10.0.0.4 not to be stored while at capacity")
 	}
 
-	// RemoveHost
+	// Round-robin probing must not thrash existing hosts
+	for i := 1; i <= 5; i++ {
+		for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+			st.Record(ip, now.Add(time.Duration(i)*time.Second), 1.0, true)
+		}
+	}
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		if n := len(st.GetRecentRawSamples(ip, 10)); n != 6 {
+			t.Errorf("expected %s to keep 6 samples, got %d", ip, n)
+		}
+	}
+	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 0 {
+		t.Errorf("expected 10.0.0.4 to stay untracked")
+	}
+
+	// RemoveHost frees a slot for a new host
 	st.RemoveHost("10.0.0.3")
 	if len(st.GetRecentRawSamples("10.0.0.3", 10)) != 0 {
 		t.Errorf("expected 10.0.0.3 to be removed")
 	}
+	st.Record("10.0.0.4", now, 4.0, true)
+	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 1 {
+		t.Errorf("expected 10.0.0.4 to be stored after a slot was freed")
+	}
 
-	// PruneHosts
+	// PruneHosts frees slots too
 	st.PruneHosts(map[string]bool{"10.0.0.4": true})
 	if len(st.GetRecentRawSamples("10.0.0.1", 10)) != 0 {
 		t.Errorf("expected 10.0.0.1 to be pruned")
 	}
 	if len(st.GetRecentRawSamples("10.0.0.4", 10)) != 1 {
 		t.Errorf("expected 10.0.0.4 to remain after pruning")
+	}
+	st.Record("10.0.0.5", now, 5.0, true)
+	if len(st.GetRecentRawSamples("10.0.0.5", 10)) != 1 {
+		t.Errorf("expected 10.0.0.5 to be stored after pruning")
+	}
+}
+
+func TestStoreSetCapacityShrinkEvictsLeastRecent(t *testing.T) {
+	st := NewStoreWithLimit(4)
+	now := time.Now()
+
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"} {
+		st.Record(ip, now, 1.0, true)
+	}
+	// Touch host 1 so hosts 2 and 3 are the least recently updated
+	st.Record("10.0.0.1", now.Add(time.Second), 1.0, true)
+
+	st.SetCapacity(2)
+
+	st.mu.RLock()
+	count := len(st.rawBuffers)
+	st.mu.RUnlock()
+	if count != 2 {
+		t.Fatalf("expected 2 hosts after shrinking capacity, got %d", count)
+	}
+	for _, ip := range []string{"10.0.0.2", "10.0.0.3"} {
+		if len(st.GetRecentRawSamples(ip, 10)) != 0 {
+			t.Errorf("expected %s to be evicted on shrink", ip)
+		}
+	}
+	for _, ip := range []string{"10.0.0.1", "10.0.0.4"} {
+		if len(st.GetRecentRawSamples(ip, 10)) == 0 {
+			t.Errorf("expected %s to be retained on shrink", ip)
+		}
 	}
 }
 
@@ -577,5 +618,60 @@ func TestRollupPointJSONDuration(t *testing.T) {
 	}
 	if str, ok := res["bucketDurationStr"].(string); !ok || str != "1m0s" {
 		t.Errorf("expected bucketDurationStr='1m0s', got %v", res["bucketDurationStr"])
+	}
+}
+
+func TestRollupSeriesPackRoundTrip(t *testing.T) {
+	if size := unsafe.Sizeof(packedRollup{}); size != 48 {
+		t.Errorf("expected packedRollup to be 48 bytes, got %d", size)
+	}
+
+	ts := time.Date(2026, 10, 5, 12, 34, 56, 123456789, time.UTC)
+	in := RollupPoint{
+		Timestamp:     ts,
+		MinLatencyMs:  0.137,
+		MaxLatencyMs:  987.654,
+		AvgLatencyMs:  12.345,
+		P50LatencyMs:  11.111,
+		P95LatencyMs:  45.678,
+		P99LatencyMs:  123.456,
+		PacketLossPct: 33.333,
+		SampleCount:   60,
+		UpRatio:       0.667,
+		JitterMs:      2.5,
+	}
+
+	rs := NewRollupSeries(5, time.Minute)
+	rs.Append(in)
+	pts := rs.GetAll()
+	if len(pts) != 1 {
+		t.Fatalf("expected 1 point, got %d", len(pts))
+	}
+	out := pts[0]
+
+	if !out.Timestamp.Equal(ts) {
+		t.Errorf("timestamp mismatch: got %v want %v", out.Timestamp, ts)
+	}
+	if out.SampleCount != 60 {
+		t.Errorf("sample count mismatch: got %d", out.SampleCount)
+	}
+	if out.BucketDuration != time.Minute || out.BucketDurationSec != 60 || out.BucketDurationStr != "1m0s" {
+		t.Errorf("bucket duration mismatch: %v %v %q", out.BucketDuration, out.BucketDurationSec, out.BucketDurationStr)
+	}
+	pairs := map[string][2]float64{
+		"min":    {in.MinLatencyMs, out.MinLatencyMs},
+		"max":    {in.MaxLatencyMs, out.MaxLatencyMs},
+		"avg":    {in.AvgLatencyMs, out.AvgLatencyMs},
+		"p50":    {in.P50LatencyMs, out.P50LatencyMs},
+		"p95":    {in.P95LatencyMs, out.P95LatencyMs},
+		"p99":    {in.P99LatencyMs, out.P99LatencyMs},
+		"loss":   {in.PacketLossPct, out.PacketLossPct},
+		"up":     {in.UpRatio, out.UpRatio},
+		"jitter": {in.JitterMs, out.JitterMs},
+	}
+	for name, p := range pairs {
+		if math.Abs(p[0]-p[1]) > 1e-3 {
+			t.Errorf("%s mismatch: in=%v out=%v", name, p[0], p[1])
+		}
 	}
 }

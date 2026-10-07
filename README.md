@@ -77,13 +77,24 @@ Listen to real-time events via Server-Sent Events (SSE):
 curl -N http://localhost:8080/api/stream
 ```
 
+### Authentication
+
+When `DINIS_API_TOKEN` is set, every `/api/*` request must send the token in a header, either `Authorization: Bearer <token>` or `X-API-Key: <token>`. Tokens in the query string (`?token=`) are not accepted, so they never end up in URLs or proxy access logs.
+
+Browsers can't set headers on `EventSource`, so the SSE stream uses a short-lived ticket instead. Request one with the token, then open the stream within 30 seconds. Each ticket works for one connection:
+```bash
+TICKET=$(curl -s -X POST -H "Authorization: Bearer $DINIS_API_TOKEN" http://localhost:8080/api/stream/ticket | jq -r .ticket)
+curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
+```
+
 ### API Endpoints Overview
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health`, `/api/health` | Health check endpoint |
 | `GET` | `/api/summary` | Aggregate host counts, latency averages, and scan status |
-| `GET` | `/api/stream` | Server-Sent Events (SSE) event stream |
+| `GET` | `/api/stream` | Server-Sent Events (SSE) event stream (`?ticket=` when a token is configured) |
+| `POST` | `/api/stream/ticket` | Issue a single-use, 30 s stream ticket (requires the API token header) |
 | `GET`, `POST`, `PUT` | `/api/cidrs` | List, add, or update monitored CIDR blocks |
 | `DELETE` | `/api/cidrs` | Remove a monitored CIDR block (`?cidr=...` or JSON body) |
 | `GET` | `/api/discovery/status` | Current discovery scan status |
@@ -103,7 +114,7 @@ curl -N http://localhost:8080/api/stream
 | `POST` | `/api/alerts/acknowledge` | Acknowledge active alert |
 | `POST` | `/api/alerts/acknowledge-all` | Acknowledge all active alerts |
 | `GET` | `/api/alerts/history` | Historical resolved alerts |
-| `GET`, `PUT`, `POST` | `/api/settings` | Read or update runtime engine settings |
+| `GET`, `PUT`, `POST` | `/api/settings` | Read or update runtime engine settings (partial updates: omitted fields keep their current values) |
 
 ## Configuration
 
@@ -120,7 +131,7 @@ curl -N http://localhost:8080/api/stream
 | `-allowed-client-ips` | `DINIS_ALLOWED_CLIENT_IPS` | `""` | Comma-separated list of allowed client IPs/CIDRs |
 | `-trusted-proxies` | `DINIS_TRUSTED_PROXIES` | `""` | Comma-separated trusted proxy IPs/CIDRs or preset ('docker'/'private') |
 | `-allowed-origins` | `DINIS_ALLOWED_ORIGINS` | `""` | Comma-separated list of allowed CORS origins |
-| `-max-metric-hosts` | `DINIS_MAX_METRIC_HOSTS` | `10000` | In-memory time-series host retention capacity before LRU eviction |
+| `-max-metric-hosts` | `DINIS_MAX_METRIC_HOSTS` | `0` (keep stored setting, default 10000) | Maximum hosts with in-memory time-series history. When set, overrides the stored setting on start. Hosts beyond the limit are still probed and alerted on, but get no history |
 | `-influxdb-url` | `INFLUXDB3_URL` | `""` | InfluxDB 3 Core URL (e.g. `http://localhost:8181`). Empty disables export |
 | `-influxdb-bucket` | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB database/bucket name |
 | `-influxdb-token` | `INFLUXDB3_TOKEN` | `""` | InfluxDB authentication token (must start with `apiv3_` if set) |
@@ -139,7 +150,7 @@ curl -N http://localhost:8080/api/stream
 | `DINIS_ALLOWED_CLIENT_IPS`| `""` | Client IP/CIDR whitelist for dashboard & API access |
 | `DINIS_TRUSTED_PROXIES` | `docker` | Trusted reverse proxy IPs/CIDRs permitted to provide `X-Forwarded-For`/`Host` |
 | `DINIS_ALLOWED_ORIGINS` | `""` | Allowed CORS origins |
-| `DINIS_MAX_METRIC_HOSTS` | `10000` | In-memory time-series host retention limit before LRU rollup eviction |
+| `DINIS_MAX_METRIC_HOSTS` | `""` | Maximum hosts with in-memory time-series history (empty keeps the stored setting, default 10000) |
 | `INFLUXDB3_URL` | `http://influxdb3:8181` | InfluxDB 3 Core endpoint |
 | `INFLUXDB3_BUCKET` | `dinis` | InfluxDB bucket name |
 | `INFLUXDB3_TOKEN` | `""` | InfluxDB API token (must start with `apiv3_` if set) |

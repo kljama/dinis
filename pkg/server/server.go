@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,6 +48,8 @@ type DiscoveryStatus struct {
 const (
 	defaultMaxSSEClients       = 256
 	discoveryRateLimitInterval = 30 * time.Second
+	streamTicketTTL            = 30 * time.Second
+	snapshotCacheTTL           = 1 * time.Second
 )
 
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
@@ -66,6 +70,15 @@ type Coordinator struct {
 
 	discoveryLastTriggered time.Time // rate-limit manual discovery
 	maxSSEClients          int
+
+	// Short-lived cache of expensive full-snapshot API responses (matrix, outliers)
+	snapMu    sync.Mutex
+	snapCache map[string]cachedSnapshot
+}
+
+type cachedSnapshot struct {
+	body    []byte
+	expires time.Time
 }
 
 // NewCoordinator creates and wires the entire monitoring subsystem.
@@ -94,6 +107,7 @@ func NewCoordinator(st *store.Store) *Coordinator {
 		sseClients:    make(map[chan []byte]bool),
 		stopChan:      make(chan struct{}),
 		maxSSEClients: defaultMaxSSEClients,
+		snapCache:     make(map[string]cachedSnapshot),
 		discoveryStatus: DiscoveryStatus{
 			IntervalMin: settings.DiscoveryIntervalMin,
 		},
@@ -324,6 +338,7 @@ func (c *Coordinator) RebuildTargetList() {
 		hostMap[ip] = &pinger.HostState{
 			IP:                ip,
 			Alias:             alias,
+			Notes:             meta.Notes,
 			CIDR:              hostCIDR,
 			Status:            status,
 			IsExcluded:        matched,
@@ -366,6 +381,34 @@ func (c *Coordinator) RebuildTargetList() {
 	c.discoveryStatus.SubnetCapacity = totalCapacity
 	c.discoveryStatus.LastDiscoveredCount = len(discovered)
 	c.discMu.Unlock()
+
+	c.invalidateSnapshots()
+}
+
+// cachedSnapshotJSON returns the JSON encoding of build(), reusing a cached body for
+// up to snapshotCacheTTL. Concurrent callers for the same key share one computation.
+func (c *Coordinator) cachedSnapshotJSON(key string, build func() interface{}) ([]byte, error) {
+	c.snapMu.Lock()
+	defer c.snapMu.Unlock()
+
+	now := time.Now()
+	if entry, ok := c.snapCache[key]; ok && now.Before(entry.expires) {
+		return entry.body, nil
+	}
+	body, err := json.Marshal(build())
+	if err != nil {
+		return nil, err
+	}
+	body = append(body, '\n')
+	c.snapCache[key] = cachedSnapshot{body: body, expires: now.Add(snapshotCacheTTL)}
+	return body, nil
+}
+
+// invalidateSnapshots drops cached snapshot responses after target, alert or state changes.
+func (c *Coordinator) invalidateSnapshots() {
+	c.snapMu.Lock()
+	clear(c.snapCache)
+	c.snapMu.Unlock()
 }
 
 // RunDiscovery performs a concurrent ICMP discovery sweep across candidate IPs in the CIDR ranges.
@@ -707,6 +750,8 @@ func (c *Coordinator) hasActiveAlert(ip string) bool {
 }
 
 func (c *Coordinator) handleStateChange(h *pinger.HostState, oldStatus, newStatus pinger.HostStatus) {
+	defer c.invalidateSnapshots()
+
 	// If called standalone outside the engine probe cycle (e.g. in manual calls/tests),
 	// ensure alert manager and engine host state are synchronized.
 	if (newStatus == pinger.StatusDown && !h.AlertActive) || ((newStatus == pinger.StatusUp || newStatus == pinger.StatusExcluded) && (h.AlertActive || c.hasActiveAlert(h.IP))) {
@@ -834,6 +879,8 @@ type Server struct {
 	manualPingLast    map[string]time.Time
 	etagMu            sync.RWMutex
 	assetETags        map[string]string
+	ticketMu          sync.Mutex
+	streamTickets     map[string]time.Time // single-use SSE ticket -> expiry
 }
 
 // NewServer creates a new HTTP server routing all REST APIs and web dashboard assets.
@@ -844,6 +891,7 @@ func NewServer(coord *Coordinator, staticDir string) *Server {
 		staticPath:     staticDir,
 		manualPingLast: make(map[string]time.Time),
 		assetETags:     make(map[string]string),
+		streamTickets:  make(map[string]time.Time),
 	}
 
 	if staticDir != "" {
@@ -1149,7 +1197,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate API token if configured
+	// Validate API token if configured. Tokens are only accepted in headers so they never
+	// end up in URLs or access logs; the SSE stream (EventSource cannot set headers)
+	// authenticates with a short-lived single-use ticket instead.
 	if s.apiToken != "" && strings.HasPrefix(r.URL.Path, "/api/") {
 		token := ""
 		authHeader := r.Header.Get("Authorization")
@@ -1157,11 +1207,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			token = strings.TrimPrefix(authHeader, "Bearer ")
 		} else if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
 			token = apiKey
-		} else {
-			token = r.URL.Query().Get("token")
 		}
 
-		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.apiToken)) != 1 {
+		authorized := token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.apiToken)) == 1
+		if !authorized && token == "" && r.URL.Path == "/api/stream" {
+			authorized = s.consumeStreamTicket(r.URL.Query().Get("ticket"))
+		}
+		if !authorized {
 			writeError(w, http.StatusUnauthorized, "Unauthorized: invalid or missing API token")
 			return
 		}
@@ -1200,6 +1252,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	// SSE Real-time Stream
 	s.mux.HandleFunc("/api/stream", s.handleSSE)
+	s.mux.HandleFunc("/api/stream/ticket", s.handleStreamTicket)
 
 	// Discovery
 	s.mux.HandleFunc("/api/discovery/status", s.handleDiscoveryStatus)
@@ -1338,6 +1391,12 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+func writeJSONBytes(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
@@ -1429,6 +1488,57 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			_ = rc.SetWriteDeadline(time.Time{})
 		}
 	}
+}
+
+// issueStreamTicket creates a single-use ticket that authorizes one /api/stream connection.
+func (s *Server) issueStreamTicket() (string, error) {
+	var buf [32]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	ticket := hex.EncodeToString(buf[:])
+
+	now := time.Now()
+	s.ticketMu.Lock()
+	defer s.ticketMu.Unlock()
+	for t, exp := range s.streamTickets {
+		if now.After(exp) {
+			delete(s.streamTickets, t)
+		}
+	}
+	s.streamTickets[ticket] = now.Add(streamTicketTTL)
+	return ticket, nil
+}
+
+// consumeStreamTicket validates and invalidates a stream ticket.
+func (s *Server) consumeStreamTicket(ticket string) bool {
+	if ticket == "" {
+		return false
+	}
+	s.ticketMu.Lock()
+	defer s.ticketMu.Unlock()
+	exp, ok := s.streamTickets[ticket]
+	if !ok {
+		return false
+	}
+	delete(s.streamTickets, ticket)
+	return time.Now().Before(exp)
+}
+
+func (s *Server) handleStreamTicket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	ticket, err := s.issueStreamTicket()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to issue stream ticket")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ticket":       ticket,
+		"expiresInSec": int(streamTicketTTL.Seconds()),
+	})
 }
 
 func (s *Server) handleDiscoveryStatus(w http.ResponseWriter, r *http.Request) {
@@ -1523,15 +1633,15 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	sortField := r.URL.Query().Get("sort")
 	lightweight := r.URL.Query().Get("lightweight") == "true"
 
-	allHosts := s.coord.pinger.GetAllHosts()
+	var allHosts []*pinger.HostState
+	if lightweight {
+		allHosts = s.coord.pinger.GetAllHostsLite()
+	} else {
+		allHosts = s.coord.pinger.GetAllHosts()
+	}
 
 	// If no query parameters, maintain legacy response format (raw slice) for backward compatibility
 	if pageStr == "" && limitStr == "" && search == "" && status == "" && sortField == "" {
-		if lightweight {
-			for _, h := range allHosts {
-				h.LatencyHistory = nil
-			}
-		}
 		writeJSON(w, http.StatusOK, allHosts)
 		return
 	}
@@ -1544,7 +1654,8 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 			matchAlias := strings.Contains(strings.ToLower(h.Alias), search)
 			matchCIDR := strings.Contains(strings.ToLower(h.CIDR), search)
 			matchExcl := strings.Contains(strings.ToLower(h.ExclusionReason), search)
-			if !matchIP && !matchAlias && !matchCIDR && !matchExcl {
+			matchNotes := strings.Contains(strings.ToLower(h.Notes), search)
+			if !matchIP && !matchAlias && !matchCIDR && !matchExcl && !matchNotes {
 				continue
 			}
 		}
@@ -1579,13 +1690,7 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if lightweight {
-			cpy := *h
-			cpy.LatencyHistory = nil
-			filtered = append(filtered, &cpy)
-		} else {
-			filtered = append(filtered, h)
-		}
+		filtered = append(filtered, h)
 	}
 
 	// Sort
@@ -1700,7 +1805,16 @@ func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hosts := s.coord.pinger.GetAllHosts()
+	body, err := s.coord.cachedSnapshotJSON("matrix", func() interface{} { return s.buildSubnetsMatrix() })
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSONBytes(w, http.StatusOK, body)
+}
+
+func (s *Server) buildSubnetsMatrix() []timeseries.SubnetMatrixBlock {
+	hosts := s.coord.pinger.GetAllHostsLite()
 	hostsBySubnet := make(map[string][]timeseries.SubnetMatrixCell)
 	subnetParentMap := make(map[string]string)
 
@@ -1766,7 +1880,7 @@ func (s *Server) handleSubnetsMatrix(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, matrix)
+	return matrix
 }
 
 func (s *Server) handleOutliers(w http.ResponseWriter, r *http.Request) {
@@ -1786,14 +1900,29 @@ func (s *Server) handleOutliers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	outliers := tsStore.GetTopOutliers(limit, func(ip string) (bool, string, string) {
-		if h, ok := s.coord.pinger.GetHost(ip); ok && !h.IsExcluded {
-			return true, h.CIDR, h.Alias
+	body, err := s.coord.cachedSnapshotJSON("outliers:"+strconv.Itoa(limit), func() interface{} {
+		// One engine snapshot instead of a locked GetHost copy per candidate host
+		hosts := s.coord.pinger.GetAllHostsLite()
+		byIP := make(map[string]*pinger.HostState, len(hosts))
+		for _, h := range hosts {
+			byIP[h.IP] = h
 		}
-		return false, "", ""
+		outliers := tsStore.GetTopOutliers(limit, func(ip string) (bool, string, string) {
+			if h, ok := byIP[ip]; ok && !h.IsExcluded {
+				return true, h.CIDR, h.Alias
+			}
+			return false, "", ""
+		})
+		if outliers == nil {
+			outliers = []timeseries.OutlierHost{}
+		}
+		return outliers
 	})
-
-	writeJSON(w, http.StatusOK, outliers)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSONBytes(w, http.StatusOK, body)
 }
 
 func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request) {
@@ -2249,6 +2378,7 @@ func (s *Server) handleAlertAcknowledge(w http.ResponseWriter, r *http.Request) 
 
 	// Update host state in pinger engine
 	s.coord.pinger.SetHostAlertState(alert.IP, true, alert.ID, true, alert.AcknowledgedBy, alert.AckNote, alert.AcknowledgedAt, &alert.StartedAt)
+	s.coord.invalidateSnapshots()
 	if h, ok := s.coord.pinger.GetHost(alert.IP); ok {
 		s.coord.broadcastEvent("host_update", h)
 	}
@@ -2277,6 +2407,7 @@ func (s *Server) handleAlertAcknowledgeAll(w http.ResponseWriter, r *http.Reques
 			s.coord.broadcastEvent("host_update", h)
 		}
 	}
+	s.coord.invalidateSnapshots()
 
 	writeJSON(w, http.StatusOK, ackAlerts)
 }
@@ -2288,7 +2419,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, settings)
 
 	case http.MethodPut, http.MethodPost:
-		var req store.AppSettings
+		// Decode onto the current settings so omitted fields keep their stored values
+		req := s.coord.store.GetSettings()
 		if err := decodeJSON(r, &req); err != nil {
 			writeDecodeError(w, err)
 			return

@@ -28,6 +28,47 @@ func checksum(b []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// Linux raw-socket ICMP_FILTER option (linux/icmp.h). A set bit in the mask blocks that ICMP type.
+const (
+	solRaw     = 255
+	icmpFilter = 1
+
+	icmpFilterMask = ^int32(1<<0 | 1<<3 | 1<<11)
+)
+
+// quotedProbeMatches reports whether an ICMP error message (Destination Unreachable /
+// Time Exceeded) quotes the echo request we sent to target with the given id and seq.
+// icmpData starts at the ICMP header of the error message. The quoted ID is only
+// compared when checkID is set: SOCK_DGRAM ping sockets rewrite it in the kernel.
+func quotedProbeMatches(icmpData []byte, target net.IP, id, seq uint16, checkID bool) bool {
+	const errHdrLen = 8
+	if len(icmpData) < errHdrLen+20 {
+		return false
+	}
+	quotedIP := icmpData[errHdrLen:]
+	if quotedIP[0]>>4 != 4 {
+		return false
+	}
+	ihl := int(quotedIP[0]&0x0f) * 4
+	if ihl < 20 || len(quotedIP) < ihl+8 {
+		return false
+	}
+	if quotedIP[9] != syscall.IPPROTO_ICMP {
+		return false
+	}
+	if !net.IP(quotedIP[16:20]).Equal(target) {
+		return false
+	}
+	quotedICMP := quotedIP[ihl:]
+	if quotedICMP[0] != 8 {
+		return false
+	}
+	if checkID && binary.BigEndian.Uint16(quotedICMP[4:6]) != id {
+		return false
+	}
+	return binary.BigEndian.Uint16(quotedICMP[6:8]) == seq
+}
+
 // PingResult represents the outcome of a single ICMP echo probe.
 type PingResult struct {
 	IP        string
@@ -84,6 +125,9 @@ func (p *SingleProber) newSocket() (*probeSocket, error) {
 			return nil, err
 		}
 		isRaw = true
+		// Raw ICMP sockets receive a copy of every inbound ICMP packet; let the kernel
+		// drop everything except Echo Reply, Destination Unreachable and Time Exceeded.
+		_ = syscall.SetsockoptInt(fd, solRaw, icmpFilter, int(icmpFilterMask))
 	}
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 65536)
 	return &probeSocket{
@@ -306,8 +350,12 @@ func (p *SingleProber) nativeProbe(ctx context.Context, ip net.IP, timeout time.
 		icmpData := buf[icmpOffset:n]
 
 		// Validate ICMP type: must be Echo Reply (type 0, code 0).
-		// Immediately return failure for Destination Unreachable (type 3) or Time Exceeded (type 11)
+		// Return failure immediately for Destination Unreachable (type 3) or Time Exceeded (type 11),
+		// but only when the error quotes this probe; raw sockets also see errors for other traffic.
 		if icmpData[0] != 0 {
+			if (icmpData[0] == 3 || icmpData[0] == 11) && !quotedProbeMatches(icmpData, ip, expectedID, expectedSeq, sock.isRaw) {
+				continue
+			}
 			if icmpData[0] == 3 {
 				return PingResult{
 					IP:        ip.String(),

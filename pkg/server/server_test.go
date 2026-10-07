@@ -1139,12 +1139,12 @@ func TestAPITokenAuthentication(t *testing.T) {
 		t.Errorf("expected 200 for valid X-API-Key header, got %d", rec.Code)
 	}
 
-	// 5. Valid query param token (e.g. for SSE stream) -> 200
+	// 5. Query param token is no longer accepted (tokens must not appear in URLs/logs) -> 401
 	req = httptest.NewRequest(http.MethodGet, "/api/summary?token=super-secret-token-123", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected 200 for valid query token, got %d", rec.Code)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for query token, got %d", rec.Code)
 	}
 
 	// 6. Non-API path (e.g. static UI assets) should NOT require token
@@ -1951,6 +1951,33 @@ func TestHostMetaAlertSynchronization(t *testing.T) {
 	if updatedAlt.Alias != "Primary Gateway" {
 		t.Errorf("expected alert alias to be updated to 'Primary Gateway', got %q", updatedAlt.Alias)
 	}
+
+	// 4. Host detail returns the persisted notes
+	req = httptest.NewRequest(http.MethodGet, "/api/hosts/10.150.0.10", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	var detail pinger.HostState
+	if err := json.NewDecoder(rec.Body).Decode(&detail); err != nil {
+		t.Fatalf("failed to decode host detail: %v", err)
+	}
+	if detail.Notes != "Rack A" {
+		t.Errorf("expected host notes 'Rack A', got %q", detail.Notes)
+	}
+
+	// 5. Explorer search matches on notes
+	req = httptest.NewRequest(http.MethodGet, "/api/hosts?search=rack&lightweight=true", nil)
+	rec = httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	var page struct {
+		Total int                 `json:"total"`
+		Hosts []*pinger.HostState `json:"hosts"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&page); err != nil {
+		t.Fatalf("failed to decode hosts page: %v", err)
+	}
+	if page.Total != 1 || len(page.Hosts) != 1 || page.Hosts[0].IP != "10.150.0.10" {
+		t.Errorf("expected notes search to return 10.150.0.10, got total=%d hosts=%v", page.Total, page.Hosts)
+	}
 }
 
 func TestOutlierHostAliasPropagation(t *testing.T) {
@@ -2048,5 +2075,180 @@ func TestAlertHistoryLimitQueryParam(t *testing.T) {
 	}
 	if len(histClamped) != 15 {
 		t.Errorf("expected all 15 history items when limit clamped, got %d", len(histClamped))
+	}
+}
+
+func TestSettingsPartialUpdatePreservesFields(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	put := func(body string) store.AppSettings {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var res store.AppSettings
+		if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		return res
+	}
+
+	put(`{"maxMetricHosts":20000,"discoveryIntervalMin":30,"autoDiscovery":true}`)
+
+	// Body without maxMetricHosts / discovery fields must not reset them
+	res := put(`{"intervalSec":5,"timeoutMs":800,"failThreshold":3,"concurrency":50}`)
+	if res.MaxMetricHosts != 20000 {
+		t.Errorf("expected MaxMetricHosts to stay 20000, got %d", res.MaxMetricHosts)
+	}
+	if res.DiscoveryIntervalMin != 30 || !res.AutoDiscovery {
+		t.Errorf("expected discovery settings preserved, got interval=%d auto=%v", res.DiscoveryIntervalMin, res.AutoDiscovery)
+	}
+	if res.IntervalSec != 5 || res.TimeoutMs != 800 || res.FailThreshold != 3 || res.Concurrency != 50 {
+		t.Errorf("expected provided fields applied, got %+v", res)
+	}
+	if stored := coord.store.GetSettings(); stored.MaxMetricHosts != 20000 {
+		t.Errorf("expected stored MaxMetricHosts 20000, got %d", stored.MaxMetricHosts)
+	}
+}
+
+func TestStreamTicketAuthentication(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	srv.SetAPIToken("super-secret-token-123")
+
+	issueTicket := func() string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/stream/ticket", nil)
+		req.Header.Set("Authorization", "Bearer super-secret-token-123")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 issuing ticket, got %d", rec.Code)
+		}
+		var res struct {
+			Ticket string `json:"ticket"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&res); err != nil || res.Ticket == "" {
+			t.Fatalf("expected ticket in response, err=%v", err)
+		}
+		return res.Ticket
+	}
+
+	openStream := func(ticket string) *httptest.ResponseRecorder {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		req := httptest.NewRequest(http.MethodGet, "/api/stream?ticket="+ticket, nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Ticket endpoint itself requires the API token
+	req := httptest.NewRequest(http.MethodPost, "/api/stream/ticket", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 issuing ticket without token, got %d", rec.Code)
+	}
+
+	// Valid ticket opens the stream
+	ticket := issueTicket()
+	rec = openStream(ticket)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "event: summary_update") {
+		t.Errorf("expected stream to open with ticket, got %d: %q", rec.Code, rec.Body.String())
+	}
+
+	// Tickets are single-use
+	rec = openStream(ticket)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 reusing ticket, got %d", rec.Code)
+	}
+
+	// Unknown ticket is rejected
+	rec = openStream("deadbeef")
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for unknown ticket, got %d", rec.Code)
+	}
+
+	// Tickets only authorize the stream endpoint
+	ticket = issueTicket()
+	req = httptest.NewRequest(http.MethodGet, "/api/summary?ticket="+ticket, nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for ticket on non-stream endpoint, got %d", rec.Code)
+	}
+
+	// Expired tickets are rejected
+	ticket = issueTicket()
+	srv.ticketMu.Lock()
+	srv.streamTickets[ticket] = time.Now().Add(-time.Second)
+	srv.ticketMu.Unlock()
+	rec = openStream(ticket)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for expired ticket, got %d", rec.Code)
+	}
+}
+
+func TestSnapshotResponseCacheAndInvalidation(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	getMatrix := func() string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/subnets/matrix", nil)
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 from matrix, got %d", rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	first := getMatrix()
+
+	// Changing the store without a rebuild leaves the cached snapshot in place
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "10.77.0.5/32", Description: "Cache Probe", Enabled: true})
+	if second := getMatrix(); second != first {
+		t.Errorf("expected cached matrix body within TTL")
+	}
+
+	// A target rebuild invalidates the cache
+	coord.RebuildTargetList()
+	if third := getMatrix(); third == first || !strings.Contains(third, "10.77.0.5") {
+		t.Errorf("expected fresh matrix containing new target after rebuild, got %s", third)
+	}
+
+	// Entries expire after the TTL
+	coord.snapMu.Lock()
+	for k, v := range coord.snapCache {
+		v.expires = time.Now().Add(-time.Millisecond)
+		coord.snapCache[k] = v
+	}
+	coord.snapMu.Unlock()
+	_ = coord.store.DeleteCIDR("10.77.0.5/32")
+	_ = coord.store.RemoveDiscoveredHost("10.77.0.5")
+	coord.pinger.SetHosts(map[string]*pinger.HostState{})
+	if fourth := getMatrix(); strings.Contains(fourth, "10.77.0.5") {
+		t.Errorf("expected expired cache entry to be rebuilt, got %s", fourth)
+	}
+}
+
+func TestOutliersEmptyListIsJSONArray(t *testing.T) {
+	srv, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/outliers", nil)
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Errorf("expected empty JSON array, got %q", rec.Body.String())
 	}
 }

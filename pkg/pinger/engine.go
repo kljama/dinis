@@ -24,6 +24,7 @@ const (
 type HostState struct {
 	IP                string     `json:"ip"`
 	Alias             string     `json:"alias"`
+	Notes             string     `json:"notes"`
 	CIDR              string     `json:"cidr"`
 	Status            HostStatus `json:"status"`
 	LatencyMs         float64    `json:"latencyMs"`
@@ -113,8 +114,10 @@ type Engine struct {
 	subnetRunners   map[string]*subnetRunner
 	runnerWg        sync.WaitGroup
 
-	workChan chan string
-	workerWg sync.WaitGroup
+	workChan      chan string
+	workerWg      sync.WaitGroup
+	workerStops   []chan struct{} // one stop channel per running worker
+	activeWorkers int32
 
 	// Callbacks
 	BeforeStateChange func(host *HostState, oldStatus, newStatus HostStatus)
@@ -182,10 +185,16 @@ func (e *Engine) Wake() {
 
 // UpdateConfig dynamically updates the engine configuration and wakes the polling loop.
 func (e *Engine) UpdateConfig(cfg EngineConfig) {
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 100
+	}
 	e.mu.Lock()
 	e.config = cfg
 	if cfg.MaxMetricHosts > 0 && e.tsStore != nil {
 		e.tsStore.SetCapacity(cfg.MaxMetricHosts)
+	}
+	if e.ctx != nil {
+		e.resizeWorkersUnsafe(cfg.Concurrency)
 	}
 	e.reconcileRunnersUnsafe()
 	e.mu.Unlock()
@@ -213,6 +222,7 @@ func (e *Engine) SetTargetsAndIntervals(hosts map[string]*HostState, subnetInter
 		if oldH, exists := e.hosts[ip]; exists {
 			// Keep existing metrics and history, but update metadata
 			oldH.Alias = newH.Alias
+			oldH.Notes = newH.Notes
 			oldH.CIDR = newH.CIDR
 			oldH.IsExcluded = newH.IsExcluded
 			oldH.ExclusionReason = newH.ExclusionReason
@@ -303,6 +313,24 @@ func (e *Engine) GetAllHosts() []*HostState {
 		cpy := *h
 		cpy.LatencyHistory = append([]float64(nil), h.LatencyHistory...)
 		result = append(result, &cpy)
+	}
+	return result
+}
+
+// GetAllHostsLite returns a snapshot of all monitored hosts without their latency
+// history. It is cheaper than GetAllHosts and holds the engine lock for less time.
+func (e *Engine) GetAllHostsLite() []*HostState {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	slab := make([]HostState, len(e.hosts))
+	result := make([]*HostState, 0, len(e.hosts))
+	i := 0
+	for _, h := range e.hosts {
+		slab[i] = *h
+		slab[i].LatencyHistory = nil
+		result = append(result, &slab[i])
+		i++
 	}
 	return result
 }
@@ -487,12 +515,8 @@ func (e *Engine) Start() {
 	if numWorkers <= 0 {
 		numWorkers = 100
 	}
-	workChan := make(chan string, numWorkers*2)
-	e.workChan = workChan
-	e.workerWg.Add(numWorkers)
-	for w := 0; w < numWorkers; w++ {
-		go e.workerLoop(workChan)
-	}
+	e.workChan = make(chan string, numWorkers*2)
+	e.resizeWorkersUnsafe(numWorkers)
 
 	e.reconcileRunnersUnsafe()
 	e.mu.Unlock()
@@ -525,6 +549,7 @@ func (e *Engine) Stop() {
 
 	e.mu.Lock()
 	e.workChan = nil
+	e.workerStops = nil
 	e.ctx = nil
 	e.cancel = nil
 	e.mu.Unlock()
@@ -534,11 +559,39 @@ func (e *Engine) Stop() {
 	}
 }
 
-func (e *Engine) workerLoop(workChan <-chan string) {
+// resizeWorkersUnsafe grows or shrinks the probe worker pool to n workers.
+// Removed workers exit after finishing their current probe. Caller must hold e.mu.
+func (e *Engine) resizeWorkersUnsafe(n int) {
+	if e.workChan == nil {
+		return
+	}
+	for len(e.workerStops) < n {
+		stop := make(chan struct{})
+		e.workerStops = append(e.workerStops, stop)
+		e.workerWg.Add(1)
+		go e.workerLoop(e.ctx, e.workChan, stop)
+	}
+	for len(e.workerStops) > n {
+		last := len(e.workerStops) - 1
+		close(e.workerStops[last])
+		e.workerStops = e.workerStops[:last]
+	}
+}
+
+// ActiveWorkers returns the number of running probe workers.
+func (e *Engine) ActiveWorkers() int {
+	return int(atomic.LoadInt32(&e.activeWorkers))
+}
+
+func (e *Engine) workerLoop(ctx context.Context, workChan <-chan string, stop <-chan struct{}) {
+	atomic.AddInt32(&e.activeWorkers, 1)
+	defer atomic.AddInt32(&e.activeWorkers, -1)
 	defer e.workerWg.Done()
 	for {
 		select {
-		case <-e.ctx.Done():
+		case <-ctx.Done():
+			return
+		case <-stop:
 			return
 		case ip, ok := <-workChan:
 			if !ok {

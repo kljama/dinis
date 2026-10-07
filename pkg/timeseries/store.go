@@ -3,6 +3,7 @@ package timeseries
 import (
 	"container/list"
 	"context"
+	"log"
 	"math"
 	"sort"
 	"strconv"
@@ -66,6 +67,10 @@ type Store struct {
 	lruList      *list.List
 	lruIndex     map[string]*list.Element
 
+	// Samples dropped because the host limit was reached, reported via a rate-limited log
+	droppedSamples   uint64
+	lastCapacityWarn time.Time
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -92,6 +97,7 @@ func NewStoreWithLimit(maxHosts int) *Store {
 }
 
 // SetCapacity dynamically updates the maximum host retention capacity.
+// Shrinking below the current host count evicts the least-recently-updated hosts.
 func (s *Store) SetCapacity(maxHosts int) {
 	if maxHosts <= 0 {
 		return
@@ -99,6 +105,15 @@ func (s *Store) SetCapacity(maxHosts int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxHosts = maxHosts
+	for s.lruList.Len() > s.maxHosts {
+		oldest := s.lruList.Back()
+		oldestIP := oldest.Value.(string)
+		s.lruList.Remove(oldest)
+		delete(s.lruIndex, oldestIP)
+		delete(s.rawBuffers, oldestIP)
+		delete(s.minuteSeries, oldestIP)
+		delete(s.hourSeries, oldestIP)
+	}
 }
 
 // Start launches the background automated downsampling ticker.
@@ -139,17 +154,17 @@ func (s *Store) getOrCreateRawBuffer(ip string) *HostRingBuffer {
 		return s.rawBuffers[ip]
 	}
 
-	// Evict least-recently-used host if at capacity
+	// At capacity: don't track new hosts. Evicting here would thrash, because hosts are
+	// probed round-robin and the evicted host is always the next one probed, leaving
+	// every host with no history. Slots free up when hosts are pruned or removed.
 	if s.lruList.Len() >= s.maxHosts {
-		oldest := s.lruList.Back()
-		if oldest != nil {
-			oldestIP := oldest.Value.(string)
-			s.lruList.Remove(oldest)
-			delete(s.lruIndex, oldestIP)
-			delete(s.rawBuffers, oldestIP)
-			delete(s.minuteSeries, oldestIP)
-			delete(s.hourSeries, oldestIP)
+		s.droppedSamples++
+		if now := time.Now(); now.Sub(s.lastCapacityWarn) >= time.Minute {
+			log.Printf("[TIMESERIES] Metric host limit (%d) reached; %d samples from additional hosts not recorded. Raise MaxMetricHosts to retain history for all hosts.", s.maxHosts, s.droppedSamples)
+			s.lastCapacityWarn = now
+			s.droppedSamples = 0
 		}
+		return nil
 	}
 
 	elem := s.lruList.PushFront(ip)
@@ -172,7 +187,7 @@ func (s *Store) getOrCreateMinuteSeries(ip string) *RollupSeries {
 	if rs, ok := s.minuteSeries[ip]; ok {
 		return rs
 	}
-	rs = NewRollupSeries(1440) // 24 hours of 1-minute rollups
+	rs = NewRollupSeries(MinuteRollupRetention, time.Minute)
 	s.minuteSeries[ip] = rs
 	return rs
 }
@@ -190,7 +205,7 @@ func (s *Store) getOrCreateHourSeries(ip string) *RollupSeries {
 	if rs, ok := s.hourSeries[ip]; ok {
 		return rs
 	}
-	rs = NewRollupSeries(720) // 30 days of 1-hour rollups
+	rs = NewRollupSeries(HourRollupRetention, time.Hour)
 	s.hourSeries[ip] = rs
 	return rs
 }
@@ -198,6 +213,9 @@ func (s *Store) getOrCreateHourSeries(ip string) *RollupSeries {
 // Record inserts a new raw probe sample into the time-series store in O(1) time.
 func (s *Store) Record(ip string, timestamp time.Time, latencyMs float64, success bool) {
 	rb := s.getOrCreateRawBuffer(ip)
+	if rb == nil {
+		return
+	}
 	rb.Push(timestamp, latencyMs, success)
 }
 
