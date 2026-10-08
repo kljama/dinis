@@ -3,6 +3,7 @@ package pinger
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -85,9 +86,9 @@ func TestEnginePacing(t *testing.T) {
 		t.Errorf("expected positive PacedDelayMs, got %f", summary.PacedDelayMs)
 	}
 
-	// Verify that 10 hosts over 1000ms (with 200ms timeout reserve -> 800ms window) gives ~80ms pace delay
-	expectedPace := 80.0
-	if summary.PacedDelayMs < 75.0 || summary.PacedDelayMs > 85.0 {
+	// 10 hosts at a 1000ms interval: one probe every 100ms on average
+	expectedPace := 100.0
+	if summary.PacedDelayMs < 95.0 || summary.PacedDelayMs > 105.0 {
 		t.Errorf("expected ~%f ms pace delay, got %f ms", expectedPace, summary.PacedDelayMs)
 	}
 }
@@ -114,13 +115,25 @@ func TestEnginePacingWithWake(t *testing.T) {
 	engine.Start()
 	defer engine.Stop()
 
-	// Simulate pre-startup Wake() call like RebuildTargetList does
+	// Simulate the Wake() call RebuildTargetList makes right after startup
 	engine.Wake()
-	time.Sleep(300 * time.Millisecond)
 
-	h, ok := engine.GetHost("127.0.0.1")
-	if !ok || h.SentPackets == 0 {
-		t.Fatalf("expected 127.0.0.1 to have sent packets after Wake, got sent=%d", h.SentPackets)
+	// Every host is probed within one interval of Start (first probes are spread over it)
+	deadline := time.Now().Add(3 * cfg.Interval)
+	for {
+		unprobed := 0
+		for ip := range hosts {
+			if h, ok := engine.GetHost(ip); !ok || h.SentPackets == 0 {
+				unprobed++
+			}
+		}
+		if unprobed == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected all hosts to be probed within %v of Start, %d still unprobed", 3*cfg.Interval, unprobed)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -407,5 +420,253 @@ func TestGetAllHostsLiteOmitsHistory(t *testing.T) {
 	lite[0].Alias = "mutated"
 	if h, _ := engine.GetHost("127.0.0.1"); h.Alias == "mutated" {
 		t.Errorf("expected lite snapshot to be detached from engine state")
+	}
+}
+
+// probeRecorder collects probe completion times per IP via OnProbeRecorded.
+type probeRecorder struct {
+	mu    sync.Mutex
+	times map[string][]time.Time
+}
+
+func newProbeRecorder(e *Engine) *probeRecorder {
+	r := &probeRecorder{times: map[string][]time.Time{}}
+	e.OnProbeRecorded = func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time) {
+		r.mu.Lock()
+		r.times[ip] = append(r.times[ip], ts)
+		r.mu.Unlock()
+	}
+	return r
+}
+
+func (r *probeRecorder) get(ip string) []time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]time.Time(nil), r.times[ip]...)
+}
+
+func loopbackHosts(n int, cidr string) map[string]*HostState {
+	hosts := make(map[string]*HostState, n)
+	for i := 1; i <= n; i++ {
+		ip := fmt.Sprintf("127.0.0.%d", i)
+		hosts[ip] = &HostState{IP: ip, CIDR: cidr, Status: StatusPending}
+	}
+	return hosts
+}
+
+func TestNextSlot(t *testing.T) {
+	s := time.Second
+	cases := []struct {
+		phase       float64
+		iv, after   time.Duration
+		want        time.Duration
+		description string
+	}{
+		{0.25, 4 * s, 0, 1 * s, "first slot after start"},
+		{0.25, 4 * s, 1 * s, 5 * s, "strictly after a slot"},
+		{0.25, 4 * s, 4900 * time.Millisecond, 5 * s, "next slot in the same cycle"},
+		{0.25, 4 * s, 5001 * time.Millisecond, 9 * s, "skips to the following cycle"},
+		{0.5, 4 * s, -3 * s, -2 * s, "works before the epoch"},
+		{0, 4 * s, 8 * s, 12 * s, "phase zero"},
+	}
+	for _, c := range cases {
+		if got := nextSlot(c.phase, c.iv, c.after); got != c.want {
+			t.Errorf("%s: nextSlot(%v, %v, %v) = %v, want %v", c.description, c.phase, c.iv, c.after, got, c.want)
+		}
+	}
+}
+
+func TestProbeIntervalBackoffForLongDownHosts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 60 * time.Second
+	cfg.DownProbeInterval = 5 * time.Minute
+	e := NewEngine(cfg)
+
+	longAgo := time.Now().Add(-10 * time.Minute)
+	recently := time.Now().Add(-1 * time.Minute)
+	cases := []struct {
+		host *HostState
+		want time.Duration
+		desc string
+	}{
+		{&HostState{IP: "10.0.0.1", Status: StatusDown, LastStateChange: &longAgo}, 5 * time.Minute, "DOWN for 10 minutes backs off"},
+		{&HostState{IP: "10.0.0.2", Status: StatusDown, LastStateChange: &recently}, 60 * time.Second, "DOWN for 1 minute keeps the normal interval"},
+		{&HostState{IP: "10.0.0.3", Status: StatusUp, LastStateChange: &longAgo}, 60 * time.Second, "UP host keeps the normal interval"},
+	}
+	for _, c := range cases {
+		if got := e.probeIntervalUnsafe(c.host); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.desc, got, c.want)
+		}
+	}
+
+	e.config.DownProbeInterval = 0
+	if got := e.probeIntervalUnsafe(cases[0].host); got != 60*time.Second {
+		t.Errorf("back-off disabled: got %v, want 60s", got)
+	}
+	e.config.DownProbeInterval = 30 * time.Second
+	if got := e.probeIntervalUnsafe(cases[0].host); got != 60*time.Second {
+		t.Errorf("down-probe interval shorter than the normal interval must not speed probing up: got %v", got)
+	}
+}
+
+func TestScheduleProbesNewHostPromptly(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 30 * time.Second
+	cfg.Timeout = 200 * time.Millisecond
+	cfg.Concurrency = 4
+	e := NewEngine(cfg)
+	rec := newProbeRecorder(e)
+
+	e.SetHosts(loopbackHosts(3, ""))
+	e.Start()
+	defer e.Stop()
+
+	time.Sleep(500 * time.Millisecond)
+	added := time.Now()
+	hosts := loopbackHosts(3, "")
+	hosts["127.0.0.50"] = &HostState{IP: "127.0.0.50", Status: StatusPending}
+	e.SetHosts(hosts)
+
+	deadline := added.Add(newHostSpread + 2*time.Second)
+	for len(rec.get("127.0.0.50")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("host added while running was not probed within %v (interval %v)", newHostSpread+2*time.Second, cfg.Interval)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestScheduleIntervalChangeTakesEffectImmediately(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 30 * time.Second
+	cfg.Timeout = 200 * time.Millisecond
+	cfg.Concurrency = 4
+	e := NewEngine(cfg)
+	rec := newProbeRecorder(e)
+
+	hosts := loopbackHosts(3, "")
+	e.SetHosts(hosts)
+	e.Start()
+	defer e.Stop()
+
+	time.Sleep(500 * time.Millisecond)
+	changed := time.Now()
+	cfg.Interval = 1 * time.Second
+	e.UpdateConfig(cfg)
+	time.Sleep(4 * time.Second)
+
+	for ip := range hosts {
+		n := 0
+		for _, ts := range rec.get(ip) {
+			if ts.After(changed) {
+				n++
+			}
+		}
+		if n < 3 {
+			t.Errorf("%s: expected at least 3 probes in the 4s after switching to a 1s interval, got %d", ip, n)
+		}
+	}
+}
+
+func TestScheduleKeepsPerHostSpacingEven(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 1 * time.Second
+	cfg.Timeout = 200 * time.Millisecond
+	cfg.Concurrency = 4
+	e := NewEngine(cfg)
+	rec := newProbeRecorder(e)
+
+	hosts := loopbackHosts(5, "")
+	e.SetHosts(hosts)
+	e.Start()
+	time.Sleep(5500 * time.Millisecond)
+	e.Stop()
+
+	for ip := range hosts {
+		ts := rec.get(ip)
+		if len(ts) < 4 {
+			t.Errorf("%s: expected at least 4 probes in 5.5s at a 1s interval, got %d", ip, len(ts))
+			continue
+		}
+		for i := 1; i < len(ts); i++ {
+			if gap := ts[i].Sub(ts[i-1]); gap < 800*time.Millisecond || gap > 1200*time.Millisecond {
+				t.Errorf("%s: probe gap %v outside 0.8-1.2s for a 1s interval", ip, gap)
+			}
+		}
+	}
+}
+
+func TestScheduleStopsProbingRemovedAndExcludedHosts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 500 * time.Millisecond
+	cfg.Timeout = 200 * time.Millisecond
+	cfg.Concurrency = 4
+	e := NewEngine(cfg)
+	rec := newProbeRecorder(e)
+
+	e.SetHosts(loopbackHosts(3, ""))
+	e.Start()
+	defer e.Stop()
+	time.Sleep(1200 * time.Millisecond)
+
+	// Remove 127.0.0.2 and exclude 127.0.0.3
+	hosts := loopbackHosts(1, "")
+	hosts["127.0.0.3"] = &HostState{IP: "127.0.0.3", Status: StatusExcluded, IsExcluded: true}
+	e.SetHosts(hosts)
+	time.Sleep(300 * time.Millisecond) // let probes already in flight finish
+	before2, before3 := len(rec.get("127.0.0.2")), len(rec.get("127.0.0.3"))
+	time.Sleep(1500 * time.Millisecond)
+
+	if after := len(rec.get("127.0.0.2")); after != before2 {
+		t.Errorf("removed host was probed %d more times", after-before2)
+	}
+	if after := len(rec.get("127.0.0.3")); after != before3 {
+		t.Errorf("excluded host was probed %d more times", after-before3)
+	}
+	if len(rec.get("127.0.0.1")) < 4 {
+		t.Errorf("remaining host should keep being probed, got %d probes", len(rec.get("127.0.0.1")))
+	}
+}
+
+// Unreachable hosts hold a worker for the whole timeout. Their probes may use only part of
+// the pool, so a host that answers keeps its interval during a large outage.
+func TestScheduleFailingHostsCannotStarveHealthyHosts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 1 * time.Second
+	cfg.Timeout = 1 * time.Second
+	cfg.Concurrency = 4
+	e := NewEngine(cfg)
+	rec := newProbeRecorder(e)
+
+	hosts := map[string]*HostState{
+		"127.0.0.1": {IP: "127.0.0.1", CIDR: "127.0.0.0/24", Status: StatusPending},
+	}
+	for i := 1; i <= 20; i++ {
+		ip := fmt.Sprintf("192.0.2.%d", i) // TEST-NET-1: unreachable
+		hosts[ip] = &HostState{IP: ip, CIDR: "192.0.2.0/24", Status: StatusPending}
+	}
+	e.SetHosts(hosts)
+	e.Start()
+	start := time.Now()
+	time.Sleep(10 * time.Second)
+	e.Stop()
+
+	// After the first round every unreachable host is a failing host, capped below the pool size.
+	var maxGap time.Duration
+	ts := rec.get("127.0.0.1")
+	for i := 1; i < len(ts); i++ {
+		if ts[i-1].Sub(start) < 6*time.Second {
+			continue
+		}
+		if gap := ts[i].Sub(ts[i-1]); gap > maxGap {
+			maxGap = gap
+		}
+	}
+	if maxGap == 0 {
+		t.Fatalf("healthy host was not probed after warm-up (%d probes total)", len(ts))
+	}
+	t.Logf("healthy host: max probe gap after warm-up %v (interval %v)", maxGap, cfg.Interval)
+	if maxGap > 1500*time.Millisecond {
+		t.Errorf("healthy host probe gap reached %v with a 1s interval while unreachable hosts saturated the pool", maxGap)
 	}
 }

@@ -845,6 +845,12 @@
             <span class="field-hint">Concurrent goroutines for parallel probing (default 100).</span>
           </div>
 
+          <div class="form-group">
+            <label for="inputDownProbeInterval">Probe Interval for Long-Down Hosts (seconds)</label>
+            <input type="number" id="inputDownProbeInterval" step="1" min="0" max="86400" required>
+            <span class="field-hint">Hosts that have been DOWN longer than this are only probed this often, keeping probe capacity for hosts that answer (default 300). 0 probes them at their normal interval.</span>
+          </div>
+
           <div class="modal-section-title d-flex justify-between align-center mt-3">
             <span>Subnet Intervals & Overrides</span>
             <button type="button" id="btnSettingsOpenSubnets" class="btn btn-xs btn-outline">Manage Subnets</button>

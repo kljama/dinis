@@ -2314,3 +2314,187 @@ func TestSingleIPTargetDeleteAndDisableStopMonitoring(t *testing.T) {
 		t.Errorf("expected 203.0.113.9 to stay monitored under 203.0.113.0/24, got ok=%v host=%+v", ok, h)
 	}
 }
+
+func TestDiscoveryRequestsQueueWhileSweepRuns(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Unreachable TEST-NET addresses make the first sweep wait for the discovery timeout
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "192.0.2.0/28", Enabled: true})
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "127.0.0.0/30", Enabled: true})
+
+	accepted, queued := coord.RequestDiscovery("192.0.2.0/28")
+	if !accepted || queued {
+		t.Fatalf("expected the first request to start a sweep, got accepted=%v queued=%v", accepted, queued)
+	}
+	// Wait until the sweep has taken its request off the queue (requests arriving before
+	// that are merged into the same sweep)
+	for {
+		coord.discMu.RLock()
+		taken := len(coord.discPending) == 0 && !coord.discPendingAll
+		coord.discMu.RUnlock()
+		if taken {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A second request while the sweep runs is queued, not dropped
+	req := httptest.NewRequest(http.MethodPost, "/api/discovery/run", strings.NewReader(`{"cidr":"127.0.0.0/30"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for a request queued behind a running sweep, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for coord.GetDiscoveryStatus().IsScanning {
+		if time.Now().After(deadline) {
+			t.Fatalf("discovery still running after 15s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	status := coord.GetDiscoveryStatus()
+	if status.LastScannedCount != 2 {
+		t.Errorf("expected the queued sweep of 127.0.0.0/30 (2 addresses) to run last, got LastScannedCount=%d", status.LastScannedCount)
+	}
+	if _, ok := coord.store.GetDiscoveredHost("127.0.0.1"); !ok {
+		t.Errorf("expected the queued sweep to discover 127.0.0.1")
+	}
+
+	// Single-CIDR sweeps don't count as full sweeps, so they don't postpone the periodic one
+	coord.discMu.RLock()
+	lastFull := coord.lastFullSweep
+	coord.discMu.RUnlock()
+	if !lastFull.IsZero() {
+		t.Errorf("single-CIDR sweeps must not update the last full sweep time")
+	}
+	if status.NextRun != nil {
+		t.Errorf("expected no NextRun before the first full sweep, got %v", status.NextRun)
+	}
+}
+
+func TestRunDiscoveryReportsDiscoveredHosts(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "127.0.0.0/30", Enabled: true})
+	online, _, err := coord.RunDiscovery("127.0.0.0/30")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if online != 2 {
+		t.Errorf("expected 2 loopback hosts to answer, got %d", online)
+	}
+	if coord.GetDiscoveryStatus().IsScanning {
+		t.Errorf("expected discovery to be idle after a synchronous sweep")
+	}
+
+	// A full sweep updates the periodic schedule
+	if _, _, err := coord.RunDiscovery(""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	status := coord.GetDiscoveryStatus()
+	if status.NextRun == nil {
+		t.Fatalf("expected NextRun after a full sweep")
+	}
+	want := 240 * time.Minute
+	if got := status.NextRun.Sub(*status.LastRun); got < want-time.Second || got > want+time.Second {
+		t.Errorf("expected NextRun 240 minutes after the full sweep, got %v", got)
+	}
+}
+
+func TestAlertStateSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dinis.json")
+
+	st, err := store.NewStore(path)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	_ = st.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "192.0.2.77/32", Description: "Restore Target", Enabled: true})
+	coord := NewCoordinator(st)
+
+	coord.alerts.Trigger("192.0.2.77", "Restore Target", "192.0.2.77/32", "Request timeout")
+	acked, err := coord.alerts.Acknowledge("192.0.2.77", "Alice", "Rebooting the switch")
+	if err != nil {
+		t.Fatalf("acknowledge failed: %v", err)
+	}
+	coord.alerts.Trigger("192.0.2.78", "", "", "Request timeout")
+	coord.alerts.Resolve("192.0.2.78")
+
+	coord.Stop() // saves the alert state
+	_ = st.Close()
+
+	st2, err := store.NewStore(path)
+	if err != nil {
+		t.Fatalf("failed to reopen store: %v", err)
+	}
+	coord2 := NewCoordinator(st2)
+	defer func() {
+		coord2.Stop()
+		_ = st2.Close()
+	}()
+
+	restored, ok := coord2.alerts.GetAlertForIP("192.0.2.77")
+	if !ok {
+		t.Fatalf("expected the active alert to be restored")
+	}
+	if restored.ID != acked.ID || !restored.StartedAt.Equal(acked.StartedAt) {
+		t.Errorf("expected the same alert (ID %s, started %v), got ID %s started %v", acked.ID, acked.StartedAt, restored.ID, restored.StartedAt)
+	}
+	if !restored.Acknowledged || restored.AcknowledgedBy != "Alice" || restored.AckNote != "Rebooting the switch" {
+		t.Errorf("expected the acknowledgement to be restored, got %+v", restored)
+	}
+
+	h, ok := coord2.pinger.GetHost("192.0.2.77")
+	if !ok {
+		t.Fatalf("expected the host to be monitored")
+	}
+	if h.Status != pinger.StatusDown || !h.AlertActive || !h.AlertAcknowledged || h.AlertAckBy != "Alice" {
+		t.Errorf("expected the host to restart DOWN with its acknowledged alert, got status=%s alertActive=%v ack=%v by=%q",
+			h.Status, h.AlertActive, h.AlertAcknowledged, h.AlertAckBy)
+	}
+	if summary := coord2.pinger.GetSummary(); summary.AlertsActive != 1 || summary.AckCount != 1 {
+		t.Errorf("expected summary to count the restored alert, got active=%d ack=%d", summary.AlertsActive, summary.AckCount)
+	}
+
+	history := coord2.alerts.GetAlertHistory(10)
+	if len(history) != 1 || history[0].IP != "192.0.2.78" {
+		t.Errorf("expected the resolved alert in history, got %+v", history)
+	}
+}
+
+func TestSettingsDownProbeInterval(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	if got := coord.store.GetSettings().DownProbeIntervalSec; got != 300 {
+		t.Fatalf("expected default downProbeIntervalSec 300, got %d", got)
+	}
+
+	put := func(body string) store.AppSettings {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		var res store.AppSettings
+		if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		return res
+	}
+
+	if got := put(`{"downProbeIntervalSec":-5}`).DownProbeIntervalSec; got != 0 {
+		t.Errorf("expected negative value clamped to 0, got %d", got)
+	}
+	if got := put(`{"downProbeIntervalSec":100000}`).DownProbeIntervalSec; got != 86400 {
+		t.Errorf("expected large value clamped to 86400, got %d", got)
+	}
+	put(`{"downProbeIntervalSec":600}`)
+	if got := put(`{"intervalSec":30}`).DownProbeIntervalSec; got != 600 {
+		t.Errorf("expected partial update to keep downProbeIntervalSec 600, got %d", got)
+	}
+}

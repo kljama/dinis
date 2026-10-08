@@ -10,20 +10,22 @@ DINIS is an ICMP network monitoring daemon with an embedded web dashboard and RE
   - when a CIDR is added, if `autoDiscovery` is on
   - on demand
   
-  Addresses matching an exclusion rule are skipped. Single-IP targets (`/32`) are always monitored, whether or not they answer.
+  A sweep requested while another one runs is queued and starts when that one finishes. The periodic schedule counts from the last *full* sweep, so sweeping a single range doesn't postpone it. Addresses matching an exclusion rule are skipped. Single-IP targets (`/32`) are always monitored, whether or not they answer.
 - **Enrolled hosts stay monitored.** A host that stops answering is not removed: it goes DOWN and raises an alert. Monitoring stops when you delete or disable the host's CIDR, or add an exclusion for it. Un-enrolling a discovered host only lasts until the next sweep finds it again. See [Removing targets](#removing-targets).
-- **Probing.** Each subnet is probed every `intervalSec` seconds (default 60; per-CIDR overrides down to 0.5 s). Probes are spread evenly across the interval instead of sent in a burst.
+- **Probing.** Each host is probed every `intervalSec` seconds (default 60; per-CIDR overrides down to 0.5 s). Every host has a fixed slot within its interval, so probes are spread evenly and each host is probed at a steady pace.
+  - A host added while DINIS runs (new target, or found by discovery) is first probed within 5 seconds. Interval changes take effect immediately.
   - A host starts as `PENDING` and becomes `UP` on its first reply.
   - It becomes `DOWN` after `failThreshold` consecutive failures (default 2).
   - Packet loss shown per host is cumulative since DINIS started.
+- **Probe capacity during outages.** A probe to a host that doesn't answer occupies a worker for the whole timeout. Two rules keep outages from slowing down the monitoring of everything else:
+  - Probes of hosts whose last probe failed may use at most three quarters of the workers (`concurrency`); the rest stay free for hosts that answer.
+  - Hosts that have been DOWN for longer than `downProbeIntervalSec` (default 300) are only probed that often. Their recovery is then noticed within that time instead of within one interval. Set it to `0` to probe DOWN hosts at their normal interval.
 - **Alerts.** Every host that goes `DOWN` gets an alert, which resolves automatically when the host recovers. Operators can acknowledge alerts with a name and a note. Alerts are shown in the dashboard only; DINIS sends no email, webhook or other notifications.
 - **What is stored where.**
   - The JSON data file holds CIDRs, exclusions, discovered hosts, host aliases and notes, and settings.
-  - Everything else lives in memory and is lost on restart:
-    - live host status
-    - active alerts and the last 500 resolved alerts
-    - latency history: the last 120 raw samples, 1-minute rollups for 2 hours, and hourly rollups for 30 days per host
-  - Use the InfluxDB export for long-term data.
+  - A second file next to it, `<data file name>.alerts.json` (e.g. `data/dinis.alerts.json`), holds active alerts with their acknowledgements and the last 500 resolved alerts. It is saved every 5 seconds while alerts change, and on shutdown.
+  - After a restart, ongoing outages keep their alert, start time and acknowledgement. Hosts with an active alert restart as `DOWN`; all other hosts restart as `PENDING`.
+  - Latency history lives in memory and is lost on restart: the last 128 raw samples, 1-minute rollups for 2 hours, and hourly rollups for 30 days per host. Rollups cover wall-clock minutes and hours. Use the InfluxDB export for long-term data.
   - A `<data file>.lock` file prevents two DINIS processes from sharing one data file.
 
 ### Limits and defaults to know about
@@ -102,7 +104,7 @@ curl -X POST http://localhost:8080/api/cidrs \
   -d '{"cidr": "192.168.1.0/24", "description": "LAN"}'
 ```
 
-Start a discovery sweep of all enabled CIDRs. Send `{"cidr": "192.168.1.0/24"}` as the body to sweep a single range. You can start at most one sweep every 30 seconds; extra requests get `429`:
+Start a discovery sweep of all enabled CIDRs. Send `{"cidr": "192.168.1.0/24"}` as the body to sweep a single range. If a sweep is already running, the request is queued and the answer is `202`. You can request at most one sweep every 30 seconds; extra requests get `429`:
 ```bash
 curl -X POST http://localhost:8080/api/discovery/run
 ```
@@ -144,7 +146,7 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health`, `/api/health` | Health check (always public; always returns `{"status":"ok"}`) |
-| `GET` | `/api/summary` | Host counts by status, alert counts, average latency, probe rate (packets/s and pacing) and total subnet capacity |
+| `GET` | `/api/summary` | Host counts by status, alert counts, average latency, probe rate (probes per second and the average gap between probes) and total subnet capacity |
 | `GET` | `/api/stream` | Server-Sent Events stream (`?ticket=` when a token is configured) |
 | `POST` | `/api/stream/ticket` | Issue a single-use, 30 s stream ticket (requires the API token header) |
 | `GET` | `/api/cidrs` | List configured CIDRs |
@@ -152,7 +154,7 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | `PUT` | `/api/cidrs` | Update fields of an existing CIDR (only the fields you send) |
 | `DELETE` | `/api/cidrs` | Remove a CIDR (`?cidr=...` or JSON body) and stop monitoring the hosts it enrolled (promoted hosts are kept) |
 | `GET` | `/api/discovery/status` | Discovery state: running or not, last and next run, counts |
-| `POST` | `/api/discovery/run` | Start a discovery sweep (optional `{"cidr": ...}`; max one per 30 s) |
+| `POST` | `/api/discovery/run` | Start a discovery sweep (optional `{"cidr": ...}`; `202` if queued behind a running sweep; max one request per 30 s) |
 | `GET` | `/api/hosts` | Host list; see query parameters below |
 | `GET` | `/api/hosts/{ip}` | Host detail, including alias and notes |
 | `GET` | `/api/hosts/{ip}/history` | Latency and loss history (`?window=1h`) |
@@ -187,7 +189,7 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 
 **History windows.**
 - `window` takes a Go duration, e.g. `30m`, `1h`, `24h` or `168h`.
-- Windows up to 2 hours return 1-minute rollups; longer windows return hourly rollups, up to 30 days.
+- Windows up to 2 hours return 1-minute rollups; longer windows return hourly rollups, up to 30 days. Each point is timestamped at the start of its minute or hour.
 - History is in memory only. It starts empty after a restart, and hourly points first appear after an hour of uptime.
 
 **Probe response.** `/api/hosts/{ip}/ping` returns `{"IP", "Success", "Latency", "LatencyMs", "Error", "Timestamp"}`. Note the capitalised keys, unlike the other endpoints.
@@ -220,6 +222,7 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | `discoveryIntervalMin` | `240` | ≥ 0 | Minutes between automatic discovery sweeps; `0` turns them off |
 | `autoDiscovery` | `true` | — | Whether to sweep at startup and when a CIDR is added |
 | `maxMetricHosts` | `10000` | 500–500000 | Hosts that keep latency history |
+| `downProbeIntervalSec` | `300` | 0–86400 | Hosts DOWN for longer than this are only probed this often; `0` disables the back-off |
 
 Settings are saved to the data file. `-max-metric-hosts` / `DINIS_MAX_METRIC_HOSTS`, if set, overrides `maxMetricHosts` at every start.
 

@@ -241,6 +241,7 @@
     inputTimeout: document.getElementById('inputTimeout'),
     inputFailThreshold: document.getElementById('inputFailThreshold'),
     inputConcurrency: document.getElementById('inputConcurrency'),
+    inputDownProbeInterval: document.getElementById('inputDownProbeInterval'),
     settingsSubnetsList: document.getElementById('settingsSubnetsList'),
     btnSettingsOpenSubnets: document.getElementById('btnSettingsOpenSubnets'),
 
@@ -261,6 +262,11 @@
   matrixTooltip.className = 'matrix-floating-tooltip';
   matrixTooltip.style.display = 'none';
   document.body.appendChild(matrixTooltip);
+
+  // Latest matrix cell data by IP. Cells only carry a data-ip attribute; hover and click
+  // handlers are delegated to the matrix container and always read the current data here.
+  const matrixCellsByIP = new Map();
+  let hoveredMatrixEl = null;
 
   // Initialize Application
   async function init() {
@@ -390,6 +396,33 @@
     el.tabViewMatrix.addEventListener('click', () => switchView('matrix'));
     el.tabViewOutliers.addEventListener('click', () => switchView('outliers'));
     el.tabViewExplorer.addEventListener('click', () => switchView('explorer'));
+
+    // Subnet matrix: delegated hover and click handling (see matrixCellsByIP)
+    el.matrixGridContainer.addEventListener('click', (e) => {
+      const badge = e.target.closest('.matrix-interval-badge');
+      if (badge) {
+        openEditCIDRModal(badge.dataset.cidr);
+        return;
+      }
+      const target = e.target.closest('[data-ip]');
+      if (target && el.matrixGridContainer.contains(target)) {
+        openHostDetailModal(target.dataset.ip);
+      }
+    });
+    el.matrixGridContainer.addEventListener('mouseover', (e) => {
+      const target = e.target.closest('[data-ip]');
+      if (target === hoveredMatrixEl) return;
+      hoveredMatrixEl = target;
+      if (target) {
+        showMatrixTooltip(target);
+      } else {
+        hideMatrixTooltip();
+      }
+    });
+    el.matrixGridContainer.addEventListener('mouseleave', () => {
+      hoveredMatrixEl = null;
+      hideMatrixTooltip();
+    });
 
     // Outliers refresh
     if (el.btnRefreshOutliers) {
@@ -1047,9 +1080,19 @@
   function renderSubnetMatrix() {
     const blocks = state.subnetsMatrix || [];
 
+    matrixCellsByIP.clear();
+    blocks.forEach(block => {
+      (block.cells ?? block.Cells ?? []).forEach(cell => {
+        const ip = cell.ip ?? cell.IP;
+        if (ip) matrixCellsByIP.set(ip, cell);
+      });
+    });
+
     el.matrixSubnetCount.textContent = `${blocks.length} Subnet${blocks.length === 1 ? '' : 's'} Monitored`;
 
     if (blocks.length === 0) {
+      hoveredMatrixEl = null;
+      hideMatrixTooltip();
       el.matrixGridContainer.innerHTML = `
         <div class="empty-state" style="grid-column: 1 / -1;">
           <div class="empty-icon">
@@ -1093,6 +1136,8 @@
         card.remove();
       }
     });
+
+    refreshMatrixTooltip();
   }
 
   function getCellClass(cellData) {
@@ -1167,51 +1212,7 @@
       <div class="matrix-cells-grid"></div>
     `;
 
-    const badgeBtn = card.querySelector('.matrix-interval-badge');
-    if (badgeBtn) {
-      badgeBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openEditCIDRModal(parentCidr);
-      });
-    }
-
-    const grid = card.querySelector('.matrix-cells-grid');
-
-    if (cells.length === 1) {
-      const cellData = cells[0];
-      const status = cellData.status ?? cellData.Status ?? 'PENDING';
-      const latencyMs = cellData.latencyMs ?? cellData.LatencyMs ?? 0;
-      const rttText = status === 'UP' ? `${latencyMs.toFixed(2)} ms` : status;
-      const aliasText = cellData.alias ? `· ${escapeHtml(cellData.alias)}` : '';
-      const ip = cellData.ip ?? cellData.IP ?? '';
-
-      grid.className = 'matrix-single-host-view';
-      grid.innerHTML = `
-        <div class="matrix-cell ${getCellClass(cellData)}" style="width: 20px; height: 20px; flex-shrink: 0;"></div>
-        <div class="d-flex align-center justify-between flex-1 font-mono text-xs">
-          <strong>${escapeHtml(ip)} <span class="text-muted font-normal">${aliasText}</span></strong>
-          <span>${rttText}</span>
-        </div>
-      `;
-      grid.addEventListener('mouseenter', (e) => showMatrixTooltip(e, cellData));
-      grid.addEventListener('mouseleave', hideMatrixTooltip);
-      grid.addEventListener('click', () => openHostDetailModal(ip));
-      return card;
-    }
-
-    // Render all discovered cells
-    cells.forEach(cellData => {
-      const ip = cellData.ip ?? cellData.IP ?? '';
-      const cellEl = document.createElement('div');
-      cellEl.className = `matrix-cell ${getCellClass(cellData)}`;
-
-      cellEl.addEventListener('mouseenter', (e) => showMatrixTooltip(e, cellData));
-      cellEl.addEventListener('mouseleave', hideMatrixTooltip);
-      cellEl.addEventListener('click', () => openHostDetailModal(ip));
-
-      grid.appendChild(cellEl);
-    });
-
+    renderMatrixCells(card, cells);
     return card;
   }
 
@@ -1262,47 +1263,81 @@
       healthPill.textContent = `${healthPct.toFixed(1)}% Health`;
     }
 
-    const grid = card.querySelector('.matrix-cells-grid, .matrix-single-host-view');
-    if (!grid) return;
+    renderMatrixCells(card, cells);
+  }
 
-    if (cells.length === 1) {
-      const cellData = cells[0];
-      const status = cellData.status ?? cellData.Status ?? 'PENDING';
-      const latencyMs = cellData.latencyMs ?? cellData.LatencyMs ?? 0;
-      const rttText = status === 'UP' ? `${latencyMs.toFixed(2)} ms` : status;
-      const cellEl = grid.querySelector('.matrix-cell');
-      if (cellEl) cellEl.className = `matrix-cell ${getCellClass(cellData)}`;
-      const rttSpan = grid.querySelector('.font-mono.text-xs span:last-child');
-      if (rttSpan) rttSpan.textContent = rttText;
-    } else {
-      const cellEls = grid.querySelectorAll('.matrix-cell');
-      if (cellEls.length === cells.length) {
-        for (let i = 0; i < cells.length; i++) {
-          const cellData = cells[i];
-          const cEl = cellEls[i];
-          const newClass = `matrix-cell ${getCellClass(cellData)}`;
-          if (cEl.className !== newClass) {
-            cEl.className = newClass;
-          }
-        }
+  // Renders a card's cells: a single-host row for one host, a cell grid otherwise. The grid
+  // element is replaced when the layout changes; otherwise cells are updated in place.
+  function renderMatrixCells(card, cells) {
+    const single = cells.length === 1;
+    let grid = card.querySelector('.matrix-cells-grid, .matrix-single-host-view');
+    const isSingle = !!grid && grid.classList.contains('matrix-single-host-view');
+    if (!grid || isSingle !== single) {
+      const fresh = document.createElement('div');
+      fresh.className = single ? 'matrix-single-host-view' : 'matrix-cells-grid';
+      if (grid) {
+        grid.replaceWith(fresh);
       } else {
-        grid.className = 'matrix-cells-grid';
-        grid.innerHTML = '';
-        cells.forEach(cellData => {
-          const ip = cellData.ip ?? cellData.IP ?? '';
-          const cellEl = document.createElement('div');
-          cellEl.className = `matrix-cell ${getCellClass(cellData)}`;
-          cellEl.addEventListener('mouseenter', (e) => showMatrixTooltip(e, cellData));
-          cellEl.addEventListener('mouseleave', hideMatrixTooltip);
-          cellEl.addEventListener('click', () => openHostDetailModal(ip));
-          grid.appendChild(cellEl);
-        });
+        card.appendChild(fresh);
       }
+      grid = fresh;
+    }
+
+    if (single) {
+      renderSingleHostView(grid, cells[0]);
+    } else {
+      syncMatrixCellGrid(grid, cells);
     }
   }
 
-  function showMatrixTooltip(e, cell) {
-    const rect = e.target.getBoundingClientRect();
+  function renderSingleHostView(grid, cellData) {
+    const ip = cellData.ip ?? cellData.IP ?? '';
+    const status = cellData.status ?? cellData.Status ?? 'PENDING';
+    const latencyMs = cellData.latencyMs ?? cellData.LatencyMs ?? 0;
+    const rttText = status === 'UP' ? `${latencyMs.toFixed(2)} ms` : status;
+    const aliasText = cellData.alias ? `· ${escapeHtml(cellData.alias)}` : '';
+
+    grid.dataset.ip = ip;
+    grid.innerHTML = `
+      <div class="matrix-cell ${getCellClass(cellData)}" style="width: 20px; height: 20px; flex-shrink: 0;"></div>
+      <div class="d-flex align-center justify-between flex-1 font-mono text-xs">
+        <strong>${escapeHtml(ip)} <span class="text-muted font-normal">${aliasText}</span></strong>
+        <span>${escapeHtml(rttText)}</span>
+      </div>
+    `;
+  }
+
+  function syncMatrixCellGrid(grid, cells) {
+    if (grid.children.length !== cells.length) {
+      const frag = document.createDocumentFragment();
+      cells.forEach(cellData => frag.appendChild(createMatrixCellEl(cellData)));
+      grid.replaceChildren(frag);
+      return;
+    }
+    for (let i = 0; i < cells.length; i++) {
+      const cellData = cells[i];
+      const cellEl = grid.children[i];
+      const cls = `matrix-cell ${getCellClass(cellData)}`;
+      const ip = cellData.ip ?? cellData.IP ?? '';
+      if (cellEl.className !== cls) cellEl.className = cls;
+      if (cellEl.dataset.ip !== ip) cellEl.dataset.ip = ip;
+    }
+  }
+
+  function createMatrixCellEl(cellData) {
+    const cellEl = document.createElement('div');
+    cellEl.className = `matrix-cell ${getCellClass(cellData)}`;
+    cellEl.dataset.ip = cellData.ip ?? cellData.IP ?? '';
+    return cellEl;
+  }
+
+  function showMatrixTooltip(target) {
+    const cell = matrixCellsByIP.get(target.dataset.ip);
+    if (!cell) {
+      hideMatrixTooltip();
+      return;
+    }
+    const rect = target.getBoundingClientRect();
     const ip = cell.ip ?? cell.IP ?? '';
     const alias = cell.alias ?? cell.Alias ?? '';
     const status = cell.status ?? cell.Status ?? 'PENDING';
@@ -1325,6 +1360,18 @@
 
   function hideMatrixTooltip() {
     matrixTooltip.style.display = 'none';
+  }
+
+  // After a matrix refresh, show the hovered cell's new data, or hide the tooltip if the
+  // cell is gone.
+  function refreshMatrixTooltip() {
+    if (!hoveredMatrixEl) return;
+    if (!hoveredMatrixEl.isConnected) {
+      hoveredMatrixEl = null;
+      hideMatrixTooltip();
+      return;
+    }
+    showMatrixTooltip(hoveredMatrixEl);
   }
 
   // -------------------------------------------------------------
@@ -2508,6 +2555,7 @@
     el.inputTimeout.value = s.timeoutMs || 1000;
     el.inputFailThreshold.value = s.failThreshold || 2;
     el.inputConcurrency.value = s.concurrency || 100;
+    el.inputDownProbeInterval.value = s.downProbeIntervalSec ?? 300;
     renderSettingsSubnetsList();
     el.settingsModal.style.display = 'flex';
   }
@@ -2524,6 +2572,7 @@
       timeoutMs: parseInt(el.inputTimeout.value, 10),
       failThreshold: parseInt(el.inputFailThreshold.value, 10),
       concurrency: parseInt(el.inputConcurrency.value, 10),
+      downProbeIntervalSec: parseInt(el.inputDownProbeInterval.value, 10),
       autoDiscovery: parseInt(el.inputDiscoveryInterval.value, 10) > 0
     };
 
@@ -2551,12 +2600,8 @@
   // DISCOVERY HELPERS
   // -------------------------------------------------------------
 
+  // Requests a sweep. If one is already running the server queues this one (HTTP 202).
   async function triggerDiscovery(cidr = '') {
-    if (state.discoveryStatus.isScanning) {
-      showToast('Discovery scan is already in progress', 'info');
-      return;
-    }
-
     try {
       el.btnRunDiscovery.disabled = true;
       el.discRadarIcon.classList.add('scanning');
@@ -2568,7 +2613,11 @@
         body: JSON.stringify({ cidr })
       });
 
-      if (!res.ok) {
+      if (res.status === 202) {
+        // Another sweep is running; this one starts when it finishes
+        const data = await res.json();
+        showToast(data.message || 'Discovery sweep queued', 'info');
+      } else if (!res.ok) {
         const err = await res.json();
         showToast(`Discovery error: ${err.error}`, 'error');
       }

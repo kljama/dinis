@@ -675,3 +675,83 @@ func TestRollupSeriesPackRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestRollupDueBuckets(t *testing.T) {
+	base := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	var got []time.Time
+	record := func(start, end time.Time) {
+		if end.Sub(start) != time.Minute {
+			t.Errorf("bucket %v-%v is not one minute", start, end)
+		}
+		got = append(got, start)
+	}
+
+	// Not due yet: the bucket ending at 12:01 waits for the grace period
+	next := rollupDueBuckets(base.Add(time.Minute+500*time.Millisecond), base.Add(time.Minute), time.Minute, record)
+	if len(got) != 0 || !next.Equal(base.Add(time.Minute)) {
+		t.Fatalf("expected nothing rolled up before the grace period, got %v next=%v", got, next)
+	}
+
+	// Due: exactly one bucket, then the next one is pending
+	next = rollupDueBuckets(base.Add(time.Minute+rollupGrace), next, time.Minute, record)
+	if len(got) != 1 || !got[0].Equal(base) || !next.Equal(base.Add(2*time.Minute)) {
+		t.Fatalf("expected bucket 12:00 rolled up once, got %v next=%v", got, next)
+	}
+
+	// A late tick rolls up every missed bucket in order
+	got = nil
+	next = rollupDueBuckets(base.Add(3*time.Minute+5*time.Second), next, time.Minute, record)
+	if len(got) != 2 || !got[0].Equal(base.Add(time.Minute)) || !got[1].Equal(base.Add(2*time.Minute)) {
+		t.Fatalf("expected buckets 12:01 and 12:02, got %v", got)
+	}
+
+	// After a long pause only the most recent completed bucket is rolled up
+	got = nil
+	rollupDueBuckets(base.Add(3*time.Hour+30*time.Second), next, time.Minute, record)
+	if len(got) != 1 || !got[0].Equal(base.Add(3*time.Hour-time.Minute)) {
+		t.Fatalf("expected only bucket 14:59 after a long pause, got %v", got)
+	}
+}
+
+func TestMinuteAndHourRollupsCoverEverySample(t *testing.T) {
+	st := NewStoreWithLimit(10)
+	hour := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
+
+	// 3 samples per minute for 3 minutes, plus one sample exactly on each boundary
+	var want int
+	for m := 0; m < 3; m++ {
+		bucket := hour.Add(time.Duration(m) * time.Minute)
+		for _, off := range []time.Duration{0, 20 * time.Second, 59*time.Second + 999*time.Millisecond} {
+			st.Record("10.0.0.1", bucket.Add(off), 2.0, true)
+			want++
+		}
+	}
+
+	total := 0
+	for m := 0; m < 3; m++ {
+		start := hour.Add(time.Duration(m) * time.Minute)
+		st.computeMinuteRollups(start, start.Add(time.Minute))
+	}
+	pts := st.getOrCreateMinuteSeries("10.0.0.1").GetAll()
+	if len(pts) != 3 {
+		t.Fatalf("expected 3 minute points, got %d", len(pts))
+	}
+	for i, p := range pts {
+		if !p.Timestamp.Equal(hour.Add(time.Duration(i) * time.Minute)) {
+			t.Errorf("minute point %d timestamped %v, want bucket start", i, p.Timestamp)
+		}
+		if p.SampleCount != 3 {
+			t.Errorf("minute point %d has %d samples, want 3", i, p.SampleCount)
+		}
+		total += p.SampleCount
+	}
+	if total != want {
+		t.Errorf("minute rollups hold %d samples, recorded %d", total, want)
+	}
+
+	st.computeHourRollups(hour, hour.Add(time.Hour))
+	hp := st.getOrCreateHourSeries("10.0.0.1").GetAll()
+	if len(hp) != 1 || hp[0].SampleCount != want || !hp[0].Timestamp.Equal(hour) {
+		t.Fatalf("expected one hour point with %d samples at %v, got %+v", want, hour, hp)
+	}
+}

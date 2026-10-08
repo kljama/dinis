@@ -205,3 +205,45 @@ func TestAlertMetadataUpdateAndRetrigger(t *testing.T) {
 		t.Errorf("expected false for unknown IP")
 	}
 }
+
+func TestExportImportState(t *testing.T) {
+	m := NewManager(3)
+	v0 := m.Version()
+
+	m.Trigger("10.0.0.1", "core", "10.0.0.0/24", "timeout")
+	if _, err := m.Acknowledge("10.0.0.1", "Alice", "on it"); err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range []string{"10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"} {
+		m.Trigger(ip, "", "", "timeout")
+		m.Resolve(ip)
+	}
+	if m.Version() == v0 {
+		t.Fatalf("expected version to change after alert changes")
+	}
+
+	st := m.ExportState()
+	if len(st.Active) != 1 || len(st.History) != 3 {
+		t.Fatalf("expected 1 active and 3 history entries (max 3), got %d and %d", len(st.Active), len(st.History))
+	}
+	if st.History[0].IP != "10.0.0.3" || st.History[2].IP != "10.0.0.5" {
+		t.Errorf("expected history oldest first (10.0.0.3 .. 10.0.0.5), got %s .. %s", st.History[0].IP, st.History[2].IP)
+	}
+
+	m2 := NewManager(2)
+	m2.ImportState(st)
+	a, ok := m2.GetAlertForIP("10.0.0.1")
+	if !ok || !a.Acknowledged || a.AcknowledgedBy != "Alice" {
+		t.Errorf("expected acknowledged alert to be imported, got %+v ok=%v", a, ok)
+	}
+	hist := m2.GetAlertHistory(0)
+	if len(hist) != 2 || hist[0].IP != "10.0.0.5" || hist[1].IP != "10.0.0.4" {
+		t.Errorf("expected the newest 2 history entries, newest first, got %+v", hist)
+	}
+
+	// An imported alert continues: triggering it again keeps ID, start and acknowledgement
+	again := m2.Trigger("10.0.0.1", "", "", "timeout")
+	if again.ID != a.ID || !again.Acknowledged {
+		t.Errorf("expected re-trigger to continue the imported alert, got %+v", again)
+	}
+}

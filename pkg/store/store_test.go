@@ -443,3 +443,65 @@ func TestStoreSettingsPartialDefaults(t *testing.T) {
 		t.Errorf("expected AutoDiscovery false to be preserved, got %v", loaded.AutoDiscovery)
 	}
 }
+
+func TestLoadOlderFileGetsDefaultsForNewSettings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dinis.json")
+	old := `{"cidrs":[],"exclusions":[],"hostMeta":{},"discoveredHosts":{},` +
+		`"settings":{"discoveryIntervalMin":60,"intervalSec":30,"timeoutMs":800,"failThreshold":3,"concurrency":50,"maxMetricHosts":2000,"autoDiscovery":false}}`
+	if err := os.WriteFile(path, []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("failed to load store: %v", err)
+	}
+	defer st.Close()
+
+	s := st.GetSettings()
+	if s.DownProbeIntervalSec != 300 {
+		t.Errorf("expected missing downProbeIntervalSec to default to 300, got %d", s.DownProbeIntervalSec)
+	}
+	if s.IntervalSec != 30 || s.AutoDiscovery || s.MaxMetricHosts != 2000 {
+		t.Errorf("expected stored settings to be kept, got %+v", s)
+	}
+
+	s.DownProbeIntervalSec = 0
+	if err := st.UpdateSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	st2, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("failed to reload store: %v", err)
+	}
+	defer st2.Close()
+	if got := st2.GetSettings().DownProbeIntervalSec; got != 0 {
+		t.Errorf("expected an explicit 0 to be kept, got %d", got)
+	}
+}
+
+func TestAlertStateFile(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(filepath.Join(dir, "dinis.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if want := filepath.Join(dir, "dinis.alerts.json"); st.AlertStatePath() != want {
+		t.Errorf("expected alert state path %s, got %s", want, st.AlertStatePath())
+	}
+
+	var v map[string]int
+	if ok, err := st.LoadAlertState(&v); err != nil || ok {
+		t.Fatalf("expected no saved state yet, got ok=%v err=%v", ok, err)
+	}
+	if err := st.SaveAlertState(map[string]int{"active": 2}); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	if ok, err := st.LoadAlertState(&v); err != nil || !ok || v["active"] != 2 {
+		t.Fatalf("expected saved state back, got ok=%v err=%v v=%v", ok, err, v)
+	}
+}

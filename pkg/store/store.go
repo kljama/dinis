@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -54,6 +55,9 @@ type AppSettings struct {
 	Concurrency          int     `json:"concurrency"`
 	MaxMetricHosts       int     `json:"maxMetricHosts"` // Capacity limit for time-series metric retention
 	AutoDiscovery        bool    `json:"autoDiscovery"`
+	// DownProbeIntervalSec: hosts DOWN for at least this long are probed this often (if longer
+	// than their normal interval). 0 probes DOWN hosts at their normal interval.
+	DownProbeIntervalSec int `json:"downProbeIntervalSec"`
 }
 
 // DefaultSettings returns safe production defaults.
@@ -66,6 +70,7 @@ func DefaultSettings() AppSettings {
 		Concurrency:          100,
 		MaxMetricHosts:       10000,
 		AutoDiscovery:        true,
+		DownProbeIntervalSec: 300, // 5 minutes
 	}
 }
 
@@ -84,6 +89,8 @@ type Store struct {
 	filePath string
 	lockFile *os.File
 	data     StoreData
+
+	alertMu sync.Mutex // serializes writes of the alert state file
 }
 
 // NewStore initializes or loads the persistent store from the specified file path.
@@ -173,7 +180,9 @@ func (s *Store) load() error {
 		return fmt.Errorf("failed to read store file %s: %w", s.filePath, err)
 	}
 
-	var data StoreData
+	// Decode on top of the defaults so settings added in newer versions get their default
+	// value instead of zero when an older file is loaded.
+	data := StoreData{Settings: DefaultSettings()}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fmt.Errorf("failed to parse JSON from %s: %w", s.filePath, err)
 	}
@@ -212,18 +221,23 @@ func (s *Store) load() error {
 }
 
 func (s *Store) saveUnsafe() error {
-	dir := filepath.Dir(s.filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
-	}
-
 	// Compact JSON serialization eliminates indentation overhead and cuts disk I/O by ~50%
 	raw, err := json.Marshal(s.data)
 	if err != nil {
 		return fmt.Errorf("failed to encode store data: %w", err)
 	}
+	return writeFileAtomic(s.filePath, raw)
+}
 
-	tmpFile := s.filePath + ".tmp"
+// writeFileAtomic writes data to a temporary file, syncs it and renames it over path, so a
+// crash leaves either the old or the new content.
+func writeFileAtomic(path string, raw []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	tmpFile := path + ".tmp"
 	f, err := os.Create(tmpFile)
 	if err != nil {
 		return fmt.Errorf("failed to create tmp file: %w", err)
@@ -243,12 +257,45 @@ func (s *Store) saveUnsafe() error {
 		return fmt.Errorf("failed to close tmp file: %w", err)
 	}
 
-	if err := os.Rename(tmpFile, s.filePath); err != nil {
+	if err := os.Rename(tmpFile, path); err != nil {
 		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to atomic rename tmp file: %w", err)
 	}
 
 	return nil
+}
+
+// AlertStatePath returns the file that holds alert state, next to the data file
+// (data/dinis.json -> data/dinis.alerts.json).
+func (s *Store) AlertStatePath() string {
+	return strings.TrimSuffix(s.filePath, filepath.Ext(s.filePath)) + ".alerts.json"
+}
+
+// LoadAlertState decodes the saved alert state into v. It reports false if none has been
+// saved yet.
+func (s *Store) LoadAlertState(v interface{}) (bool, error) {
+	raw, err := os.ReadFile(s.AlertStatePath())
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read alert state %s: %w", s.AlertStatePath(), err)
+	}
+	if err := json.Unmarshal(raw, v); err != nil {
+		return false, fmt.Errorf("failed to parse alert state %s: %w", s.AlertStatePath(), err)
+	}
+	return true, nil
+}
+
+// SaveAlertState writes v as the alert state file. It does not touch the main data file.
+func (s *Store) SaveAlertState(v interface{}) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("failed to encode alert state: %w", err)
+	}
+	s.alertMu.Lock()
+	defer s.alertMu.Unlock()
+	return writeFileAtomic(s.AlertStatePath(), raw)
 }
 
 // GetCIDRs returns all configured CIDRs.

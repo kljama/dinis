@@ -94,7 +94,8 @@ def run_tests():
     # 4. Trigger Discovery Sweep
     print("[TEST 4] Running Discovery Sweep...")
     status, raw = post("/api/discovery/run", {"cidr": "192.0.2.0/28"})
-    assert status == 200
+    # 202: adding the CIDR already started a sweep; this one is queued behind it
+    assert status in (200, 202), f"unexpected status {status}"
     time.sleep(4)
 
     # Verify that unallocated offline IPs were NOT added to active monitoring

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dinis/pkg/alerts"
@@ -50,6 +51,7 @@ const (
 	discoveryRateLimitInterval = 30 * time.Second
 	streamTicketTTL            = 30 * time.Second
 	snapshotCacheTTL           = 1 * time.Second
+	alertSaveInterval          = 5 * time.Second
 )
 
 // Coordinator orchestrates between Storage, CIDR Engine, ICMP Engine, and Alert Manager.
@@ -71,6 +73,15 @@ type Coordinator struct {
 	discoveryLastTriggered time.Time // rate-limit manual discovery
 	maxSSEClients          int
 
+	// Discovery queue (guarded by discMu). Sweeps requested while one runs are queued and
+	// run when it finishes; a queued full sweep covers queued single CIDRs.
+	discRunnerActive bool
+	discPendingAll   bool
+	discPending      map[string]bool
+	lastFullSweep    time.Time // periodic sweeps are scheduled from the last full sweep
+
+	alertsSavedVersion atomic.Uint64 // alert manager version last written to disk
+
 	// Short-lived cache of expensive full-snapshot API responses (matrix, outliers)
 	snapMu    sync.Mutex
 	snapCache map[string]cachedSnapshot
@@ -89,16 +100,26 @@ func NewCoordinator(st *store.Store) *Coordinator {
 		maxMetricHosts = 10000
 	}
 	cfg := pinger.EngineConfig{
-		Interval:       time.Duration(settings.IntervalSec * float64(time.Second)),
-		Timeout:        time.Duration(settings.TimeoutMs) * time.Millisecond,
-		Concurrency:    settings.Concurrency,
-		FailThreshold:  settings.FailThreshold,
-		HistorySize:    25,
-		MaxMetricHosts: maxMetricHosts,
+		Interval:          time.Duration(settings.IntervalSec * float64(time.Second)),
+		Timeout:           time.Duration(settings.TimeoutMs) * time.Millisecond,
+		Concurrency:       settings.Concurrency,
+		FailThreshold:     settings.FailThreshold,
+		HistorySize:       25,
+		MaxMetricHosts:    maxMetricHosts,
+		DownProbeInterval: time.Duration(settings.DownProbeIntervalSec) * time.Second,
 	}
 
 	p := pinger.NewEngine(cfg)
 	altMgr := alerts.NewManager(500)
+
+	// Restore alerts, acknowledgements and history from the previous run
+	var savedAlerts alerts.State
+	if ok, err := st.LoadAlertState(&savedAlerts); err != nil {
+		log.Printf("[DINIS] Warning: could not restore alert state: %v", err)
+	} else if ok {
+		altMgr.ImportState(savedAlerts)
+		log.Printf("[DINIS] Restored %d active alerts and %d resolved alerts", len(savedAlerts.Active), len(savedAlerts.History))
+	}
 
 	c := &Coordinator{
 		store:         st,
@@ -108,10 +129,12 @@ func NewCoordinator(st *store.Store) *Coordinator {
 		stopChan:      make(chan struct{}),
 		maxSSEClients: defaultMaxSSEClients,
 		snapCache:     make(map[string]cachedSnapshot),
+		discPending:   make(map[string]bool),
 		discoveryStatus: DiscoveryStatus{
 			IntervalMin: settings.DiscoveryIntervalMin,
 		},
 	}
+	c.alertsSavedVersion.Store(altMgr.Version())
 
 	// Wire engine callbacks
 	p.BeforeStateChange = c.handleBeforeStateChange
@@ -138,7 +161,7 @@ func NewCoordinator(st *store.Store) *Coordinator {
 // Start begins background monitoring and heartbeat routines.
 func (c *Coordinator) Start() {
 	c.pinger.Start()
-	c.wg.Add(2)
+	c.wg.Add(3)
 	go func() {
 		defer c.wg.Done()
 		c.heartbeatLoop()
@@ -146,6 +169,10 @@ func (c *Coordinator) Start() {
 	go func() {
 		defer c.wg.Done()
 		c.discoveryLoop()
+	}()
+	go func() {
+		defer c.wg.Done()
+		c.alertPersistLoop()
 	}()
 }
 
@@ -155,6 +182,7 @@ func (c *Coordinator) Stop() {
 		close(c.stopChan)
 		c.wg.Wait()
 		c.pinger.Stop()
+		c.saveAlertState() // final state, after the last probe results are in
 
 		c.clientsMu.Lock()
 		for ch := range c.sseClients {
@@ -180,6 +208,7 @@ func (c *Coordinator) RebuildTargetList() {
 	exclusions := c.store.GetExclusions()
 	discovered := c.store.GetDiscoveredHosts()
 	allMeta := c.store.GetAllHostMeta()
+	failThreshold := c.store.GetSettings().FailThreshold
 
 	matcher := network.NewExclusionMatcher()
 	for _, excl := range exclusions {
@@ -316,12 +345,15 @@ func (c *Coordinator) RebuildTargetList() {
 		}
 
 		status := pinger.StatusPending
+		existing, inEngine := c.pinger.GetHost(ip)
 		if matched {
 			status = pinger.StatusExcluded
-		} else if existing, ok := c.pinger.GetHost(ip); ok {
+		} else if inEngine {
 			// Retain existing live status (e.g. UP, DOWN) across rebuilds
 			status = existing.Status
 		}
+		var consecutiveFails int
+		var lastStateChange *time.Time
 
 		activeAlert, hasAlert := c.alerts.GetAlertForIP(ip)
 		alertActive := false
@@ -341,6 +373,15 @@ func (c *Coordinator) RebuildTargetList() {
 			alertAckAt = activeAlert.AcknowledgedAt
 			alertStartedAt = &activeAlert.StartedAt
 			c.alerts.UpdateAlertMetadata(ip, alias, hostCIDR)
+
+			if !inEngine {
+				// Alert restored after a restart: the host stays DOWN until a probe shows
+				// otherwise, so the outage keeps its alert, start time and acknowledgement.
+				status = pinger.StatusDown
+				consecutiveFails = failThreshold
+				startedAt := activeAlert.StartedAt
+				lastStateChange = &startedAt
+			}
 		}
 
 		discAt := disc.DiscoveredAt
@@ -352,6 +393,8 @@ func (c *Coordinator) RebuildTargetList() {
 			Notes:             meta.Notes,
 			CIDR:              hostCIDR,
 			Status:            status,
+			ConsecutiveFails:  consecutiveFails,
+			LastStateChange:   lastStateChange,
 			IsExcluded:        matched,
 			ExclusionReason:   reason,
 			DiscoveredAt:      &discAt,
@@ -447,19 +490,132 @@ func (c *Coordinator) DeleteCIDR(cidr string) error {
 	return nil
 }
 
-// RunDiscovery performs a concurrent ICMP discovery sweep across candidate IPs in the CIDR ranges.
+// RunDiscovery runs a discovery sweep synchronously, of all enabled CIDRs or only
+// specificCIDR, followed by any sweeps requested while it ran. It fails if a sweep is
+// already running.
 func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 	c.discMu.Lock()
-	if c.discoveryStatus.IsScanning {
+	if c.discRunnerActive {
 		c.discMu.Unlock()
 		return 0, 0, fmt.Errorf("discovery scan is already running")
 	}
+	c.discRunnerActive = true
 	c.discoveryStatus.IsScanning = true
 	c.discMu.Unlock()
 
+	var only []string
+	if specificCIDR != "" {
+		only = []string{specificCIDR}
+	}
+	online, newCount, aborted := c.runSweep(specificCIDR == "", only)
+	if aborted {
+		c.endDiscovery()
+	} else {
+		c.runQueuedDiscovery()
+	}
+	return online, newCount, nil
+}
+
+// RequestDiscovery asks for a sweep of one CIDR, or of all enabled CIDRs if cidr is empty.
+// If a sweep is already running, the request is queued and runs when that sweep finishes.
+// accepted is false only while the coordinator shuts down.
+func (c *Coordinator) RequestDiscovery(cidr string) (accepted, queued bool) {
+	c.discMu.Lock()
+	select {
+	case <-c.stopChan:
+		c.discMu.Unlock()
+		return false, false
+	default:
+	}
+	if cidr == "" {
+		c.discPendingAll = true
+	} else {
+		c.discPending[cidr] = true
+	}
+	c.discoveryStatus.IsScanning = true
+	if c.discRunnerActive {
+		c.discMu.Unlock()
+		return true, true
+	}
+	c.discRunnerActive = true
+	c.wg.Add(1)
+	c.discMu.Unlock()
+
+	go func() {
+		defer c.wg.Done()
+		c.runQueuedDiscovery()
+	}()
+	return true, false
+}
+
+// TriggerDiscovery requests a sweep asynchronously (see RequestDiscovery). Returns false if
+// the server is shutting down.
+func (c *Coordinator) TriggerDiscovery(specificCIDR string) bool {
+	accepted, _ := c.RequestDiscovery(specificCIDR)
+	return accepted
+}
+
+// runQueuedDiscovery runs queued sweeps until none are left, then marks discovery idle.
+func (c *Coordinator) runQueuedDiscovery() {
+	for {
+		c.discMu.Lock()
+		all := c.discPendingAll
+		var only []string
+		if !all {
+			for cidr := range c.discPending {
+				only = append(only, cidr)
+			}
+			sort.Strings(only)
+		}
+		c.discPendingAll = false
+		c.discPending = make(map[string]bool)
+		if !all && len(only) == 0 {
+			c.discRunnerActive = false
+			c.discoveryStatus.IsScanning = false
+			c.discMu.Unlock()
+			return
+		}
+		c.discMu.Unlock()
+
+		if _, _, aborted := c.runSweep(all, only); aborted {
+			c.endDiscovery()
+			return
+		}
+	}
+}
+
+// endDiscovery marks discovery idle and drops queued sweeps (used when shutting down).
+func (c *Coordinator) endDiscovery() {
+	c.discMu.Lock()
+	c.discRunnerActive = false
+	c.discoveryStatus.IsScanning = false
+	c.discPendingAll = false
+	c.discPending = make(map[string]bool)
+	c.discMu.Unlock()
+}
+
+// updateNextRunUnsafe sets NextRun from the last full sweep. Caller holds discMu.
+func (c *Coordinator) updateNextRunUnsafe(intervalMin int) {
+	if intervalMin <= 0 || c.lastFullSweep.IsZero() {
+		c.discoveryStatus.NextRun = nil
+		return
+	}
+	next := c.lastFullSweep.Add(time.Duration(intervalMin) * time.Minute)
+	c.discoveryStatus.NextRun = &next
+}
+
+// runSweep probes every address of the selected CIDRs once and enrolls the hosts that
+// answer: every enabled CIDR if all is set, otherwise only those listed in only. It reports
+// aborted if the coordinator stopped during the sweep.
+func (c *Coordinator) runSweep(all bool, only []string) (discoveredOnline, newDiscovered int, aborted bool) {
+	selected := make(map[string]bool, len(only))
+	for _, cidr := range only {
+		selected[cidr] = true
+	}
+
 	c.broadcastEvent("discovery_started", map[string]interface{}{
-		"specificCIDR": specificCIDR,
-		"timestamp":    time.Now(),
+		"cidrs":     only,
+		"timestamp": time.Now(),
 	})
 
 	cidrs := c.store.GetCIDRs()
@@ -482,7 +638,7 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 		if !cfg.Enabled {
 			continue
 		}
-		if specificCIDR != "" && cfg.CIDR != specificCIDR {
+		if !all && !selected[cfg.CIDR] {
 			continue
 		}
 
@@ -499,178 +655,149 @@ func (c *Coordinator) RunDiscovery(specificCIDR string) (int, int, error) {
 	}
 
 	settings := c.store.GetSettings()
-	if len(targets) == 0 {
-		now := time.Now()
-		c.discMu.Lock()
-		c.discoveryStatus.IsScanning = false
-		c.discoveryStatus.LastRun = &now
-		if settings.DiscoveryIntervalMin > 0 {
-			next := now.Add(time.Duration(settings.DiscoveryIntervalMin) * time.Minute)
-			c.discoveryStatus.NextRun = &next
-		} else {
-			c.discoveryStatus.NextRun = nil
+	if len(targets) > 0 {
+		prober := pinger.NewSingleProber()
+		defer prober.Close()
+		concurrency := settings.Concurrency
+		if concurrency <= 0 {
+			concurrency = 100
 		}
-		c.discoveryStatus.LastScannedCount = 0
-		c.discoveryStatus.LastDiscoveredCount = len(c.store.GetDiscoveredHosts())
-		statusCpy := c.discoveryStatus
-		c.discMu.Unlock()
-
-		c.broadcastEvent("discovery_completed", map[string]interface{}{
-			"status":           statusCpy,
-			"discoveredOnline": 0,
-			"newDiscovered":    0,
-			"scannedCount":     0,
-		})
-
-		return 0, 0, nil
-	}
-
-	prober := pinger.NewSingleProber()
-	defer prober.Close()
-	concurrency := settings.Concurrency
-	if concurrency <= 0 {
-		concurrency = 100
-	}
-	if concurrency > len(targets) {
-		concurrency = len(targets)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		select {
-		case <-c.stopChan:
-			cancel()
-		case <-ctx.Done():
+		if concurrency > len(targets) {
+			concurrency = len(targets)
 		}
-	}()
 
-	workChan := make(chan candidate, concurrency*2)
-	var discoveredMu sync.Mutex
-	discoveredOnline := 0
-	newDiscovered := 0
-	existingDiscovered := c.store.GetDiscoveredHosts()
-	var discoveredBatch []store.DiscoveredHost
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(concurrency)
-
-	for w := 0; w < concurrency; w++ {
 		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case cand, ok := <-workChan:
-					if !ok {
-						return
-					}
-					res := prober.Probe(ctx, cand.ip, 750*time.Millisecond)
-					if res.Success {
-						now := time.Now()
-						discoveredMu.Lock()
-						discoveredOnline++
-						discAt := now
-						isStatic := false
-						if existing, exists := existingDiscovered[cand.ip]; exists {
-							discAt = existing.DiscoveredAt
-							isStatic = existing.IsStatic
-						} else {
-							newDiscovered++
-						}
-						discoveredBatch = append(discoveredBatch, store.DiscoveredHost{
-							IP:             cand.ip,
-							CIDR:           cand.cidr,
-							DiscoveredAt:   discAt,
-							LastDiscovered: now,
-							IsStatic:       isStatic,
-						})
-						discoveredMu.Unlock()
-					}
-				}
+			select {
+			case <-c.stopChan:
+				cancel()
+			case <-ctx.Done():
 			}
 		}()
-	}
 
-	// Paced discovery feeder: slight spacing to prevent ARP / NIC bursts on large ranges
-	var discPace time.Duration
-	if len(targets) > 50 {
-		// Space discovery across ~2 to 5 seconds depending on range size
-		discPace = (3 * time.Second) / time.Duration(len(targets))
-		if discPace > 20*time.Millisecond {
-			discPace = 20 * time.Millisecond
-		}
-	}
+		workChan := make(chan candidate, concurrency*2)
+		var discoveredMu sync.Mutex
+		discoveredOnline, newDiscovered = 0, 0
+		existingDiscovered := c.store.GetDiscoveredHosts()
+		var discoveredBatch []store.DiscoveredHost
 
-	var paceTimer *time.Timer
-	if discPace > 0 {
-		paceTimer = time.NewTimer(discPace)
-		defer paceTimer.Stop()
-	}
+		var wg sync.WaitGroup
+		wg.Add(concurrency)
 
-	aborted := false
-feeder:
-	for _, t := range targets {
-		select {
-		case <-ctx.Done():
-			aborted = true
-			break feeder
-		case workChan <- t:
-		}
-
-		if paceTimer != nil {
-			if !paceTimer.Stop() {
-				select {
-				case <-paceTimer.C:
-				default:
+		for w := 0; w < concurrency; w++ {
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case cand, ok := <-workChan:
+						if !ok {
+							return
+						}
+						res := prober.Probe(ctx, cand.ip, 750*time.Millisecond)
+						if res.Success {
+							now := time.Now()
+							discoveredMu.Lock()
+							discoveredOnline++
+							discAt := now
+							isStatic := false
+							if existing, exists := existingDiscovered[cand.ip]; exists {
+								discAt = existing.DiscoveredAt
+								isStatic = existing.IsStatic
+							} else {
+								newDiscovered++
+							}
+							discoveredBatch = append(discoveredBatch, store.DiscoveredHost{
+								IP:             cand.ip,
+								CIDR:           cand.cidr,
+								DiscoveredAt:   discAt,
+								LastDiscovered: now,
+								IsStatic:       isStatic,
+							})
+							discoveredMu.Unlock()
+						}
+					}
 				}
+			}()
+		}
+
+		// Paced discovery feeder: slight spacing to prevent ARP / NIC bursts on large ranges
+		var discPace time.Duration
+		if len(targets) > 50 {
+			// Space discovery across ~2 to 5 seconds depending on range size
+			discPace = (3 * time.Second) / time.Duration(len(targets))
+			if discPace > 20*time.Millisecond {
+				discPace = 20 * time.Millisecond
 			}
-			paceTimer.Reset(discPace)
+		}
+
+		var paceTimer *time.Timer
+		if discPace > 0 {
+			paceTimer = time.NewTimer(discPace)
+			defer paceTimer.Stop()
+		}
+
+		aborted = false
+	feeder:
+		for _, t := range targets {
 			select {
 			case <-ctx.Done():
 				aborted = true
 				break feeder
-			case <-paceTimer.C:
+			case workChan <- t:
+			}
+
+			if paceTimer != nil {
+				if !paceTimer.Stop() {
+					select {
+					case <-paceTimer.C:
+					default:
+					}
+				}
+				paceTimer.Reset(discPace)
+				select {
+				case <-ctx.Done():
+					aborted = true
+					break feeder
+				case <-paceTimer.C:
+				}
 			}
 		}
-	}
-	close(workChan)
+		close(workChan)
 
-	wg.Wait()
+		wg.Wait()
 
-	// Batch-write all discovered hosts to disk in a single atomic operation,
-	// ensuring any partially-discovered hosts are persisted even during shutdown.
-	if len(discoveredBatch) > 0 {
-		if err := c.store.AddOrUpdateDiscoveredHostsBatch(discoveredBatch); err != nil {
-			log.Printf("[DINIS] Error persisting discovered hosts batch to disk: %v", err)
+		// Batch-write all discovered hosts to disk in a single atomic operation,
+		// ensuring any partially-discovered hosts are persisted even during shutdown.
+		if len(discoveredBatch) > 0 {
+			if err := c.store.AddOrUpdateDiscoveredHostsBatch(discoveredBatch); err != nil {
+				log.Printf("[DINIS] Error persisting discovered hosts batch to disk: %v", err)
+			}
 		}
-	}
 
-	if aborted {
-		c.discMu.Lock()
-		c.discoveryStatus.IsScanning = false
-		c.discMu.Unlock()
-		return discoveredOnline, newDiscovered, nil
-	}
+		if aborted {
+			return discoveredOnline, newDiscovered, true
+		}
 
-	// Rebuild target list so newly discovered hosts are immediately monitored
-	c.RebuildTargetList()
-	c.pinger.TriggerSweep()
+		// Rebuild target list so newly discovered hosts are monitored right away
+		c.RebuildTargetList()
+		c.pinger.TriggerSweep()
+	}
 
 	now := time.Now()
 	c.discMu.Lock()
-	c.discoveryStatus.IsScanning = false
 	c.discoveryStatus.LastRun = &now
-	if settings.DiscoveryIntervalMin > 0 {
-		next := now.Add(time.Duration(settings.DiscoveryIntervalMin) * time.Minute)
-		c.discoveryStatus.NextRun = &next
-	} else {
-		c.discoveryStatus.NextRun = nil
+	if all {
+		c.lastFullSweep = now
 	}
+	c.updateNextRunUnsafe(settings.DiscoveryIntervalMin)
 	c.discoveryStatus.LastScannedCount = len(targets)
 	c.discoveryStatus.LastDiscoveredCount = len(c.store.GetDiscoveredHosts())
+	// Still "scanning" while more sweeps are queued
+	c.discoveryStatus.IsScanning = c.discPendingAll || len(c.discPending) > 0
 	statusCpy := c.discoveryStatus
 	c.discMu.Unlock()
 
@@ -681,28 +808,7 @@ feeder:
 		"scannedCount":     len(targets),
 	})
 
-	return discoveredOnline, newDiscovered, nil
-}
-
-// TriggerDiscovery initiates a discovery sweep asynchronously. Returns false if server is shutting down.
-func (c *Coordinator) TriggerDiscovery(specificCIDR string) bool {
-	c.discMu.Lock()
-	select {
-	case <-c.stopChan:
-		c.discMu.Unlock()
-		return false
-	default:
-	}
-	c.wg.Add(1)
-	c.discMu.Unlock()
-
-	go func() {
-		defer c.wg.Done()
-		if _, _, err := c.RunDiscovery(specificCIDR); err != nil {
-			log.Printf("[DINIS] Triggered discovery sweep error: %v", err)
-		}
-	}()
-	return true
+	return discoveredOnline, newDiscovered, false
 }
 
 // GetDiscoveryStatus returns a copy of current discovery status.
@@ -713,17 +819,15 @@ func (c *Coordinator) GetDiscoveryStatus() DiscoveryStatus {
 }
 
 func (c *Coordinator) discoveryLoop() {
-	// Run initial discovery sweep on startup after a 5s warmup to avoid colliding with initial engine cycle
+	// Initial discovery sweep 5s after startup, to avoid colliding with the first probes.
+	// If a sweep is already running by then, it is queued behind it.
 	select {
 	case <-c.stopChan:
 		return
 	case <-time.After(5 * time.Second):
 	}
-	settings := c.store.GetSettings()
-	if settings.AutoDiscovery {
-		if _, _, err := c.RunDiscovery(""); err != nil {
-			log.Printf("[DINIS] Initial discovery sweep error: %v", err)
-		}
+	if c.store.GetSettings().AutoDiscovery {
+		c.RequestDiscovery("")
 	}
 
 	ticker := time.NewTicker(1 * time.Minute)
@@ -740,21 +844,47 @@ func (c *Coordinator) discoveryLoop() {
 			}
 
 			c.discMu.RLock()
-			lastRun := c.discoveryStatus.LastRun
-			isScanning := c.discoveryStatus.IsScanning
+			lastFull := c.lastFullSweep
+			busy := c.discRunnerActive
 			c.discMu.RUnlock()
 
-			if isScanning {
+			if busy {
 				continue
 			}
 
-			if lastRun == nil || time.Since(*lastRun) >= time.Duration(s.DiscoveryIntervalMin)*time.Minute {
-				if _, _, err := c.RunDiscovery(""); err != nil {
-					log.Printf("[DINIS] Periodic discovery sweep error: %v", err)
-				}
+			// Counted from the last full sweep: single-CIDR sweeps don't postpone it
+			if lastFull.IsZero() || time.Since(lastFull) >= time.Duration(s.DiscoveryIntervalMin)*time.Minute {
+				c.RequestDiscovery("")
 			}
 		}
 	}
+}
+
+// alertPersistLoop saves alert state while it changes, at most every alertSaveInterval.
+func (c *Coordinator) alertPersistLoop() {
+	ticker := time.NewTicker(alertSaveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			c.saveAlertState()
+		}
+	}
+}
+
+// saveAlertState writes active alerts and history to disk if they changed since the last save.
+func (c *Coordinator) saveAlertState() {
+	v := c.alerts.Version()
+	if v == c.alertsSavedVersion.Load() {
+		return
+	}
+	if err := c.store.SaveAlertState(c.alerts.ExportState()); err != nil {
+		log.Printf("[DINIS] Error saving alert state: %v", err)
+		return
+	}
+	c.alertsSavedVersion.Store(v)
 }
 
 func (c *Coordinator) handleBeforeStateChange(h *pinger.HostState, oldStatus, newStatus pinger.HostStatus) {
@@ -1609,8 +1739,16 @@ func (s *Server) handleDiscoveryRun(w http.ResponseWriter, r *http.Request) {
 		_ = decodeJSON(r, &req)
 	}
 
-	if !s.coord.TriggerDiscovery(req.CIDR) {
+	accepted, queued := s.coord.RequestDiscovery(req.CIDR)
+	if !accepted {
 		writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
+		return
+	}
+	if queued {
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
+			"message": "A discovery sweep is already running; this one is queued and starts when it finishes",
+			"queued":  true,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -2495,6 +2633,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		} else if req.MaxMetricHosts > 500000 {
 			req.MaxMetricHosts = 500000
 		}
+		if req.DownProbeIntervalSec < 0 {
+			req.DownProbeIntervalSec = 0
+		}
+		if req.DownProbeIntervalSec > 86400 {
+			req.DownProbeIntervalSec = 86400
+		}
 
 		if err := s.coord.store.UpdateSettings(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -2503,25 +2647,19 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 		// Update engine config live
 		s.coord.pinger.UpdateConfig(pinger.EngineConfig{
-			Interval:       time.Duration(req.IntervalSec * float64(time.Second)),
-			Timeout:        time.Duration(req.TimeoutMs) * time.Millisecond,
-			Concurrency:    req.Concurrency,
-			FailThreshold:  req.FailThreshold,
-			HistorySize:    25,
-			MaxMetricHosts: req.MaxMetricHosts,
+			Interval:          time.Duration(req.IntervalSec * float64(time.Second)),
+			Timeout:           time.Duration(req.TimeoutMs) * time.Millisecond,
+			Concurrency:       req.Concurrency,
+			FailThreshold:     req.FailThreshold,
+			HistorySize:       25,
+			MaxMetricHosts:    req.MaxMetricHosts,
+			DownProbeInterval: time.Duration(req.DownProbeIntervalSec) * time.Second,
 		})
 		s.coord.RebuildTargetList()
 
 		s.coord.discMu.Lock()
 		s.coord.discoveryStatus.IntervalMin = req.DiscoveryIntervalMin
-		if req.DiscoveryIntervalMin > 0 {
-			if s.coord.discoveryStatus.LastRun != nil {
-				next := s.coord.discoveryStatus.LastRun.Add(time.Duration(req.DiscoveryIntervalMin) * time.Minute)
-				s.coord.discoveryStatus.NextRun = &next
-			}
-		} else {
-			s.coord.discoveryStatus.NextRun = nil
-		}
+		s.coord.updateNextRunUnsafe(req.DiscoveryIntervalMin)
 		s.coord.discMu.Unlock()
 
 		writeJSON(w, http.StatusOK, req)

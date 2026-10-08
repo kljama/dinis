@@ -62,17 +62,21 @@ type EngineConfig struct {
 	FailThreshold  int
 	HistorySize    int
 	MaxMetricHosts int
+	// DownProbeInterval is how often a host that has been DOWN for at least this long is
+	// probed, when that is longer than its normal interval. 0 disables the back-off.
+	DownProbeInterval time.Duration
 }
 
 // DefaultConfig returns default engine settings.
 func DefaultConfig() EngineConfig {
 	return EngineConfig{
-		Interval:       60 * time.Second,
-		Timeout:        1000 * time.Millisecond,
-		Concurrency:    100,
-		FailThreshold:  2,
-		HistorySize:    20,
-		MaxMetricHosts: 10000,
+		Interval:          60 * time.Second,
+		Timeout:           1000 * time.Millisecond,
+		Concurrency:       100,
+		FailThreshold:     2,
+		HistorySize:       20,
+		MaxMetricHosts:    10000,
+		DownProbeInterval: 5 * time.Minute,
 	}
 }
 
@@ -93,28 +97,27 @@ type CycleSummary struct {
 	Timestamp      time.Time `json:"timestamp"`
 }
 
-type subnetRunner struct {
-	cidr     string
-	interval time.Duration
-	inFlight int32
-	wakeChan chan struct{}
-	stopChan chan struct{}
-}
-
-// Engine runs the periodic, high-concurrency ICMP probing loops across targets.
+// Engine probes every monitored host on its own schedule using a shared worker pool.
 type Engine struct {
 	mu      sync.RWMutex
-	cycleMu sync.Mutex
 	config  EngineConfig
 	prober  *SingleProber
 	tsStore *timeseries.Store
 
 	hosts           map[string]*HostState
 	subnetIntervals map[string]time.Duration
-	subnetRunners   map[string]*subnetRunner
-	runnerWg        sync.WaitGroup
 
-	workChan      chan string
+	// Probe schedule, guarded by mu (see schedule.go). Each probed host has an entry, queued
+	// by due time in healthyQ or, if its last probe failed, in suspectQ.
+	epoch           time.Time
+	sched           map[string]*schedEntry
+	healthyQ        schedHeap
+	suspectQ        schedHeap
+	suspectInFlight int
+	schedWake       chan struct{}
+	dispatchWg      sync.WaitGroup
+
+	workChan      chan probeJob
 	workerWg      sync.WaitGroup
 	workerStops   []chan struct{} // one stop channel per running worker
 	activeWorkers int32
@@ -125,11 +128,8 @@ type Engine struct {
 	OnStateChange     func(host *HostState, oldStatus, newStatus HostStatus)
 	OnProbeRecorded   func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time)
 
-	wakeChan chan struct{}
-
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
 }
 
 // NewEngine creates a new ICMP probing engine.
@@ -137,8 +137,8 @@ func NewEngine(cfg EngineConfig) *Engine {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 100
 	}
-	if cfg.Interval < 500*time.Millisecond {
-		cfg.Interval = 500 * time.Millisecond
+	if cfg.Interval < minProbeInterval {
+		cfg.Interval = minProbeInterval
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 1000 * time.Millisecond
@@ -161,8 +161,9 @@ func NewEngine(cfg EngineConfig) *Engine {
 		tsStore:         timeseries.NewStoreWithLimit(maxMetricHosts),
 		hosts:           make(map[string]*HostState),
 		subnetIntervals: make(map[string]time.Duration),
-		subnetRunners:   make(map[string]*subnetRunner),
-		wakeChan:        make(chan struct{}, 1),
+		epoch:           time.Now(),
+		sched:           make(map[string]*schedEntry),
+		schedWake:       make(chan struct{}, 1),
 	}
 }
 
@@ -171,19 +172,13 @@ func (e *Engine) GetTimeseriesStore() *timeseries.Store {
 	return e.tsStore
 }
 
-// Wake signals all subnet runners to immediately start a cycle.
+// Wake makes the dispatcher re-evaluate the probe schedule.
 func (e *Engine) Wake() {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	for _, sr := range e.subnetRunners {
-		select {
-		case sr.wakeChan <- struct{}{}:
-		default:
-		}
-	}
+	e.signalSchedule()
 }
 
-// UpdateConfig dynamically updates the engine configuration and wakes the polling loop.
+// UpdateConfig applies a new configuration. Interval changes take effect immediately: hosts
+// move to their slot in the new interval instead of finishing the old one.
 func (e *Engine) UpdateConfig(cfg EngineConfig) {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 100
@@ -196,7 +191,7 @@ func (e *Engine) UpdateConfig(cfg EngineConfig) {
 	if e.ctx != nil {
 		e.resizeWorkersUnsafe(cfg.Concurrency)
 	}
-	e.reconcileRunnersUnsafe()
+	e.schedSyncUnsafe()
 	e.mu.Unlock()
 	e.Wake()
 }
@@ -269,7 +264,7 @@ func (e *Engine) SetTargetsAndIntervals(hosts map[string]*HostState, subnetInter
 		e.tsStore.PruneHosts(activeIPs)
 	}
 
-	e.reconcileRunnersUnsafe()
+	e.schedSyncUnsafe()
 }
 
 // SetHosts updates the target host map, retaining existing subnet intervals atomically.
@@ -277,15 +272,16 @@ func (e *Engine) SetHosts(hosts map[string]*HostState) {
 	e.SetTargetsAndIntervals(hosts, nil)
 }
 
+// effectiveIntervalUnsafe returns the configured probe interval for hosts in a subnet.
 func (e *Engine) effectiveIntervalUnsafe(cidr string) time.Duration {
 	if interval, ok := e.subnetIntervals[cidr]; ok && interval > 0 {
-		if interval < 500*time.Millisecond {
-			return 500 * time.Millisecond
+		if interval < minProbeInterval {
+			return minProbeInterval
 		}
 		return interval
 	}
-	if e.config.Interval < 500*time.Millisecond {
-		return 500 * time.Millisecond
+	if e.config.Interval < minProbeInterval {
+		return minProbeInterval
 	}
 	return e.config.Interval
 }
@@ -347,7 +343,7 @@ func (e *Engine) GetSummary() CycleSummary {
 
 	var sumLatency float64
 	var upWithLatency int
-	subnetCounts := make(map[string]int)
+	var probesPerSec float64
 
 	for _, h := range e.hosts {
 		switch h.Status {
@@ -366,7 +362,7 @@ func (e *Engine) GetSummary() CycleSummary {
 		}
 
 		if !h.IsExcluded {
-			subnetCounts[h.CIDR]++
+			probesPerSec += 1 / e.probeIntervalUnsafe(h).Seconds()
 			if h.Status == StatusDown {
 				if h.AlertAcknowledged {
 					summary.AckCount++
@@ -385,38 +381,11 @@ func (e *Engine) GetSummary() CycleSummary {
 		summary.AvgLatencyMs = math.Round((sumLatency/float64(upWithLatency))*100) / 100
 	}
 
-	// Calculate pacing rates across subnets
-	activeTargets := summary.TotalTargets - summary.ExcludedCount
-	if activeTargets > 0 {
-		var totalPacketsPerSec float64
-		var sumWeightedPace float64
-		var totalPacedHosts int
-
-		for cidr, count := range subnetCounts {
-			interval := e.effectiveIntervalUnsafe(cidr)
-			if interval > 0 && count > 0 {
-				totalPacketsPerSec += float64(count) / interval.Seconds()
-
-				reserveTail := e.config.Timeout
-				if reserveTail > interval/2 {
-					reserveTail = interval / 2
-				}
-				dispatchWindow := interval - reserveTail
-				if dispatchWindow < 100*time.Millisecond {
-					dispatchWindow = interval
-				}
-				paceDelay := dispatchWindow / time.Duration(count)
-				sumWeightedPace += (float64(paceDelay.Microseconds()) / 1000.0) * float64(count)
-				totalPacedHosts += count
-			}
-		}
-
-		if totalPacketsPerSec > 0 {
-			summary.PacketsPerSec = math.Round(totalPacketsPerSec*10) / 10
-		}
-		if totalPacedHosts > 0 {
-			summary.PacedDelayMs = math.Round((sumWeightedPace/float64(totalPacedHosts))*100) / 100
-		}
+	// Probe rate across all scheduled hosts (including backed-off DOWN hosts) and the
+	// average gap between two consecutive probes.
+	if probesPerSec > 0 {
+		summary.PacketsPerSec = math.Round(probesPerSec*10) / 10
+		summary.PacedDelayMs = math.Round((1000/probesPerSec)*100) / 100
 	}
 
 	return summary
@@ -437,73 +406,17 @@ func (e *Engine) SetHostAlertState(ip string, active bool, id string, ack bool, 
 	}
 }
 
-// TriggerSweep asynchronously initiates an immediate probing round.
+// TriggerSweep makes the dispatcher pick up schedule changes immediately. New hosts are
+// probed within newHostSpread regardless.
 func (e *Engine) TriggerSweep() {
 	e.Wake()
 }
 
-func (e *Engine) reconcileRunnersUnsafe() {
-	if e.ctx == nil {
-		return
-	}
-
-	neededRunners := make(map[string]time.Duration)
-	for cidr, interval := range e.subnetIntervals {
-		if interval > 0 {
-			neededRunners[cidr] = interval
-		} else {
-			neededRunners[cidr] = e.config.Interval
-		}
-	}
-
-	// Check if we need default runner for unassigned/static targets
-	hasUnassigned := false
-	for _, h := range e.hosts {
-		if h.CIDR == "" {
-			hasUnassigned = true
-			break
-		}
-		if _, exists := neededRunners[h.CIDR]; !exists {
-			hasUnassigned = true
-			break
-		}
-	}
-	if hasUnassigned || len(neededRunners) == 0 {
-		neededRunners[""] = e.config.Interval
-	}
-
-	// Stop runners no longer needed, and update interval in-place if changed
-	for cidr, r := range e.subnetRunners {
-		expectedInterval, exists := neededRunners[cidr]
-		if !exists {
-			close(r.stopChan)
-			delete(e.subnetRunners, cidr)
-		} else if expectedInterval != r.interval {
-			r.interval = expectedInterval
-		}
-	}
-
-	// Start new runners
-	for cidr, interval := range neededRunners {
-		if _, running := e.subnetRunners[cidr]; !running {
-			sr := &subnetRunner{
-				cidr:     cidr,
-				interval: interval,
-				wakeChan: make(chan struct{}, 1),
-				stopChan: make(chan struct{}),
-			}
-			e.subnetRunners[cidr] = sr
-			e.runnerWg.Add(1)
-			go e.runSubnetLoop(sr)
-		}
-	}
-}
-
-// Start starts the background polling loops and shared worker pool.
+// Start starts the probe dispatcher and the shared worker pool.
 func (e *Engine) Start() {
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.ctx != nil {
-		e.mu.Unlock()
 		return
 	}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
@@ -515,29 +428,34 @@ func (e *Engine) Start() {
 	if numWorkers <= 0 {
 		numWorkers = 100
 	}
-	e.workChan = make(chan string, numWorkers*2)
+	// Unbuffered: the dispatcher decides which probe goes next when a worker is free.
+	e.workChan = make(chan probeJob)
 	e.resizeWorkersUnsafe(numWorkers)
 
-	e.reconcileRunnersUnsafe()
-	e.mu.Unlock()
+	// First probes fall on each host's slot, spread over one interval.
+	e.sched = make(map[string]*schedEntry, len(e.hosts))
+	e.healthyQ, e.suspectQ = nil, nil
+	e.suspectInFlight = 0
+	for _, h := range e.hosts {
+		e.schedAddUnsafe(h, true)
+	}
+
+	e.dispatchWg.Add(1)
+	go e.dispatchLoop(e.ctx, e.workChan)
 }
 
-// Stop stops all background polling loops and closes prober socket resources.
+// Stop stops the dispatcher and workers and closes prober socket resources.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if e.cancel != nil {
 		e.cancel()
-	}
-	for cidr, r := range e.subnetRunners {
-		close(r.stopChan)
-		delete(e.subnetRunners, cidr)
 	}
 	if e.tsStore != nil {
 		e.tsStore.Stop()
 	}
 	e.mu.Unlock()
 
-	e.runnerWg.Wait()
+	e.dispatchWg.Wait()
 
 	e.mu.Lock()
 	if e.workChan != nil {
@@ -550,6 +468,9 @@ func (e *Engine) Stop() {
 	e.mu.Lock()
 	e.workChan = nil
 	e.workerStops = nil
+	e.sched = make(map[string]*schedEntry)
+	e.healthyQ, e.suspectQ = nil, nil
+	e.suspectInFlight = 0
 	e.ctx = nil
 	e.cancel = nil
 	e.mu.Unlock()
@@ -576,6 +497,7 @@ func (e *Engine) resizeWorkersUnsafe(n int) {
 		close(e.workerStops[last])
 		e.workerStops = e.workerStops[:last]
 	}
+	e.signalSchedule() // the suspect cap depends on the pool size
 }
 
 // ActiveWorkers returns the number of running probe workers.
@@ -583,7 +505,7 @@ func (e *Engine) ActiveWorkers() int {
 	return int(atomic.LoadInt32(&e.activeWorkers))
 }
 
-func (e *Engine) workerLoop(ctx context.Context, workChan <-chan string, stop <-chan struct{}) {
+func (e *Engine) workerLoop(ctx context.Context, workChan <-chan probeJob, stop <-chan struct{}) {
 	atomic.AddInt32(&e.activeWorkers, 1)
 	defer atomic.AddInt32(&e.activeWorkers, -1)
 	defer e.workerWg.Done()
@@ -593,16 +515,16 @@ func (e *Engine) workerLoop(ctx context.Context, workChan <-chan string, stop <-
 			return
 		case <-stop:
 			return
-		case ip, ok := <-workChan:
+		case job, ok := <-workChan:
 			if !ok {
 				return
 			}
-			e.probeAndApply(ip)
+			e.probeAndApply(job)
 		}
 	}
 }
 
-func (e *Engine) probeAndApply(ip string) {
+func (e *Engine) probeAndApply(job probeJob) {
 	e.mu.RLock()
 	timeout := e.config.Timeout
 	ctx := e.ctx
@@ -613,11 +535,16 @@ func (e *Engine) probeAndApply(ip string) {
 		probeCtx = ctx
 	}
 
-	res := e.prober.Probe(probeCtx, ip, timeout)
+	res := e.prober.Probe(probeCtx, job.ip, timeout)
 
 	e.mu.Lock()
-	h, exists := e.hosts[ip]
+	if job.suspect {
+		e.suspectInFlight--
+		e.signalSchedule() // a suspect slot is free again
+	}
+	h, exists := e.hosts[job.ip]
 	if !exists || h.IsExcluded {
+		e.schedDoneUnsafe(job.ip, nil)
 		e.mu.Unlock()
 		return
 	}
@@ -630,6 +557,7 @@ func (e *Engine) probeAndApply(ip string) {
 	if statusChanged && e.BeforeStateChange != nil {
 		e.BeforeStateChange(h, oldStatus, newStatus)
 	}
+	e.schedDoneUnsafe(job.ip, h)
 
 	cpy := *h
 	cpy.LatencyHistory = append([]float64(nil), h.LatencyHistory...)
@@ -682,122 +610,6 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 	}
 
 	return res
-}
-
-func (e *Engine) runSubnetLoop(sr *subnetRunner) {
-	defer e.runnerWg.Done()
-
-	for {
-		select {
-		case <-e.ctx.Done():
-			return
-		case <-sr.stopChan:
-			return
-		default:
-		}
-
-		cycleStart := time.Now()
-		e.runSubnetCycle(sr)
-
-		e.mu.RLock()
-		interval := sr.interval
-		if interval <= 0 {
-			interval = e.config.Interval
-		}
-		e.mu.RUnlock()
-
-		elapsed := time.Since(cycleStart)
-		remaining := interval - elapsed
-		if remaining > 10*time.Millisecond {
-			select {
-			case <-e.ctx.Done():
-				return
-			case <-sr.stopChan:
-				return
-			case <-sr.wakeChan:
-			case <-time.After(remaining):
-			}
-		}
-	}
-}
-
-func (e *Engine) runSubnetCycle(sr *subnetRunner) {
-	if !atomic.CompareAndSwapInt32(&sr.inFlight, 0, 1) {
-		return
-	}
-	defer atomic.StoreInt32(&sr.inFlight, 0)
-
-	e.mu.RLock()
-	targets := make([]string, 0)
-	for ip, h := range e.hosts {
-		if !h.IsExcluded {
-			if sr.cidr == "" {
-				if _, hasExplicit := e.subnetIntervals[h.CIDR]; !hasExplicit {
-					targets = append(targets, ip)
-				}
-			} else if h.CIDR == sr.cidr {
-				targets = append(targets, ip)
-			}
-		}
-	}
-	timeout := e.config.Timeout
-	interval := sr.interval
-	if interval <= 0 {
-		interval = e.config.Interval
-	}
-	e.mu.RUnlock()
-
-	if len(targets) == 0 {
-		return
-	}
-
-	reserveTail := timeout
-	if reserveTail > interval/2 {
-		reserveTail = interval / 2
-	}
-	dispatchWindow := interval - reserveTail
-	if dispatchWindow < 100*time.Millisecond {
-		dispatchWindow = interval
-	}
-
-	var paceDelay time.Duration
-	if len(targets) > 1 && dispatchWindow > 0 {
-		paceDelay = dispatchWindow / time.Duration(len(targets))
-	}
-
-	var paceTimer *time.Timer
-	if paceDelay > 0 {
-		paceTimer = time.NewTimer(paceDelay)
-		defer paceTimer.Stop()
-	}
-
-	for _, ip := range targets {
-		select {
-		case <-e.ctx.Done():
-			return
-		case <-sr.stopChan:
-			return
-		case e.workChan <- ip:
-		}
-
-		if paceTimer != nil {
-			if !paceTimer.Stop() {
-				select {
-				case <-paceTimer.C:
-				default:
-				}
-			}
-			paceTimer.Reset(paceDelay)
-			select {
-			case <-e.ctx.Done():
-				return
-			case <-sr.stopChan:
-				return
-			case <-sr.wakeChan:
-			case <-paceTimer.C:
-			}
-		}
-	}
 }
 
 func (e *Engine) applyResult(h *HostState, res PingResult) {

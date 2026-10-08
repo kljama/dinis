@@ -26,7 +26,7 @@ type HostRingBuffer struct {
 // NewHostRingBuffer creates a new ring buffer with the given capacity.
 func NewHostRingBuffer(capacity int) *HostRingBuffer {
 	if capacity <= 0 {
-		capacity = 120 // Default ~10-20 minutes of samples at standard probe intervals
+		capacity = RawSampleRetention
 	}
 	return &HostRingBuffer{
 		samples:  make([]RawSample, 0, 8),
@@ -97,6 +97,18 @@ func (rb *HostRingBuffer) GetSince(cutoff time.Time) []RawSample {
 	}
 	if len(result) == 0 {
 		return nil
+	}
+	return result
+}
+
+// GetRange returns the samples timestamped in [start, end), in buffer order.
+func (rb *HostRingBuffer) GetRange(start, end time.Time) []RawSample {
+	all := rb.GetAll()
+	var result []RawSample
+	for _, s := range all {
+		if !s.Timestamp.Before(start) && s.Timestamp.Before(end) {
+			result = append(result, s)
+		}
 	}
 	return result
 }

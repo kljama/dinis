@@ -40,6 +40,7 @@ type Manager struct {
 	historyHead  int
 	historyCount int
 	maxHistory   int
+	version      uint64 // incremented on every change, so callers can tell when to persist
 
 	OnAlertTriggered    func(alert *Alert)
 	OnAlertAcknowledged func(alert *Alert)
@@ -80,6 +81,7 @@ func (m *Manager) Trigger(ip, alias, cidr, lastErr string) *Alert {
 		if cidr != "" {
 			existing.CIDR = cidr
 		}
+		m.version++
 		cpy := *existing
 		m.mu.Unlock()
 		return &cpy
@@ -98,6 +100,7 @@ func (m *Manager) Trigger(ip, alias, cidr, lastErr string) *Alert {
 	}
 
 	m.activeAlerts[ip] = alert
+	m.version++
 	cpy := *alert
 	cb := m.OnAlertTriggered
 	m.mu.Unlock()
@@ -141,6 +144,7 @@ func (m *Manager) Acknowledge(ipOrID, ackBy, note string) (*Alert, error) {
 	target.AckNote = note
 	target.State = AlertStateAcknowledged
 	target.DurationSec = int64(now.Sub(target.StartedAt).Seconds())
+	m.version++
 
 	cpy := *target
 	cb := m.OnAlertAcknowledged
@@ -176,6 +180,9 @@ func (m *Manager) AcknowledgeAll(ackBy, note string) []*Alert {
 			acknowledged = append(acknowledged, &cpy)
 		}
 	}
+	if len(acknowledged) > 0 {
+		m.version++
+	}
 	cb := m.OnAlertAcknowledged
 	m.mu.Unlock()
 
@@ -205,6 +212,7 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	alert.DurationSec = int64(now.Sub(alert.StartedAt).Seconds())
 
 	m.pushHistory(alert)
+	m.version++
 
 	cpy := *alert
 	cb := m.OnAlertResolved
@@ -236,6 +244,9 @@ func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
 			cpy := *alert
 			resolved = append(resolved, &cpy)
 		}
+	}
+	if len(resolved) > 0 {
+		m.version++
 	}
 	cb := m.OnAlertResolved
 	m.mu.Unlock()
@@ -315,6 +326,9 @@ func (m *Manager) UpdateAlertMetadata(ip, alias, cidr string) bool {
 	defer m.mu.Unlock()
 
 	if existing, exists := m.activeAlerts[ip]; exists {
+		if (alias != "" && existing.Alias != alias) || (cidr != "" && existing.CIDR != cidr) {
+			m.version++
+		}
 		if alias != "" {
 			existing.Alias = alias
 		}
@@ -324,4 +338,65 @@ func (m *Manager) UpdateAlertMetadata(ip, alias, cidr string) bool {
 		return true
 	}
 	return false
+}
+
+// State is the serializable form of a manager's alerts, used to keep them across restarts.
+type State struct {
+	Active  []Alert `json:"active"`
+	History []Alert `json:"history"` // oldest first
+}
+
+// Version returns a counter that changes whenever alerts or history change.
+func (m *Manager) Version() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.version
+}
+
+// ExportState returns a copy of all active alerts and the resolved history.
+func (m *Manager) ExportState() State {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	st := State{
+		Active:  make([]Alert, 0, len(m.activeAlerts)),
+		History: make([]Alert, 0, m.historyCount),
+	}
+	for _, a := range m.activeAlerts {
+		st.Active = append(st.Active, *a)
+	}
+	for i := m.historyCount - 1; i >= 0; i-- {
+		idx := (m.historyHead - 1 - i + m.maxHistory*2) % m.maxHistory
+		st.History = append(st.History, *m.history[idx])
+	}
+	return st
+}
+
+// ImportState replaces the manager's alerts with a previously exported state. Callbacks are
+// not invoked. Only the newest maxHistory history entries are kept.
+func (m *Manager) ImportState(st State) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.activeAlerts = make(map[string]*Alert, len(st.Active))
+	for i := range st.Active {
+		a := st.Active[i]
+		if a.IP == "" {
+			continue
+		}
+		m.activeAlerts[a.IP] = &a
+	}
+
+	m.history = make([]*Alert, m.maxHistory)
+	m.historyHead = 0
+	m.historyCount = 0
+	history := st.History
+	if len(history) > m.maxHistory {
+		history = history[len(history)-m.maxHistory:]
+	}
+	for i := range history {
+		a := history[i]
+		m.pushHistory(&a)
+	}
+	m.version++
 }

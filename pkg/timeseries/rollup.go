@@ -7,11 +7,16 @@ import (
 	"time"
 )
 
-// Rollup retention per host. Minute rollups only serve history windows up to 2h and
-// the hourly aggregation (last 60 points); longer windows read the hourly series.
+// Retention per host. Minute rollups only serve history windows up to 2h and the hourly
+// aggregation (last 60 points); longer windows read the hourly series.
 const (
 	MinuteRollupRetention = 120 // 2 hours of 1-minute rollups
 	HourRollupRetention   = 720 // 30 days of 1-hour rollups
+
+	// RawSampleRetention is the number of raw samples kept per host. At the minimum probe
+	// interval (0.5 s) it covers 64 s: a full minute bucket plus the few seconds that can
+	// pass before the bucket is rolled up.
+	RawSampleRetention = 128
 )
 
 // RollupPoint represents downsampled aggregate metrics over a time bucket (e.g. 1m, 1h).
@@ -320,6 +325,18 @@ func (rs *RollupSeries) GetAll() []RollupPoint {
 	result := make([]RollupPoint, n)
 	for i := 0; i < n; i++ {
 		result[i] = rs.points[(start+i)%n].unpack(rs.bucket)
+	}
+	return result
+}
+
+// GetRange returns the rollups timestamped in [start, end), in chronological order.
+func (rs *RollupSeries) GetRange(start, end time.Time) []RollupPoint {
+	all := rs.GetAll()
+	var result []RollupPoint
+	for _, p := range all {
+		if !p.Timestamp.Before(start) && p.Timestamp.Before(end) {
+			result = append(result, p)
+		}
 	}
 	return result
 }

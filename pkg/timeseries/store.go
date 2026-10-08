@@ -169,7 +169,7 @@ func (s *Store) getOrCreateRawBuffer(ip string) *HostRingBuffer {
 
 	elem := s.lruList.PushFront(ip)
 	s.lruIndex[ip] = elem
-	rb := NewHostRingBuffer(120) // ~10-20 min raw memory window
+	rb := NewHostRingBuffer(RawSampleRetention)
 	s.rawBuffers[ip] = rb
 	return rb
 }
@@ -376,7 +376,19 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (valid b
 	return outliers
 }
 
-// Background Downsampling Routine
+const (
+	// rollupTick is how often the rollup loop checks for completed buckets.
+	rollupTick = time.Second
+	// rollupGrace is how long after a bucket ends it is rolled up, so probes that finish
+	// right at the boundary are recorded first.
+	rollupGrace = time.Second
+)
+
+// Background Downsampling Routine.
+//
+// Buckets are aligned to wall-clock minutes and hours, and each completed bucket is rolled
+// up exactly once from the samples timestamped inside it. No sample is skipped or counted
+// twice, however the ticker jitters.
 func (s *Store) rollupLoop() {
 	defer s.wg.Done()
 
@@ -387,33 +399,44 @@ func (s *Store) rollupLoop() {
 		return
 	}
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(rollupTick)
 	defer ticker.Stop()
 
-	lastMinuteRollup := time.Now()
-	lastHourRollup := time.Now()
+	start := time.Now()
+	nextMinute := start.Truncate(time.Minute).Add(time.Minute)
+	nextHour := start.Truncate(time.Hour).Add(time.Hour)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
-			// Check if 1-minute downsampling is due
-			if now.Sub(lastMinuteRollup) >= 1*time.Minute {
-				s.computeMinuteRollups(now)
-				lastMinuteRollup = now
-			}
-
-			// Check if 1-hour downsampling is due
-			if now.Sub(lastHourRollup) >= 1*time.Hour {
-				s.computeHourRollups(now)
-				lastHourRollup = now
-			}
+		case <-ticker.C:
+			now := time.Now()
+			// Minutes first: an hour bucket aggregates the minute rollups inside it.
+			nextMinute = rollupDueBuckets(now, nextMinute, time.Minute, s.computeMinuteRollups)
+			nextHour = rollupDueBuckets(now, nextHour, time.Hour, s.computeHourRollups)
 		}
 	}
 }
 
-func (s *Store) computeMinuteRollups(now time.Time) {
+// rollupDueBuckets rolls up every bucket of the given size that ended at least rollupGrace
+// before now, starting with the bucket ending at nextEnd, and returns the end of the next
+// pending bucket. After a long pause (suspend, clock jump) it skips to the most recently
+// completed bucket instead of replaying buckets whose samples are gone.
+func rollupDueBuckets(now, nextEnd time.Time, size time.Duration, compute func(start, end time.Time)) time.Time {
+	if now.Sub(nextEnd) > 2*size {
+		nextEnd = now.Truncate(size)
+	}
+	for !now.Before(nextEnd.Add(rollupGrace)) {
+		compute(nextEnd.Add(-size), nextEnd)
+		nextEnd = nextEnd.Add(size)
+	}
+	return nextEnd
+}
+
+// computeMinuteRollups rolls up the raw samples timestamped in [start, end) into one
+// 1-minute point per host, timestamped at the start of the bucket.
+func (s *Store) computeMinuteRollups(start, end time.Time) {
 	s.mu.RLock()
 	ips := make([]string, 0, len(s.rawBuffers))
 	for ip := range s.rawBuffers {
@@ -421,7 +444,6 @@ func (s *Store) computeMinuteRollups(now time.Time) {
 	}
 	s.mu.RUnlock()
 
-	cutoff := now.Add(-1 * time.Minute)
 	for _, ip := range ips {
 		s.mu.RLock()
 		rb, ok := s.rawBuffers[ip]
@@ -430,16 +452,18 @@ func (s *Store) computeMinuteRollups(now time.Time) {
 			continue
 		}
 
-		samples := rb.GetSince(cutoff)
+		samples := rb.GetRange(start, end)
 		if len(samples) > 0 {
-			rollup := ComputeRollup(now, 1*time.Minute, samples)
+			rollup := ComputeRollup(start, time.Minute, samples)
 			ms := s.getOrCreateMinuteSeries(ip)
 			ms.Append(rollup)
 		}
 	}
 }
 
-func (s *Store) computeHourRollups(now time.Time) {
+// computeHourRollups aggregates the minute rollups timestamped in [start, end) into one
+// 1-hour point per host, timestamped at the start of the bucket.
+func (s *Store) computeHourRollups(start, end time.Time) {
 	s.mu.RLock()
 	ips := make([]string, 0, len(s.minuteSeries))
 	for ip := range s.minuteSeries {
@@ -447,7 +471,6 @@ func (s *Store) computeHourRollups(now time.Time) {
 	}
 	s.mu.RUnlock()
 
-	cutoff := now.Add(-1 * time.Hour)
 	for _, ip := range ips {
 		s.mu.RLock()
 		ms, ok := s.minuteSeries[ip]
@@ -456,9 +479,9 @@ func (s *Store) computeHourRollups(now time.Time) {
 			continue
 		}
 
-		minuteRollups := ms.GetSince(cutoff)
+		minuteRollups := ms.GetRange(start, end)
 		if len(minuteRollups) > 0 {
-			hourPoint := AggregateRollups(now, 1*time.Hour, minuteRollups)
+			hourPoint := AggregateRollups(start, time.Hour, minuteRollups)
 			hs := s.getOrCreateHourSeries(ip)
 			hs.Append(hourPoint)
 		}
