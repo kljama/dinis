@@ -112,7 +112,7 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
     ```
 
   If DINIS cannot open an ICMP socket, DINIS starts the system `ping` command for each probe. For this method, the system must have the `ping` command. This method is much slower. Use it only for small installations.
-- **Docker and Docker Compose 2.23.1 or a later version.** These are necessary only for the installation with containers.
+- **Docker and Docker Compose.** These are necessary only for the installation with containers.
 
 ## Installation
 
@@ -426,11 +426,9 @@ In the Docker Compose stack, Explorer starts with a configured connection named 
 | Token | `INFLUXDB3_TOKEN` | empty |
 | Database | `INFLUXDB3_BUCKET` | `dinis` |
 
-Docker Compose writes these values into the file `/app-root/config/config.json` in the Explorer container. For this function, you must have Docker Compose 2.23.1 or a later version.
+Docker Compose gives these values to the Explorer container as the environment variables `DEFAULT_SERVER_NAME`, `DEFAULT_INFLUX_SERVER`, `DEFAULT_API_TOKEN`, and `DEFAULT_INFLUX_DATABASE`. After you change a value in `.env`, run `docker compose up -d` again.
 
 Explorer keeps its settings and saved connections on the `influxdb-explorer-data` volume. After a restart, Explorer can read these settings only with the same session key. Set `INFLUXDB3_EXPLORER_SESSION_KEY` in `.env` one time, and do not change it. To make a key, use `openssl rand -hex 32`. If the variable is empty, Docker Compose uses a fixed default key.
-
-**NOTE:** `INFLUXDB3_TOKEN` must not contain `"` or `\`, because Docker Compose writes the token into a JSON file. Usual `apiv3_` tokens do not contain these characters.
 
 **CAUTION:** Limit the access to port 8888. The Explorer operates in admin mode and has no login. The configured connection uses the InfluxDB admin token. Because of this, all persons who can connect to port 8888 have admin access to InfluxDB.
 

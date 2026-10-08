@@ -97,31 +97,24 @@ services:
       # Explorer protects sessions and saved connections with this key. Without a stable key
       # it generates a new one at each start and forgets everything saved before.
       - SESSION_SECRET_KEY=${INFLUXDB3_EXPLORER_SESSION_KEY:-dinis-explorer-session-key-change-me}
+      # Pre-configured "dinis" connection to the influxdb3 container
+      - DEFAULT_SERVER_NAME=dinis
+      - DEFAULT_INFLUX_SERVER=${INFLUXDB3_URL:-http://influxdb3:8181}
+      - DEFAULT_API_TOKEN=${INFLUXDB3_TOKEN:-}
+      - DEFAULT_INFLUX_DATABASE=${INFLUXDB3_BUCKET:-dinis}
     expose:
       - 8080
     volumes:
       - influxdb-explorer-data:/db
-    configs:
-      # Pre-configured "dinis" connection to the influxdb3 container (see configs below)
-      - source: influxdb_explorer_config
-        target: /app-root/config/config.json
-        mode: 0444
+      # The connection comes from the variables above, so /app-root/config must stay empty:
+      # Explorer 1.7-1.9 does not start if this directory is owned by root and not empty. A tmpfs
+      # also keeps Compose from re-attaching an old anonymous volume at this path.
+      - type: tmpfs
+        target: /app-root/config
     depends_on:
       influxdb3:
         condition: service_healthy
     restart: unless-stopped
-
-configs:
-  # Explorer's default connection, filled in from .env when Compose reads this file.
-  # Requires Docker Compose 2.23.1 or later.
-  influxdb_explorer_config:
-    content: |
-      {
-        "DEFAULT_SERVER_NAME": "dinis",
-        "DEFAULT_INFLUX_SERVER": "${INFLUXDB3_URL:-http://influxdb3:8181}",
-        "DEFAULT_API_TOKEN": "${INFLUXDB3_TOKEN:-}",
-        "DEFAULT_INFLUX_DATABASE": "${INFLUXDB3_BUCKET:-dinis}"
-      }
 
 volumes:
   influxdb3-data:
