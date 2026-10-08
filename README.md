@@ -112,7 +112,7 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
     ```
 
   If DINIS cannot open an ICMP socket, DINIS starts the system `ping` command for each probe. For this method, the system must have the `ping` command. This method is much slower. Use it only for small installations.
-- **Docker and Docker Compose.** These are necessary only for the installation with containers.
+- **Docker and Docker Compose 2.23.1 or a later version.** These are necessary only for the installation with containers.
 
 ## Installation
 
@@ -138,7 +138,7 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
    ```bash
    cp .env.example .env
    ```
-2. Edit `.env`. Set `INFLUXDB3_TOKEN` and `DINIS_API_TOKEN`.
+2. Edit `.env`. Set `INFLUXDB3_TOKEN`, `DINIS_API_TOKEN`, and `INFLUXDB3_EXPLORER_SESSION_KEY`.
 3. Start the containers:
    ```bash
    docker compose up -d
@@ -149,7 +149,7 @@ The stack has four containers:
 | Service | Address | Notes |
 |---|---|---|
 | Nginx → DINIS | `http://<server-ip>` (port `NGINX_HTTP_PORT`, default 80) | Dashboard and REST API, through the reverse proxy |
-| Nginx → InfluxDB 3 Explorer | `http://<server-ip>:8888` (`NGINX_EXPLORER_PORT`) | Admin mode. **There is no login.** |
+| Nginx → InfluxDB 3 Explorer | `http://<server-ip>:8888` (`NGINX_EXPLORER_PORT`) | Admin mode with the configured connection `dinis`. **There is no login.** |
 | InfluxDB 3 Core | `http://<server-ip>:8181` (`INFLUXDB3_PORT`) | Docker publishes this port directly on the host, not through Nginx. |
 | DINIS | Only in the container network (`dinis:8080`) | Has the `NET_RAW` capability for ICMP |
 
@@ -380,10 +380,11 @@ DINIS also sends a keepalive comment each 15 seconds.
 | `DINIS_TRUSTED_PROXIES` | `docker` | The trusted proxies. The `docker` preset trusts all private ranges. |
 | `DINIS_ALLOWED_ORIGINS` | `""` | The accepted CORS origins. |
 | `DINIS_MAX_METRIC_HOSTS` | `""` | The maximum number of hosts with a latency history. If it is empty, DINIS keeps the saved setting. |
-| `INFLUXDB3_URL` | `http://influxdb3:8181` | The InfluxDB endpoint. In Docker Compose, the export is on by default. |
-| `INFLUXDB3_BUCKET` | `dinis` | The name of the InfluxDB database. |
-| `INFLUXDB3_TOKEN` | `""` | The InfluxDB admin token. InfluxDB accepts only tokens that start with `apiv3_`. **If the token is empty, InfluxDB operates without authentication.** |
+| `INFLUXDB3_URL` | `http://influxdb3:8181` | The InfluxDB endpoint. In Docker Compose, the export is on by default. The Explorer connection also uses this value. |
+| `INFLUXDB3_BUCKET` | `dinis` | The name of the InfluxDB database. The Explorer connection also uses this value. |
+| `INFLUXDB3_TOKEN` | `""` | The InfluxDB admin token. InfluxDB accepts only tokens that start with `apiv3_`. The Explorer connection also uses this value. **If the token is empty, InfluxDB operates without authentication.** |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | The node identifier of InfluxDB 3. |
+| `INFLUXDB3_EXPLORER_SESSION_KEY` | `""` | The session key of InfluxDB 3 Explorer. Explorer keeps its saved settings only while this key does not change. If it is empty, Docker Compose uses a fixed default key. |
 
 ## InfluxDB data
 
@@ -414,15 +415,24 @@ The packet loss of a host in a time bucket is `1 - avg(success)`.
 
 ### InfluxDB 3 Explorer
 
-Use InfluxDB 3 Explorer to examine the tables and to run SQL queries without Grafana:
+Use InfluxDB 3 Explorer to examine the tables and to run SQL queries without Grafana. Open `http://<dinis-host-ip>:8888` in your browser.
 
-1. Open `http://<dinis-host-ip>:8888` in your browser.
-2. Connect with these values:
-   - **Host URL:** `http://influxdb3:8181` in Docker, or `http://<dinis-host-ip>:8181`.
-   - **Database:** `dinis`, or the value of `INFLUXDB3_BUCKET`.
-   - **Token:** the value of `INFLUXDB3_TOKEN`, if you set a token.
+In the Docker Compose stack, Explorer starts with a configured connection named `dinis`. It is not necessary to configure this connection manually. The connection uses these values from `.env`:
 
-**CAUTION:** Limit the access to port 8888. The Explorer operates in admin mode and has no login. All persons who can connect to port 8888 can use the Explorer.
+| Explorer value | Variable in `.env` | Default |
+|---|---|---|
+| Server name | — | `dinis` |
+| Server URL | `INFLUXDB3_URL` | `http://influxdb3:8181` |
+| Token | `INFLUXDB3_TOKEN` | empty |
+| Database | `INFLUXDB3_BUCKET` | `dinis` |
+
+Docker Compose writes these values into the file `/app-root/config/config.json` in the Explorer container. For this function, you must have Docker Compose 2.23.1 or a later version.
+
+Explorer keeps its settings and saved connections on the `influxdb-explorer-data` volume. After a restart, Explorer can read these settings only with the same session key. Set `INFLUXDB3_EXPLORER_SESSION_KEY` in `.env` one time, and do not change it. To make a key, use `openssl rand -hex 32`. If the variable is empty, Docker Compose uses a fixed default key.
+
+**NOTE:** `INFLUXDB3_TOKEN` must not contain `"` or `\`, because Docker Compose writes the token into a JSON file. Usual `apiv3_` tokens do not contain these characters.
+
+**CAUTION:** Limit the access to port 8888. The Explorer operates in admin mode and has no login. The configured connection uses the InfluxDB admin token. Because of this, all persons who can connect to port 8888 have admin access to InfluxDB.
 
 ### Connect an external Grafana instance
 
@@ -464,7 +474,7 @@ The default settings are for a safe test network. Before you use DINIS on a diff
 - **Protect InfluxDB.**
   - Set a strong `INFLUXDB3_TOKEN`. Do not use the placeholder from `.env.example`.
   - Docker publishes port 8181 on all interfaces. If you do not set a token, InfluxDB accepts reads and writes without authentication.
-- **Limit the access to port 8888.** The InfluxDB Explorer has no login.
+- **Limit the access to port 8888.** The InfluxDB Explorer has no login, and its configured connection uses the admin token.
 
 ## Project structure
 

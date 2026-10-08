@@ -93,14 +93,35 @@ services:
     image: influxdata/influxdb3-ui:latest
     container_name: dinis-influxdb-explorer
     command: ["--mode=admin"]
+    environment:
+      # Explorer protects sessions and saved connections with this key. Without a stable key
+      # it generates a new one at each start and forgets everything saved before.
+      - SESSION_SECRET_KEY=${INFLUXDB3_EXPLORER_SESSION_KEY:-dinis-explorer-session-key-change-me}
     expose:
       - 8080
     volumes:
       - influxdb-explorer-data:/db
+    configs:
+      # Pre-configured "dinis" connection to the influxdb3 container (see configs below)
+      - source: influxdb_explorer_config
+        target: /app-root/config/config.json
+        mode: 0444
     depends_on:
       influxdb3:
         condition: service_healthy
     restart: unless-stopped
+
+configs:
+  # Explorer's default connection, filled in from .env when Compose reads this file.
+  # Requires Docker Compose 2.23.1 or later.
+  influxdb_explorer_config:
+    content: |
+      {
+        "DEFAULT_SERVER_NAME": "dinis",
+        "DEFAULT_INFLUX_SERVER": "${INFLUXDB3_URL:-http://influxdb3:8181}",
+        "DEFAULT_API_TOKEN": "${INFLUXDB3_TOKEN:-}",
+        "DEFAULT_INFLUX_DATABASE": "${INFLUXDB3_BUCKET:-dinis}"
+      }
 
 volumes:
   influxdb3-data:
