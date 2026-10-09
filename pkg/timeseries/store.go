@@ -57,6 +57,17 @@ type SubnetMatrixBlock struct {
 
 const DefaultMaxHosts = 5000
 
+// BytesPerHost is the measured memory (Go heap) that the full latency history of one host
+// uses: 128 raw samples, 2 hours of minute points, 30 days of hour points, the hour in
+// progress, and the map and list entries.
+const BytesPerHost = 44 * 1024
+
+// EstimateMemoryMB returns the memory in MB that the latency history of maxHosts hosts uses
+// when all of them have a full history.
+func EstimateMemoryMB(maxHosts int) int {
+	return int(int64(maxHosts) * BytesPerHost / (1 << 20))
+}
+
 // Store manages in-memory multi-tier time-series metric retention and rollups for all IPs.
 type Store struct {
 	mu           sync.RWMutex
@@ -64,6 +75,7 @@ type Store struct {
 	rawBuffers   map[string]*HostRingBuffer
 	minuteSeries map[string]*RollupSeries
 	hourSeries   map[string]*RollupSeries
+	aggs         map[string]*hostAgg // jitter carry and hour in progress, per host
 	lruList      *list.List
 	lruIndex     map[string]*list.Element
 
@@ -91,6 +103,7 @@ func NewStoreWithLimit(maxHosts int) *Store {
 		rawBuffers:   make(map[string]*HostRingBuffer),
 		minuteSeries: make(map[string]*RollupSeries),
 		hourSeries:   make(map[string]*RollupSeries),
+		aggs:         make(map[string]*hostAgg),
 		lruList:      list.New(),
 		lruIndex:     make(map[string]*list.Element),
 	}
@@ -113,6 +126,7 @@ func (s *Store) SetCapacity(maxHosts int) {
 		delete(s.rawBuffers, oldestIP)
 		delete(s.minuteSeries, oldestIP)
 		delete(s.hourSeries, oldestIP)
+		delete(s.aggs, oldestIP)
 	}
 }
 
@@ -192,6 +206,24 @@ func (s *Store) getOrCreateMinuteSeries(ip string) *RollupSeries {
 	return rs
 }
 
+func (s *Store) getOrCreateAgg(ip string) *hostAgg {
+	s.mu.RLock()
+	a, ok := s.aggs[ip]
+	s.mu.RUnlock()
+	if ok {
+		return a
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.aggs[ip]; ok {
+		return a
+	}
+	a = &hostAgg{}
+	s.aggs[ip] = a
+	return a
+}
+
 func (s *Store) getOrCreateHourSeries(ip string) *RollupSeries {
 	s.mu.RLock()
 	rs, ok := s.hourSeries[ip]
@@ -230,6 +262,7 @@ func (s *Store) RemoveHost(ip string) {
 	delete(s.rawBuffers, ip)
 	delete(s.minuteSeries, ip)
 	delete(s.hourSeries, ip)
+	delete(s.aggs, ip)
 }
 
 // GetRecentRawSamples returns the most recent raw samples for an IP.
@@ -262,15 +295,22 @@ func (s *Store) GetHostHistory(ip string, window time.Duration) []RollupPoint {
 		return ms.GetSince(cutoff)
 	}
 
-	// Use 1-hour rollups for longer windows
+	// Use 1-hour rollups for longer windows, plus the hour in progress
 	s.mu.RLock()
 	hs, ok := s.hourSeries[ip]
+	agg := s.aggs[ip]
 	s.mu.RUnlock()
-	if !ok {
-		return nil
-	}
 	cutoff := time.Now().Add(-window)
-	return hs.GetSince(cutoff)
+	var pts []RollupPoint
+	if ok {
+		pts = hs.GetSince(cutoff)
+	}
+	if agg != nil {
+		if p, ok := agg.currentHour(); ok && !p.Timestamp.Before(cutoff) {
+			pts = append(pts, p)
+		}
+	}
+	return pts
 }
 
 // PruneHosts removes time-series metric buffers and rollups for hosts that are no longer monitored.
@@ -287,6 +327,7 @@ func (s *Store) PruneHosts(activeIPs map[string]bool) {
 			delete(s.rawBuffers, ip)
 			delete(s.minuteSeries, ip)
 			delete(s.hourSeries, ip)
+			delete(s.aggs, ip)
 		}
 	}
 	for ip := range s.minuteSeries {
@@ -297,6 +338,11 @@ func (s *Store) PruneHosts(activeIPs map[string]bool) {
 	for ip := range s.hourSeries {
 		if !activeIPs[ip] {
 			delete(s.hourSeries, ip)
+		}
+	}
+	for ip := range s.aggs {
+		if !activeIPs[ip] {
+			delete(s.aggs, ip)
 		}
 	}
 }
@@ -311,6 +357,7 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (valid b
 	s.mu.RUnlock()
 
 	var outliers []OutlierHost
+	var scratch []float64
 	for _, ip := range ips {
 		subnet := ""
 		alias := ""
@@ -330,7 +377,9 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (valid b
 			continue
 		}
 
-		avgLat, _, _, p95Lat, lossRatio, jitter, count := rb.ComputeSummary()
+		var avgLat, p95Lat, lossRatio, jitter float64
+		var count int
+		avgLat, _, _, p95Lat, lossRatio, jitter, count, scratch = rb.computeSummary(scratch)
 		if count < 2 {
 			continue
 		}
@@ -435,7 +484,8 @@ func rollupDueBuckets(now, nextEnd time.Time, size time.Duration, compute func(s
 }
 
 // computeMinuteRollups rolls up the raw samples timestamped in [start, end) into one
-// 1-minute point per host, timestamped at the start of the bucket.
+// 1-minute point per host, timestamped at the start of the bucket. The samples also go into
+// the host's hour in progress, from which computeHourRollups makes the hour point.
 func (s *Store) computeMinuteRollups(start, end time.Time) {
 	s.mu.RLock()
 	ips := make([]string, 0, len(s.rawBuffers))
@@ -444,6 +494,7 @@ func (s *Store) computeMinuteRollups(start, end time.Time) {
 	}
 	s.mu.RUnlock()
 
+	b := bucketStats{}
 	for _, ip := range ips {
 		s.mu.RLock()
 		rb, ok := s.rawBuffers[ip]
@@ -452,38 +503,32 @@ func (s *Store) computeMinuteRollups(start, end time.Time) {
 			continue
 		}
 
-		samples := rb.GetRange(start, end)
-		if len(samples) > 0 {
-			rollup := ComputeRollup(start, time.Minute, samples)
-			ms := s.getOrCreateMinuteSeries(ip)
-			ms.Append(rollup)
+		if rollup, ok := s.getOrCreateAgg(ip).rollupMinute(rb, start, end, &b); ok {
+			s.getOrCreateMinuteSeries(ip).Append(rollup)
 		}
 	}
 }
 
-// computeHourRollups aggregates the minute rollups timestamped in [start, end) into one
-// 1-hour point per host, timestamped at the start of the bucket.
+// computeHourRollups ends the hour [start, end) of every host: its hour in progress becomes
+// a 1-hour point, timestamped at the start of the bucket. Percentiles come from all samples
+// of the hour (see hourStats), not from the minute points.
 func (s *Store) computeHourRollups(start, end time.Time) {
 	s.mu.RLock()
-	ips := make([]string, 0, len(s.minuteSeries))
-	for ip := range s.minuteSeries {
+	ips := make([]string, 0, len(s.aggs))
+	for ip := range s.aggs {
 		ips = append(ips, ip)
 	}
 	s.mu.RUnlock()
 
 	for _, ip := range ips {
 		s.mu.RLock()
-		ms, ok := s.minuteSeries[ip]
+		agg, ok := s.aggs[ip]
 		s.mu.RUnlock()
 		if !ok {
 			continue
 		}
-
-		minuteRollups := ms.GetRange(start, end)
-		if len(minuteRollups) > 0 {
-			hourPoint := AggregateRollups(start, time.Hour, minuteRollups)
-			hs := s.getOrCreateHourSeries(ip)
-			hs.Append(hourPoint)
+		if point, ok := agg.rollupHour(start); ok {
+			s.getOrCreateHourSeries(ip).Append(point)
 		}
 	}
 }

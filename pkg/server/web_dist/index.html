@@ -682,7 +682,7 @@
                 <div class="chart-window-tabs" id="detailWindowTabs">
                   <button class="chart-tab active" data-window="realtime">Live (25)</button>
                   <button class="chart-tab" data-window="1h">1 Hour (1m)</button>
-                  <button class="chart-tab" data-window="24h">24 Hours (1m)</button>
+                  <button class="chart-tab" data-window="24h">24 Hours (1h)</button>
                   <button class="chart-tab" data-window="168h">7 Days (1h)</button>
                 </div>
                 <span class="chart-current-rtt" id="detailCurrentRTT">-- ms</span>
@@ -696,27 +696,27 @@
           <!-- Host Metric Cards -->
           <div class="detail-metrics-grid">
             <div class="detail-metric-box">
-              <span class="d-label">Min Latency</span>
+              <span class="d-label">Min Latency (since start)</span>
               <span class="d-val font-mono" id="detailMinRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
-              <span class="d-label">Avg Latency</span>
+              <span class="d-label" title="Exponential moving average: each probe has a weight of 20 %">Avg Latency (moving)</span>
               <span class="d-val font-mono" id="detailAvgRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
-              <span class="d-label">P95 Latency</span>
+              <span class="d-label" id="detailP95Label">P95 Latency</span>
               <span class="d-val font-mono" id="detailP95RTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
-              <span class="d-label">Max Latency</span>
+              <span class="d-label">Max Latency (since start)</span>
               <span class="d-val font-mono" id="detailMaxRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
-              <span class="d-label">Packet Loss</span>
+              <span class="d-label">Packet Loss (since start)</span>
               <span class="d-val font-mono" id="detailLoss">0%</span>
             </div>
             <div class="detail-metric-box">
-              <span class="d-label">Jitter / Variance</span>
+              <span class="d-label" id="detailJitterLabel">Jitter / Variance</span>
               <span class="d-val font-mono" id="detailJitter">-- ms</span>
             </div>
             <div class="detail-metric-box">
@@ -837,6 +837,12 @@
             <label for="inputFailThreshold">Consecutive Failures for Outage Alert</label>
             <input type="number" id="inputFailThreshold" min="1" max="10" required>
             <span class="field-hint">Consecutive packet drops required before firing DOWN alert on active hosts (default 2).</span>
+          </div>
+
+          <div class="form-group">
+            <label for="inputRecoveryThreshold">Consecutive Replies for Recovery</label>
+            <input type="number" id="inputRecoveryThreshold" min="1" max="100" required>
+            <span class="field-hint">Consecutive replies a DOWN host needs before it is UP again and its alert is resolved (default 2). Higher values stop hosts with intermittent loss from flapping.</span>
           </div>
 
           <div class="form-group">

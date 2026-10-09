@@ -22,46 +22,52 @@ const (
 
 // HostState represents the live monitoring and metric state of an IP target.
 type HostState struct {
-	IP                string     `json:"ip"`
-	Alias             string     `json:"alias"`
-	Notes             string     `json:"notes"`
-	CIDR              string     `json:"cidr"`
-	Status            HostStatus `json:"status"`
-	LatencyMs         float64    `json:"latencyMs"`
-	MinLatencyMs      float64    `json:"minLatencyMs"`
-	MaxLatencyMs      float64    `json:"maxLatencyMs"`
-	AvgLatencyMs      float64    `json:"avgLatencyMs"`
-	PacketLoss        float64    `json:"packetLoss"`
-	SentPackets       uint64     `json:"sentPackets"`
-	RecvPackets       uint64     `json:"recvPackets"`
-	ConsecutiveFails  int        `json:"consecutiveFails"`
-	LastSeen          *time.Time `json:"lastSeen"`
-	LastChecked       *time.Time `json:"lastChecked"`
-	LastStateChange   *time.Time `json:"lastStateChange"`
-	LatencyHistory    []float64  `json:"latencyHistory"`
-	IsExcluded        bool       `json:"isExcluded"`
-	ExclusionReason   string     `json:"exclusionReason"`
-	DiscoveredAt      *time.Time `json:"discoveredAt,omitempty"`
-	LastDiscovered    *time.Time `json:"lastDiscovered,omitempty"`
-	IsStatic          bool       `json:"isStatic"`
-	AlertActive       bool       `json:"alertActive"`
-	AlertID           string     `json:"alertId"`
-	AlertAcknowledged bool       `json:"alertAcknowledged"`
-	AlertAckBy        string     `json:"alertAckBy"`
-	AlertAckNote      string     `json:"alertAckNote"`
-	AlertAckAt        *time.Time `json:"alertAckAt"`
-	AlertStartedAt    *time.Time `json:"alertStartedAt"`
-	LastError         string     `json:"lastError"`
+	IP               string     `json:"ip"`
+	Alias            string     `json:"alias"`
+	Notes            string     `json:"notes"`
+	CIDR             string     `json:"cidr"`
+	Status           HostStatus `json:"status"`
+	LatencyMs        float64    `json:"latencyMs"`
+	MinLatencyMs     float64    `json:"minLatencyMs"`
+	MaxLatencyMs     float64    `json:"maxLatencyMs"`
+	AvgLatencyMs     float64    `json:"avgLatencyMs"`
+	PacketLoss       float64    `json:"packetLoss"`
+	SentPackets      uint64     `json:"sentPackets"`
+	RecvPackets      uint64     `json:"recvPackets"`
+	ConsecutiveFails int        `json:"consecutiveFails"`
+	// ConsecutiveSuccesses counts replies in sequence; a DOWN host needs RecoveryThreshold.
+	ConsecutiveSuccesses int        `json:"consecutiveSuccesses"`
+	LastSeen             *time.Time `json:"lastSeen"`
+	LastChecked          *time.Time `json:"lastChecked"`
+	LastStateChange      *time.Time `json:"lastStateChange"`
+	LatencyHistory       []float64  `json:"latencyHistory"`
+	IsExcluded           bool       `json:"isExcluded"`
+	ExclusionReason      string     `json:"exclusionReason"`
+	ExclusionRule        string     `json:"exclusionRule,omitempty"` // the rule that excludes the host
+	DiscoveredAt         *time.Time `json:"discoveredAt,omitempty"`
+	LastDiscovered       *time.Time `json:"lastDiscovered,omitempty"`
+	IsStatic             bool       `json:"isStatic"`
+	AlertActive          bool       `json:"alertActive"`
+	AlertID              string     `json:"alertId"`
+	AlertAcknowledged    bool       `json:"alertAcknowledged"`
+	AlertAckBy           string     `json:"alertAckBy"`
+	AlertAckNote         string     `json:"alertAckNote"`
+	AlertAckAt           *time.Time `json:"alertAckAt"`
+	AlertStartedAt       *time.Time `json:"alertStartedAt"`
+	LastError            string     `json:"lastError"`
 }
 
 // EngineConfig holds configuration parameters for the async ICMP engine.
 type EngineConfig struct {
-	Interval       time.Duration
-	Timeout        time.Duration
-	Concurrency    int
-	FailThreshold  int
-	HistorySize    int
-	MaxMetricHosts int
+	Interval      time.Duration
+	Timeout       time.Duration
+	Concurrency   int
+	FailThreshold int
+	// RecoveryThreshold is the number of successful probes in sequence after which a DOWN
+	// host is UP again. 1 recovers on the first reply.
+	RecoveryThreshold int
+	HistorySize       int
+	MaxMetricHosts    int
 	// DownProbeInterval is how often a host that has been DOWN for at least this long is
 	// probed, when that is longer than its normal interval. 0 disables the back-off.
 	DownProbeInterval time.Duration
@@ -74,6 +80,7 @@ func DefaultConfig() EngineConfig {
 		Timeout:           1000 * time.Millisecond,
 		Concurrency:       100,
 		FailThreshold:     2,
+		RecoveryThreshold: 2,
 		HistorySize:       20,
 		MaxMetricHosts:    10000,
 		DownProbeInterval: 5 * time.Minute,
@@ -132,8 +139,8 @@ type Engine struct {
 	cancel context.CancelFunc
 }
 
-// NewEngine creates a new ICMP probing engine.
-func NewEngine(cfg EngineConfig) *Engine {
+// normalizeConfig replaces invalid configuration values with safe defaults.
+func normalizeConfig(cfg EngineConfig) EngineConfig {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 100
 	}
@@ -146,9 +153,18 @@ func NewEngine(cfg EngineConfig) *Engine {
 	if cfg.FailThreshold <= 0 {
 		cfg.FailThreshold = 2
 	}
+	if cfg.RecoveryThreshold <= 0 {
+		cfg.RecoveryThreshold = 1
+	}
 	if cfg.HistorySize <= 0 {
 		cfg.HistorySize = 20
 	}
+	return cfg
+}
+
+// NewEngine creates a new ICMP probing engine.
+func NewEngine(cfg EngineConfig) *Engine {
+	cfg = normalizeConfig(cfg)
 
 	maxMetricHosts := cfg.MaxMetricHosts
 	if maxMetricHosts <= 0 {
@@ -180,9 +196,7 @@ func (e *Engine) Wake() {
 // UpdateConfig applies a new configuration. Interval changes take effect immediately: hosts
 // move to their slot in the new interval instead of finishing the old one.
 func (e *Engine) UpdateConfig(cfg EngineConfig) {
-	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 100
-	}
+	cfg = normalizeConfig(cfg)
 	e.mu.Lock()
 	e.config = cfg
 	if cfg.MaxMetricHosts > 0 && e.tsStore != nil {
@@ -221,6 +235,7 @@ func (e *Engine) SetTargetsAndIntervals(hosts map[string]*HostState, subnetInter
 			oldH.CIDR = newH.CIDR
 			oldH.IsExcluded = newH.IsExcluded
 			oldH.ExclusionReason = newH.ExclusionReason
+			oldH.ExclusionRule = newH.ExclusionRule
 			oldH.DiscoveredAt = newH.DiscoveredAt
 			oldH.LastDiscovered = newH.LastDiscovered
 			oldH.IsStatic = newH.IsStatic
@@ -236,16 +251,11 @@ func (e *Engine) SetTargetsAndIntervals(hosts map[string]*HostState, subnetInter
 			} else if oldH.Status == StatusExcluded {
 				oldH.Status = StatusPending
 				oldH.ConsecutiveFails = 0
-			} else {
-				// Keep alert state synchronized with coordinator alert manager
-				oldH.AlertActive = newH.AlertActive
-				oldH.AlertID = newH.AlertID
-				oldH.AlertAcknowledged = newH.AlertAcknowledged
-				oldH.AlertAckBy = newH.AlertAckBy
-				oldH.AlertAckNote = newH.AlertAckNote
-				oldH.AlertAckAt = newH.AlertAckAt
-				oldH.AlertStartedAt = newH.AlertStartedAt
+				oldH.ConsecutiveSuccesses = 0
 			}
+			// The alert fields of a monitored host are not taken from the new state: the probes
+			// keep them current (BeforeStateChange, SetHostAlertState), and the new state can
+			// be older than a status change that happened while it was built.
 
 			newMap[ip] = oldH
 		} else {
@@ -329,6 +339,43 @@ func (e *Engine) GetAllHostsLite() []*HostState {
 		i++
 	}
 	return result
+}
+
+// GetStatusMap returns the current status of every monitored host.
+func (e *Engine) GetStatusMap() map[string]HostStatus {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	res := make(map[string]HostStatus, len(e.hosts))
+	for ip, h := range e.hosts {
+		res[ip] = h.Status
+	}
+	return res
+}
+
+// FillLatencyHistory copies the current latency history into the given host snapshots, for
+// example the hosts of one page from GetAllHostsLite.
+func (e *Engine) FillLatencyHistory(hosts []*HostState) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, h := range hosts {
+		if live, ok := e.hosts[h.IP]; ok {
+			h.LatencyHistory = append([]float64(nil), live.LatencyHistory...)
+		}
+	}
+}
+
+// SetHostMeta updates the alias and notes of a monitored host. It reports false if the host
+// is not monitored.
+func (e *Engine) SetHostMeta(ip, alias, notes string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[ip]
+	if !ok {
+		return false
+	}
+	h.Alias = alias
+	h.Notes = notes
+	return true
 }
 
 // GetSummary calculates an aggregated summary across all hosts.
@@ -542,6 +589,11 @@ func (e *Engine) probeAndApply(job probeJob) {
 		e.suspectInFlight--
 		e.signalSchedule() // a suspect slot is free again
 	}
+	if probeCtx.Err() != nil && !res.Success {
+		// The engine stops and cut the probe short: this is not a result of the host.
+		e.mu.Unlock()
+		return
+	}
 	h, exists := e.hosts[job.ip]
 	if !exists || h.IsExcluded {
 		e.schedDoneUnsafe(job.ip, nil)
@@ -571,16 +623,23 @@ func (e *Engine) probeAndApply(job probeJob) {
 	}
 }
 
-// PingSingle immediately probes a single host and updates its state.
+// PingSingle immediately probes a single host and updates its state. The result of an
+// excluded host, and of a probe that ctx cut short, is returned but not applied.
 func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 	e.mu.RLock()
 	timeout := e.config.Timeout
 	e.mu.RUnlock()
 
 	res := e.prober.Probe(ctx, ip, timeout)
+	if ctx != nil && ctx.Err() != nil && !res.Success {
+		return res
+	}
 
 	e.mu.Lock()
 	h, exists := e.hosts[ip]
+	if exists && h.IsExcluded {
+		exists = false // an excluded host keeps its state; only the probe result is returned
+	}
 	var oldStatus HostStatus
 	var statusChanged bool
 	var updatedHost *HostState
@@ -628,6 +687,7 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 	if res.Success {
 		h.RecvPackets++
 		h.ConsecutiveFails = 0
+		h.ConsecutiveSuccesses++
 		h.LatencyMs = res.LatencyMs
 		h.LastError = ""
 		h.LastSeen = &now
@@ -659,12 +719,16 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 			h.LatencyHistory = trimmed
 		}
 
-		if h.Status != StatusUp {
+		// A DOWN host is UP again only after RecoveryThreshold replies in sequence, so a host
+		// with intermittent loss does not start a new alert for each lost probe.
+		recovered := h.Status != StatusDown || h.ConsecutiveSuccesses >= e.config.RecoveryThreshold
+		if h.Status != StatusUp && recovered {
 			h.Status = StatusUp
 			h.LastStateChange = &now
 		}
 	} else {
 		h.ConsecutiveFails++
+		h.ConsecutiveSuccesses = 0
 		h.LastError = res.Error
 
 		// Record -1 in latency history to denote packet loss in graphs.

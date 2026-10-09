@@ -95,7 +95,9 @@ func (e *Engine) mono() time.Duration {
 // down-probe interval once the host has been DOWN for at least that long.
 func (e *Engine) probeIntervalUnsafe(h *HostState) time.Duration {
 	iv := e.effectiveIntervalUnsafe(h.CIDR)
-	if d := e.config.DownProbeInterval; d > iv && h.Status == StatusDown &&
+	// Only while the last probe failed: a DOWN host that replied again (but has not reached
+	// the recovery threshold yet) is probed at its normal interval.
+	if d := e.config.DownProbeInterval; d > iv && h.Status == StatusDown && h.ConsecutiveFails > 0 &&
 		h.LastStateChange != nil && time.Since(*h.LastStateChange) >= d {
 		return d
 	}

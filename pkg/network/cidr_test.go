@@ -111,8 +111,9 @@ func TestExclusionMatcher(t *testing.T) {
 	if err := matcher.AddExclusion("::ffff:172.16.0.1", "Mapped rule"); err != nil {
 		t.Fatalf("error adding mapped rule: %v", err)
 	}
+	// The matched rule is the text as configured, so the rule can be deleted by it
 	matched, rule, reason = matcher.Matches("172.16.0.1")
-	if !matched || reason != "Mapped rule" || rule != "172.16.0.1" {
+	if !matched || reason != "Mapped rule" || rule != "::ffff:172.16.0.1" {
 		t.Errorf("expected match for 172.16.0.1 against mapped rule, got %v, %s, %s", matched, rule, reason)
 	}
 }

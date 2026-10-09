@@ -1746,7 +1746,13 @@ body {
 .matrix-cell.cell-degraded { background-color: #f97316; }
 .matrix-cell.cell-down {
   background-color: #ef4444;
-  animation: pulse-dot-anim 1.2s infinite;
+  /* Opacity only: the compositor animates it without a repaint, also for thousands of cells */
+  animation: cell-down-pulse 1.2s infinite;
+}
+
+@keyframes cell-down-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 .matrix-cell.cell-ack { background-color: #f59e0b; }
 .matrix-cell.cell-excl { background-color: #334155; opacity: 0.5; }

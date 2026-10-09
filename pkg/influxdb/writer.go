@@ -4,6 +4,7 @@ package influxdb
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,10 +20,16 @@ const maxBufferSize = 10 << 20 // 10 MB maximum buffer ceiling
 
 // Writer batches and sends line-protocol data to InfluxDB 3 Core.
 type Writer struct {
-	url    string
-	bucket string
-	token  string
-	client *http.Client
+	url       string
+	bucket    string
+	token     string
+	retention string
+	client    *http.Client
+
+	// dbReady is set once the database is set up (see ensureDatabase); no write is sent
+	// before, so InfluxDB cannot create the database without its retention period.
+	dbReady     atomic.Bool
+	lastDBError time.Time
 
 	mu    sync.Mutex
 	buf   bytes.Buffer
@@ -36,11 +44,15 @@ type Writer struct {
 
 // Config holds InfluxDB writer configuration.
 type Config struct {
-	URL           string
-	Bucket        string
-	Token         string // optional auth token
-	FlushInterval time.Duration
-	BatchSize     int
+	URL    string
+	Bucket string
+	Token  string // optional auth token
+	// RetentionPeriod (for example "60d") is set on the database before the first write: the
+	// database is created with it, or an existing database is updated. Empty leaves the
+	// database as it is, and InfluxDB creates a missing database on the first write.
+	RetentionPeriod string
+	FlushInterval   time.Duration
+	BatchSize       int
 }
 
 // NewWriter creates a new InfluxDB line-protocol writer.
@@ -64,9 +76,10 @@ func NewWriter(cfg Config) *Writer {
 	}
 
 	w := &Writer{
-		url:    cfg.URL,
-		bucket: cfg.Bucket,
-		token:  cfg.Token,
+		url:       cfg.URL,
+		bucket:    cfg.Bucket,
+		token:     cfg.Token,
+		retention: cfg.RetentionPeriod,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Second,
@@ -75,6 +88,9 @@ func NewWriter(cfg Config) *Writer {
 		batchSize:     cfg.BatchSize,
 		flushSignal:   make(chan struct{}, 1),
 		stopChan:      make(chan struct{}),
+	}
+	if w.retention == "" {
+		w.dbReady.Store(true)
 	}
 
 	w.wg.Add(1)
@@ -150,18 +166,77 @@ func (w *Writer) flushLoop() {
 	}
 }
 
+// retainFailedPayload puts a payload that could not be written back in front of the buffer.
+// If both do not fit in maxBufferSize, the oldest lines of the payload are dropped.
 func (w *Writer) retainFailedPayload(payload []byte) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.buf.Len()+len(payload) <= maxBufferSize {
-		var newBuf bytes.Buffer
-		newBuf.Write(payload)
-		newBuf.Write(w.buf.Bytes())
-		w.buf = newBuf
-	} else {
-		log.Printf("[INFLUXDB] Buffer ceiling reached; dropping oldest failed metrics to prevent OOM")
+	if excess := w.buf.Len() + len(payload) - maxBufferSize; excess > 0 {
+		dropped := len(payload)
+		if excess < len(payload) {
+			// Cut at the end of the line that contains byte excess, so only whole lines go
+			if i := bytes.IndexByte(payload[excess-1:], '\n'); i >= 0 {
+				dropped = excess + i
+			}
+		}
+		log.Printf("[INFLUXDB] Buffer ceiling reached; dropping the %d oldest buffered lines to prevent OOM", bytes.Count(payload[:dropped], []byte{'\n'}))
+		payload = payload[dropped:]
 	}
+	var newBuf bytes.Buffer
+	newBuf.Grow(len(payload) + w.buf.Len())
+	newBuf.Write(payload)
+	newBuf.Write(w.buf.Bytes())
+	w.buf = newBuf
+}
+
+// ensureDatabase creates the database with the retention period, or sets the retention period
+// of an existing database. It returns an error only if InfluxDB is not reachable or fails, so
+// the call is repeated; other problems are logged and writes start anyway.
+func (w *Writer) ensureDatabase() error {
+	body, _ := json.Marshal(map[string]string{"db": w.bucket, "retention_period": w.retention})
+	status, msg, err := w.configureDatabase(http.MethodPost, body)
+	if err != nil {
+		return err
+	}
+	switch {
+	case status >= 200 && status < 300:
+		log.Printf("[INFLUXDB] Created database %q with retention period %s", w.bucket, w.retention)
+		return nil
+	case status == http.StatusConflict:
+		// The database exists: apply the retention period to it
+		status, msg, err = w.configureDatabase(http.MethodPut, body)
+		if err != nil {
+			return err
+		}
+		if status >= 200 && status < 300 {
+			log.Printf("[INFLUXDB] Set retention period of database %q to %s", w.bucket, w.retention)
+			return nil
+		}
+	}
+	if status >= 500 {
+		return fmt.Errorf("status %d: %s", status, msg)
+	}
+	log.Printf("[INFLUXDB] Warning: could not set retention period %s on database %q (status %d: %s); writing without it", w.retention, w.bucket, status, msg)
+	return nil
+}
+
+func (w *Writer) configureDatabase(method string, body []byte) (int, string, error) {
+	req, err := http.NewRequest(method, w.url+"/api/v3/configure/database", bytes.NewReader(body))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if w.token != "" {
+		req.Header.Set("Authorization", "Bearer "+w.token)
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, string(bytes.TrimSpace(msg)), nil
 }
 
 func (w *Writer) flush() {
@@ -175,6 +250,18 @@ func (w *Writer) flush() {
 	w.buf.Reset()
 	w.count = 0
 	w.mu.Unlock()
+
+	if !w.dbReady.Load() {
+		if err := w.ensureDatabase(); err != nil {
+			if time.Since(w.lastDBError) >= time.Minute {
+				log.Printf("[INFLUXDB] Database setup failed, data stays buffered: %v", err)
+				w.lastDBError = time.Now()
+			}
+			w.retainFailedPayload(payload)
+			return
+		}
+		w.dbReady.Store(true)
+	}
 
 	endpoint := fmt.Sprintf("%s/api/v3/write_lp?db=%s", w.url, w.bucket)
 

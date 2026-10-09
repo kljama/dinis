@@ -15,6 +15,17 @@ const (
 	AlertStateResolved     AlertState = "RESOLVED"
 )
 
+// Reasons why an alert was resolved.
+const (
+	ResolveRecovered = "recovered" // the host replied again
+	ResolveExcluded  = "excluded"  // an exclusion rule now covers the host
+	ResolveRemoved   = "removed"   // the host is no longer monitored (CIDR deleted or disabled, host un-enrolled)
+)
+
+// DefaultMaxHistoryPerHost is how many resolved alerts of one host the history keeps, so a
+// single flapping host cannot push the incidents of all other hosts out of the history.
+const DefaultMaxHistoryPerHost = 20
+
 // Alert represents an incident for an unreachable IP.
 type Alert struct {
 	ID             string     `json:"id"`
@@ -30,16 +41,16 @@ type Alert struct {
 	AcknowledgedBy string     `json:"acknowledgedBy,omitempty"`
 	AcknowledgedAt *time.Time `json:"acknowledgedAt,omitempty"`
 	AckNote        string     `json:"ackNote,omitempty"`
+	ResolveReason  string     `json:"resolveReason,omitempty"`
 }
 
 // Manager manages active alerts, acknowledgements, and incident history.
 type Manager struct {
 	mu           sync.RWMutex
 	activeAlerts map[string]*Alert // IP -> Alert
-	history      []*Alert
-	historyHead  int
-	historyCount int
+	history      []*Alert          // resolved alerts, oldest first
 	maxHistory   int
+	maxPerHost   int
 	version      uint64 // incremented on every change, so callers can tell when to persist
 
 	OnAlertTriggered    func(alert *Alert)
@@ -54,17 +65,34 @@ func NewManager(maxHistory int) *Manager {
 	}
 	return &Manager{
 		activeAlerts: make(map[string]*Alert),
-		history:      make([]*Alert, maxHistory),
+		history:      make([]*Alert, 0, maxHistory),
 		maxHistory:   maxHistory,
+		maxPerHost:   DefaultMaxHistoryPerHost,
 	}
 }
 
+// pushHistory appends a resolved alert. It drops the oldest entry of the same host when that
+// host already has maxPerHost entries, and the oldest entry overall when the history is full.
 func (m *Manager) pushHistory(alert *Alert) {
-	m.history[m.historyHead] = alert
-	m.historyHead = (m.historyHead + 1) % m.maxHistory
-	if m.historyCount < m.maxHistory {
-		m.historyCount++
+	if m.maxPerHost > 0 {
+		n, oldest := 0, -1
+		for i, a := range m.history {
+			if a.IP == alert.IP {
+				if oldest < 0 {
+					oldest = i
+				}
+				n++
+			}
+		}
+		if n >= m.maxPerHost {
+			m.history = append(m.history[:oldest], m.history[oldest+1:]...)
+		}
 	}
+	if len(m.history) >= m.maxHistory {
+		copy(m.history, m.history[1:])
+		m.history = m.history[:len(m.history)-1]
+	}
+	m.history = append(m.history, alert)
 }
 
 // Trigger creates or updates an alert when an IP becomes unreachable.
@@ -195,8 +223,9 @@ func (m *Manager) AcknowledgeAll(ackBy, note string) []*Alert {
 	return acknowledged
 }
 
-// Resolve clears the alert when a host recovers and moves it to history.
-func (m *Manager) Resolve(ip string) (*Alert, bool) {
+// Resolve closes the alert of a host with the given reason (see ResolveRecovered etc.) and
+// moves it to history.
+func (m *Manager) Resolve(ip, reason string) (*Alert, bool) {
 	m.mu.Lock()
 
 	alert, exists := m.activeAlerts[ip]
@@ -209,6 +238,7 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	now := time.Now()
 	alert.ResolvedAt = &now
 	alert.State = AlertStateResolved
+	alert.ResolveReason = reason
 	alert.DurationSec = int64(now.Sub(alert.StartedAt).Seconds())
 
 	m.pushHistory(alert)
@@ -225,8 +255,8 @@ func (m *Manager) Resolve(ip string) (*Alert, bool) {
 	return &cpy, true
 }
 
-// ResolveIf evaluates active alerts directly under lock and resolves any matching alerts without creating intermediate slices of all active alerts.
-func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
+// ResolveIf resolves, with the given reason, every active alert that matches predicate.
+func (m *Manager) ResolveIf(predicate func(a *Alert) bool, reason string) []*Alert {
 	m.mu.Lock()
 
 	var resolved []*Alert
@@ -237,6 +267,7 @@ func (m *Manager) ResolveIf(predicate func(a *Alert) bool) []*Alert {
 			delete(m.activeAlerts, ip)
 			alert.ResolvedAt = &now
 			alert.State = AlertStateResolved
+			alert.ResolveReason = reason
 			alert.DurationSec = int64(now.Sub(alert.StartedAt).Seconds())
 
 			m.pushHistory(alert)
@@ -295,14 +326,13 @@ func (m *Manager) GetAlertHistory(limit int) []*Alert {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if limit <= 0 || limit > m.historyCount {
-		limit = m.historyCount
+	if limit <= 0 || limit > len(m.history) {
+		limit = len(m.history)
 	}
 
 	res := make([]*Alert, 0, limit)
-	for i := 0; i < limit; i++ {
-		idx := (m.historyHead - 1 - i + m.maxHistory*2) % m.maxHistory
-		cpy := *m.history[idx]
+	for i := len(m.history) - 1; i >= len(m.history)-limit; i-- {
+		cpy := *m.history[i]
 		res = append(res, &cpy)
 	}
 	return res
@@ -360,20 +390,19 @@ func (m *Manager) ExportState() State {
 
 	st := State{
 		Active:  make([]Alert, 0, len(m.activeAlerts)),
-		History: make([]Alert, 0, m.historyCount),
+		History: make([]Alert, 0, len(m.history)),
 	}
 	for _, a := range m.activeAlerts {
 		st.Active = append(st.Active, *a)
 	}
-	for i := m.historyCount - 1; i >= 0; i-- {
-		idx := (m.historyHead - 1 - i + m.maxHistory*2) % m.maxHistory
-		st.History = append(st.History, *m.history[idx])
+	for _, a := range m.history {
+		st.History = append(st.History, *a)
 	}
 	return st
 }
 
 // ImportState replaces the manager's alerts with a previously exported state. Callbacks are
-// not invoked. Only the newest maxHistory history entries are kept.
+// not invoked. The history limits (total and per host) apply as for new entries.
 func (m *Manager) ImportState(st State) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -387,15 +416,9 @@ func (m *Manager) ImportState(st State) {
 		m.activeAlerts[a.IP] = &a
 	}
 
-	m.history = make([]*Alert, m.maxHistory)
-	m.historyHead = 0
-	m.historyCount = 0
-	history := st.History
-	if len(history) > m.maxHistory {
-		history = history[len(history)-m.maxHistory:]
-	}
-	for i := range history {
-		a := history[i]
+	m.history = make([]*Alert, 0, m.maxHistory)
+	for i := range st.History {
+		a := st.History[i]
 		m.pushHistory(&a)
 	}
 	m.version++

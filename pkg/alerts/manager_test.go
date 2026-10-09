@@ -29,7 +29,7 @@ func TestAlertManagerLifecycle(t *testing.T) {
 	}
 
 	// 3. Resolve alert
-	resolved, ok := mgr.Resolve("192.168.1.100")
+	resolved, ok := mgr.Resolve("192.168.1.100", ResolveRecovered)
 	if !ok || resolved.State != AlertStateResolved {
 		t.Fatalf("failed to resolve alert")
 	}
@@ -72,10 +72,15 @@ func TestResolveIf(t *testing.T) {
 	// Resolve hosts 1 and 3 based on predicate
 	resolved := mgr.ResolveIf(func(a *Alert) bool {
 		return a.IP == "10.0.0.1" || a.IP == "10.0.0.3"
-	})
+	}, ResolveExcluded)
 
 	if len(resolved) != 2 {
 		t.Fatalf("expected 2 resolved alerts, got %d", len(resolved))
+	}
+	for _, a := range resolved {
+		if a.ResolveReason != ResolveExcluded {
+			t.Errorf("expected resolve reason %q, got %q", ResolveExcluded, a.ResolveReason)
+		}
 	}
 
 	active := mgr.GetActiveAlerts()
@@ -94,13 +99,13 @@ func TestAlertHistoryRingBuffer(t *testing.T) {
 
 	// Trigger and resolve 5 alerts
 	mgr.Trigger("10.0.0.1", "H1", "10.0.0.0/24", "Down")
-	mgr.Resolve("10.0.0.1")
+	mgr.Resolve("10.0.0.1", ResolveRecovered)
 
 	mgr.Trigger("10.0.0.2", "H2", "10.0.0.0/24", "Down")
-	mgr.Resolve("10.0.0.2")
+	mgr.Resolve("10.0.0.2", ResolveRecovered)
 
 	mgr.Trigger("10.0.0.3", "H3", "10.0.0.0/24", "Down")
-	mgr.Resolve("10.0.0.3")
+	mgr.Resolve("10.0.0.3", ResolveRecovered)
 
 	// History should now contain 3 items: 10.0.0.3 (newest), 10.0.0.2, 10.0.0.1 (oldest)
 	hist := mgr.GetAlertHistory(10)
@@ -113,7 +118,7 @@ func TestAlertHistoryRingBuffer(t *testing.T) {
 
 	// Resolve 4th item -> should overwrite 10.0.0.1
 	mgr.Trigger("10.0.0.4", "H4", "10.0.0.0/24", "Down")
-	mgr.Resolve("10.0.0.4")
+	mgr.Resolve("10.0.0.4", ResolveRecovered)
 
 	hist = mgr.GetAlertHistory(10)
 	if len(hist) != 3 {
@@ -161,7 +166,7 @@ func BenchmarkResolveIfCleanup(b *testing.B) {
 
 		mgr.ResolveIf(func(a *Alert) bool {
 			return false // none match, typical case where no alerts need cleanup
-		})
+		}, ResolveRemoved)
 	}
 }
 
@@ -216,7 +221,7 @@ func TestExportImportState(t *testing.T) {
 	}
 	for _, ip := range []string{"10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"} {
 		m.Trigger(ip, "", "", "timeout")
-		m.Resolve(ip)
+		m.Resolve(ip, ResolveRecovered)
 	}
 	if m.Version() == v0 {
 		t.Fatalf("expected version to change after alert changes")
@@ -245,5 +250,48 @@ func TestExportImportState(t *testing.T) {
 	again := m2.Trigger("10.0.0.1", "", "", "timeout")
 	if again.ID != a.ID || !again.Acknowledged {
 		t.Errorf("expected re-trigger to continue the imported alert, got %+v", again)
+	}
+}
+
+func TestHistoryLimitPerHost(t *testing.T) {
+	mgr := NewManager(100)
+	mgr.maxPerHost = 3
+
+	mgr.Trigger("10.0.0.9", "Stable", "10.0.0.0/24", "Down")
+	mgr.Resolve("10.0.0.9", ResolveRecovered)
+	// A flapping host resolves many alerts
+	for i := 0; i < 10; i++ {
+		mgr.Trigger("10.0.0.1", "Flapping", "10.0.0.0/24", "Down")
+		mgr.Resolve("10.0.0.1", ResolveRecovered)
+	}
+
+	hist := mgr.GetAlertHistory(0)
+	perHost := map[string]int{}
+	for _, a := range hist {
+		perHost[a.IP]++
+	}
+	if perHost["10.0.0.1"] != 3 {
+		t.Errorf("expected 3 history entries for the flapping host, got %d", perHost["10.0.0.1"])
+	}
+	if perHost["10.0.0.9"] != 1 {
+		t.Errorf("expected the other host's incident to stay in history, got %d entries", perHost["10.0.0.9"])
+	}
+	if hist[0].IP != "10.0.0.1" || hist[len(hist)-1].IP != "10.0.0.9" {
+		t.Errorf("expected newest first, got %s .. %s", hist[0].IP, hist[len(hist)-1].IP)
+	}
+}
+
+func TestResolveReasonIsKept(t *testing.T) {
+	mgr := NewManager(10)
+	mgr.Trigger("10.0.0.1", "", "", "Down")
+	a, ok := mgr.Resolve("10.0.0.1", ResolveRemoved)
+	if !ok || a.ResolveReason != ResolveRemoved {
+		t.Fatalf("expected resolve reason %q, got %+v", ResolveRemoved, a)
+	}
+	st := mgr.ExportState()
+	m2 := NewManager(10)
+	m2.ImportState(st)
+	if h := m2.GetAlertHistory(1); len(h) != 1 || h[0].ResolveReason != ResolveRemoved {
+		t.Fatalf("expected the reason to survive export/import, got %+v", h)
 	}
 }

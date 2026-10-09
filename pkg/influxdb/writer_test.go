@@ -1,10 +1,13 @@
 package influxdb
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -294,5 +297,127 @@ func TestWriterRetainFailedPayload(t *testing.T) {
 	// The flushed data must contain the previously failed probe payload
 	if !strings.Contains(received, "10.99.99.1") {
 		t.Errorf("expected previously failed probe 10.99.99.1 to be retained and flushed, got: %q", received)
+	}
+}
+
+type recordedReq struct {
+	method, path, body string
+}
+
+// influxStub answers database configuration requests with the given statuses (POST, PUT)
+// and records every request.
+func influxStub(t *testing.T, postStatus, putStatus int) (*httptest.Server, func() []recordedReq) {
+	t.Helper()
+	var mu sync.Mutex
+	var reqs []recordedReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		reqs = append(reqs, recordedReq{r.Method, r.URL.Path, string(body)})
+		mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/v3/configure/database" && r.Method == http.MethodPost:
+			w.WriteHeader(postStatus)
+		case r.URL.Path == "/api/v3/configure/database" && r.Method == http.MethodPut:
+			w.WriteHeader(putStatus)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []recordedReq {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]recordedReq(nil), reqs...)
+	}
+}
+
+func TestWriterCreatesDatabaseWithRetentionBeforeFirstWrite(t *testing.T) {
+	srv, reqs := influxStub(t, http.StatusOK, http.StatusOK)
+	w := NewWriter(Config{URL: srv.URL, Bucket: "dinis", RetentionPeriod: "60d", FlushInterval: time.Hour})
+	w.WriteProbe("10.0.0.1", "", "", 1.5, true, time.Now())
+	w.Stop()
+
+	got := reqs()
+	if len(got) != 2 {
+		t.Fatalf("expected create + write, got %+v", got)
+	}
+	if got[0].method != http.MethodPost || got[0].path != "/api/v3/configure/database" ||
+		!strings.Contains(got[0].body, `"db":"dinis"`) || !strings.Contains(got[0].body, `"retention_period":"60d"`) {
+		t.Fatalf("expected the database to be created with its retention period first, got %+v", got[0])
+	}
+	if got[1].path != "/api/v3/write_lp" {
+		t.Fatalf("expected the write after the database setup, got %+v", got[1])
+	}
+}
+
+func TestWriterSetsRetentionOnExistingDatabase(t *testing.T) {
+	srv, reqs := influxStub(t, http.StatusConflict, http.StatusOK)
+	w := NewWriter(Config{URL: srv.URL, Bucket: "dinis", RetentionPeriod: "60d", FlushInterval: time.Hour})
+	w.WriteProbe("10.0.0.1", "", "", 1.5, true, time.Now())
+	w.Stop()
+
+	got := reqs()
+	if len(got) != 3 || got[1].method != http.MethodPut || !strings.Contains(got[1].body, `"retention_period":"60d"`) || got[2].path != "/api/v3/write_lp" {
+		t.Fatalf("expected POST (409), PUT with the retention period, then the write; got %+v", got)
+	}
+}
+
+func TestWriterWritesIfRetentionCannotBeSet(t *testing.T) {
+	// An InfluxDB version without PUT /api/v3/configure/database
+	srv, reqs := influxStub(t, http.StatusConflict, http.StatusMethodNotAllowed)
+	w := NewWriter(Config{URL: srv.URL, Bucket: "dinis", RetentionPeriod: "60d", FlushInterval: time.Hour})
+	w.WriteProbe("10.0.0.1", "", "", 1.5, true, time.Now())
+	w.Stop()
+	if got := reqs(); len(got) != 3 || got[2].path != "/api/v3/write_lp" {
+		t.Fatalf("expected the data to be written anyway, got %+v", got)
+	}
+}
+
+func TestWriterHoldsDataUntilDatabaseIsSetUp(t *testing.T) {
+	srv, reqs := influxStub(t, http.StatusServiceUnavailable, http.StatusOK)
+	w := NewWriter(Config{URL: srv.URL, Bucket: "dinis", RetentionPeriod: "60d", FlushInterval: time.Hour})
+	w.WriteProbe("10.0.0.1", "", "", 1.5, true, time.Now())
+	w.flush()
+	for _, r := range reqs() {
+		if r.path == "/api/v3/write_lp" {
+			t.Fatal("no data may be written before the database is set up")
+		}
+	}
+	w.mu.Lock()
+	buffered := w.buf.Len()
+	w.mu.Unlock()
+	if buffered == 0 {
+		t.Fatal("expected the data to stay buffered")
+	}
+	close(w.stopChan)
+	w.wg.Wait()
+}
+
+func TestRetainFailedPayloadDropsOnlyOldestLines(t *testing.T) {
+	w := &Writer{}
+	line := func(i int) string {
+		return fmt.Sprintf("icmp_probe,ip=10.0.0.%d latency_ms=1.00,success=1i %d\n", i%250, i)
+	}
+	var payload, newer bytes.Buffer
+	for i := 0; payload.Len() < maxBufferSize-200; i++ {
+		payload.WriteString(line(i))
+	}
+	for i := 0; i < 50; i++ {
+		newer.WriteString(line(1_000_000 + i))
+	}
+	w.buf.Write(newer.Bytes())
+	w.retainFailedPayload(payload.Bytes())
+
+	got := w.buf.Bytes()
+	if len(got) > maxBufferSize {
+		t.Fatalf("buffer exceeds the ceiling: %d", len(got))
+	}
+	if !bytes.HasSuffix(got, newer.Bytes()) {
+		t.Fatal("the newest data must be kept")
+	}
+	kept := got[:len(got)-newer.Len()]
+	if len(kept) == 0 || !bytes.HasSuffix(payload.Bytes(), kept) || !bytes.HasPrefix(kept, []byte("icmp_probe,")) {
+		t.Fatalf("expected the newest whole lines of the failed payload to be kept (kept %d bytes)", len(kept))
 	}
 }

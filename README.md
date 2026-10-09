@@ -53,6 +53,7 @@ Each host has a fixed time slot in its interval. DINIS distributes the probes eq
 - When you change an interval, DINIS uses the new interval immediately.
 - A new host has the status `PENDING`. After the first reply, the status changes to `UP`.
 - After `failThreshold` failed probes in sequence, the status changes to `DOWN`. The default is 2.
+- After `recoveryThreshold` replies in sequence, a `DOWN` host changes to `UP`. The default is 2. Thus a host with intermittent packet loss does not start a new alert for each lost probe.
 - The packet loss of a host is the total loss since the start of DINIS.
 
 ### Probe capacity during outages
@@ -60,13 +61,21 @@ Each host has a fixed time slot in its interval. DINIS distributes the probes eq
 A probe to a host that does not reply uses a worker for the full timeout. Two rules keep the probes to all other hosts at their normal interval during an outage:
 
 1. Probes to hosts with a failed last probe can use a maximum of three quarters of the workers (`concurrency`). The other workers are for the hosts that reply.
-2. If a host is `DOWN` for more than `downProbeIntervalSec` seconds, DINIS probes the host only each `downProbeIntervalSec` seconds. The default is 300 seconds. This rule is only for hosts with a shorter normal interval.
+2. If a host is `DOWN` for more than `downProbeIntervalSec` seconds and its last probe failed, DINIS probes the host only each `downProbeIntervalSec` seconds. The default is 300 seconds. This rule is only for hosts with a shorter normal interval.
 
-When a host of rule 2 replies again, DINIS finds this at the next probe. This can occur up to `downProbeIntervalSec` seconds later. To probe `DOWN` hosts at their normal interval, set `downProbeIntervalSec` to `0`.
+When a host of rule 2 replies again, DINIS finds this at the next probe. This can occur up to `downProbeIntervalSec` seconds later. After this reply, DINIS probes the host at its normal interval again. To probe `DOWN` hosts at their normal interval, set `downProbeIntervalSec` to `0`.
 
 ### Alerts
 
-When the status of a host changes to `DOWN`, DINIS starts an alert. When the host replies again, DINIS resolves the alert automatically. An operator can acknowledge an alert with a name and a note.
+When the status of a host changes to `DOWN`, DINIS starts an alert. When the status changes to `UP` again, DINIS resolves the alert automatically. An operator can acknowledge an alert with a name and a note.
+
+DINIS also closes the alert of a host when it stops the monitoring of the host. The field `resolveReason` of a resolved alert gives the reason:
+
+| `resolveReason` | Reason |
+|---|---|
+| `recovered` | The host replies again. |
+| `excluded` | An exclusion rule now applies to the host. |
+| `removed` | DINIS does not monitor the host now. For example, you deleted or disabled its CIDR, or you un-enrolled the host. |
 
 DINIS shows the alerts only in the dashboard. DINIS does not send email, webhook messages, or other notifications.
 
@@ -77,7 +86,7 @@ DINIS keeps its data in these locations:
 - **Data file.** This JSON file contains the CIDRs, the exclusion rules, the discovered hosts, the host aliases and notes, and the settings.
 - **Alert state file.** This file is in the same directory as the data file. Its name is the name of the data file with `.alerts.json` in place of the extension. For example, `data/dinis.json` gives `data/dinis.alerts.json`. The file contains:
   - The active alerts and their acknowledgements.
-  - The last 500 resolved alerts.
+  - The last 500 resolved alerts. Each host has a maximum of 20 of these alerts. Thus a host with frequent outages cannot remove the alerts of all other hosts from the history.
 
   DINIS saves this file each 5 seconds while alerts change. DINIS also saves the file when it stops.
 - **Memory.** DINIS keeps the latency history only in memory. After a restart, the history is empty. For each host, the history contains:
@@ -85,7 +94,9 @@ DINIS keeps its data in these locations:
   - 1-minute rollups for 2 hours.
   - 1-hour rollups for 30 days.
 
-  Each rollup contains one full clock minute or one full clock hour. For long-term data, use the InfluxDB export.
+  Each rollup contains one full clock minute or one full clock hour. For long-term data, use the InfluxDB export. Refer to [Retention and query range](#retention-and-query-range).
+
+  The history of one host uses approximately 44 KB of memory. For the default `maxMetricHosts` of 10,000 hosts, this is approximately 430 MB. At the start and when you change `maxMetricHosts`, DINIS writes an estimate to the log.
 - **Lock file.** The file `<data file>.lock` makes sure that only one DINIS process uses a data file.
 
 After a restart, each active alert keeps its ID, its start time, and its acknowledgement. A host with an active alert starts with the status `DOWN`. All other hosts start with the status `PENDING`.
@@ -95,7 +106,7 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
 - DINIS operates only with IPv4. DINIS accepts an IPv6 address as a `/128` target. But each probe to this target fails, and its status is `DOWN`.
 - A CIDR entry can contain a maximum of a /16 range (65,536 addresses). DINIS rejects larger ranges. For a larger range, add more than one CIDR entry.
 - When DINIS starts without a data file, it adds three targets: `127.0.0.1`, `1.1.1.1`, and `8.8.8.8`. The last two targets are public DNS resolvers. To stop the pings to them, delete their CIDR entries.
-- DINIS keeps the latency history for a maximum of `maxMetricHosts` hosts. The default is 10,000. DINIS also probes the other hosts and starts alerts for them. But these hosts have no history charts.
+- DINIS keeps the latency history for a maximum of `maxMetricHosts` hosts. The default is 10,000. DINIS also probes the other hosts and starts alerts for them. But these hosts have no history charts. Each host with a history uses approximately 44 KB of memory.
 
 ## Prerequisites
 
@@ -158,6 +169,9 @@ The stack has four containers:
 - In the Compose stack, the InfluxDB export is always on. The default value of `INFLUXDB3_URL` is `http://influxdb3:8181`.
 - If `INFLUXDB3_TOKEN` is empty, InfluxDB operates without authentication. Docker also publishes port 8181 on the host in this condition.
 - `.env.example` contains a placeholder token (`apiv3_dinis_secret_token`). Replace this token with a new secret value.
+- InfluxDB keeps the probe results for `INFLUXDB3_RETENTION_DAYS` days. The default is 60. Refer to [Retention and query range](#retention-and-query-range).
+- Docker keeps a maximum of five log files of 10 MB for each container.
+- When DINIS stops, it has 30 seconds to save the alerts and to send the last points to InfluxDB.
 
 ## Use the REST API
 
@@ -195,6 +209,7 @@ curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 ```
 
 - You can probe any IPv4 address. If DINIS monitors the host, DINIS updates the status of the host.
+- If an exclusion rule applies to the host, DINIS only returns the result. The status of the host does not change.
 - You can probe each address a maximum of one time each second. DINIS returns `429` for more probes.
 
 Receive the real-time events (Server-Sent Events):
@@ -246,20 +261,20 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | `POST` | `/api/discovery/run` | Starts a discovery sweep. You can send `{"cidr": ...}` as the body. If a sweep runs, DINIS puts the new sweep in a queue and returns `202`. Maximum one request each 30 seconds. |
 | `GET` | `/api/hosts` | Returns the hosts. Refer to the query parameters below. |
 | `GET` | `/api/hosts/{ip}` | Returns the details of one host, with the alias and the notes. |
-| `GET` | `/api/hosts/{ip}/history` | Returns the latency and loss history (`?window=1h`). |
+| `GET` | `/api/hosts/{ip}/history` | Returns the latency and loss history (`?window=1h`). Refer to [History windows](#history-windows). |
 | `POST` | `/api/hosts/{ip}/ping` | Probes one IPv4 address immediately. Maximum one probe each second for each address. |
 | `POST` | `/api/hosts/{ip}/promote` | Makes the host a static target. DINIS monitors a static target also after you delete its range. |
 | `PUT`, `POST` | `/api/hosts/{ip}/meta` | Sets the alias and the notes. The request replaces both values. If a field is not in the request, its value becomes empty. |
-| `DELETE` | `/api/hosts/{ip}/enrollment` | Removes a discovered host or a promoted host from the monitored hosts. Refer to [Remove a target](#remove-a-target). |
+| `DELETE` | `/api/hosts/{ip}/enrollment` | Removes a discovered host or a promoted host from the monitored hosts. For a single-IP CIDR target, DINIS returns `409`. Refer to [Remove a target](#remove-a-target). |
 | `GET` | `/api/subnets/matrix` | Returns the subnet heatmap: the hosts in groups for each subnet, with the health of each block. DINIS divides ranges larger than /24 into /24 blocks. |
 | `GET` | `/api/outliers` | Returns the hosts with packet loss, high latency, or high jitter (`?limit=50`, maximum 500). |
 | `GET` | `/api/exclusions` | Returns the exclusion rules. |
 | `POST` | `/api/exclusions` | Adds an exclusion rule, or replaces the rule with the same text. Fields: `rule` (IP or CIDR), `reason`, `enabled`. |
-| `DELETE` | `/api/exclusions` | Deletes an exclusion rule (`?rule=...` or JSON body). |
+| `DELETE` | `/api/exclusions` | Deletes an exclusion rule (`?rule=...` or JSON body). If no rule has this text, DINIS returns `404`. |
 | `GET` | `/api/alerts` | Returns the active alerts. |
 | `POST` | `/api/alerts/acknowledge` | Acknowledges one alert. Fields: `ip` or `id`, and `ackBy` and `note`. |
 | `POST` | `/api/alerts/acknowledge-all` | Acknowledges all active alerts. Fields: `ackBy`, `note`. |
-| `GET` | `/api/alerts/history` | Returns the resolved alerts, the last alert first (`?limit=100`, maximum 500). |
+| `GET` | `/api/alerts/history` | Returns the resolved alerts, the last alert first (`?limit=100`, maximum 500). The field `resolveReason` gives the reason. Refer to [Alerts](#alerts). |
 | `GET`, `PUT`, `POST` | `/api/settings` | Reads or changes the runtime settings. Refer to [Settings](#settings). |
 
 #### Query parameters for `/api/hosts`
@@ -274,13 +289,16 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | `status` | `all`, `up`, `down` (not acknowledged), `ack` (acknowledged `DOWN` hosts), `pending`, `excluded` |
 | `search` | The text to find in the IP, the alias, the CIDR, the notes, or the exclusion reason |
 | `sort` | `ip-asc`, `ip-desc`, `status`, `latency-asc`, `latency-desc`, `loss` |
-| `lightweight` | If `true`, the response does not contain the recent latency list of each host. |
+| `lightweight` | If `true`, DINIS prepares the response faster. DINIS adds the recent latency list only to the hosts on the page. |
 
 #### History windows
 
 - The `window` parameter is a Go duration, for example `30m`, `1h`, `24h`, or `168h`.
-- For a window of 2 hours or less, DINIS returns 1-minute rollups. For a longer window, DINIS returns 1-hour rollups. The maximum is 30 days.
+- For a window of 2 hours or less, DINIS returns 1-minute rollups. For a longer window, DINIS returns 1-hour rollups and the current hour. The maximum is 30 days.
+- The point of the current hour has `"partial": true`. It contains the data up to the last full minute.
 - The timestamp of each point is the start of its minute or its hour.
+- `p50LatencyMs`, `p95LatencyMs`, and `p99LatencyMs` are the percentiles of all samples in the point. For a 1-hour point, the error is approximately 2 % of the value.
+- `jitterMs` is the mean difference between two consecutive successful probes. The first difference starts at the last probe before the point. If the point has no such pair, the value is `null`.
 - DINIS keeps the history only in memory. After a restart, the history is empty.
 - The first 1-hour point is available shortly after the end of the first full clock hour. This point contains only the data after the start of DINIS.
 
@@ -296,7 +314,7 @@ The procedure is different for each type of target.
 
 - To remove the target, delete its CIDR entry.
 - To stop the probes but keep the settings, disable the CIDR entry. If an enabled larger CIDR also contains the address, DINIS continues to monitor the host as part of that range.
-- If you un-enroll this target, this has no effect while the CIDR entry exists.
+- You cannot un-enroll this target. DINIS returns `409` and makes no change.
 
 **Host that a discovery sweep found in a larger CIDR:**
 
@@ -321,6 +339,7 @@ If a value is out of range, DINIS uses the nearest value in the range. If `timeo
 | `intervalSec` | `60` | 0.5–3600 | The default probe interval for each host. A CIDR can have a different interval. |
 | `timeoutMs` | `1000` | 1–30000 | The probe timeout. |
 | `failThreshold` | `2` | 1–100 | The number of failed probes in sequence before the status changes to `DOWN`. |
+| `recoveryThreshold` | `2` | 1–100 | The number of replies in sequence before a `DOWN` host changes to `UP`. `1` resolves the alert at the first reply. |
 | `concurrency` | `100` | 1–1024 | The number of probes at the same time. DINIS uses a new value immediately. |
 | `discoveryIntervalMin` | `240` | 0 or more | The minutes between two automatic discovery sweeps. `0` stops the automatic sweeps. |
 | `autoDiscovery` | `true` | — | If `true`, DINIS starts a sweep when DINIS starts and when you add a CIDR. |
@@ -363,6 +382,7 @@ DINIS also sends a keepalive comment each 15 seconds.
 | `-influxdb-url` | `INFLUXDB3_URL` | `""` | The URL of InfluxDB 3 Core, for example `http://localhost:8181`. If it is empty, the export is off. |
 | `-influxdb-bucket` | `INFLUXDB3_BUCKET` | `dinis` | The name of the InfluxDB database. |
 | `-influxdb-token` | `INFLUXDB3_TOKEN` | `""` | The InfluxDB token. DINIS sends it as `Authorization: Bearer`. |
+| `-influxdb-retention-days` | `INFLUXDB3_RETENTION_DAYS` | `60` | The retention period in days that DINIS sets on the InfluxDB database. `0` does not change the database. Refer to [Retention and query range](#retention-and-query-range). |
 | `-version` | — | `false` | Shows the version, then DINIS stops. |
 
 ### Environment variables for Docker Compose
@@ -384,6 +404,7 @@ DINIS also sends a keepalive comment each 15 seconds.
 | `INFLUXDB3_BUCKET` | `dinis` | The name of the InfluxDB database. The Explorer connection also uses this value. |
 | `INFLUXDB3_TOKEN` | `""` | The InfluxDB admin token. InfluxDB accepts only tokens that start with `apiv3_`. The Explorer connection also uses this value. **If the token is empty, InfluxDB operates without authentication.** |
 | `INFLUXDB3_NODE_ID` | `dinis-node` | The node identifier of InfluxDB 3. |
+| `INFLUXDB3_RETENTION_DAYS` | `60` | The number of days that InfluxDB keeps the probe results. All of these days stay available for queries. Use a whole number. `0` does not change the database. Refer to [Retention and query range](#retention-and-query-range). |
 | `INFLUXDB3_EXPLORER_SESSION_KEY` | `""` | The session key of InfluxDB 3 Explorer. Explorer keeps its saved settings only while this key does not change. If it is empty, Docker Compose uses a fixed default key. |
 
 ## InfluxDB data
@@ -400,7 +421,7 @@ DINIS writes each probe result as one point:
 | Field | `success` | integer | `1`: DINIS received a reply. `0`: the probe failed. |
 | Time | — | ns | The time when the probe was complete. |
 
-DINIS sends the points to InfluxDB in batches. DINIS sends a batch each 5 seconds or after 100 points. If InfluxDB is not available, DINIS keeps a maximum of 10 MB of points and sends them again later.
+DINIS sends the points to InfluxDB in batches. DINIS sends a batch each 5 seconds or after 100 points. If InfluxDB is not available, DINIS keeps a maximum of 10 MB of points and sends them again later. If this buffer is full, DINIS deletes the oldest points first.
 
 A failed probe has `latency_ms = 0`. Because of this, use only the points with `success = 1` for latency charts. Example SQL query:
 
@@ -412,6 +433,27 @@ ORDER BY time
 ```
 
 The packet loss of a host in a time bucket is `1 - avg(success)`.
+
+### Retention and query range
+
+Before DINIS writes the first point, it sets a retention period on the database. The period is `INFLUXDB3_RETENTION_DAYS` days. The default is 60 days.
+
+- If the database does not exist, DINIS creates it with this retention period.
+- If the database exists, DINIS changes its retention period to this value. This also applies to a database from an earlier version of DINIS. InfluxDB then deletes the data that is older than the retention period.
+- If InfluxDB is not available, DINIS keeps the points in its buffer and tries again at the next batch. DINIS sends no point before the retention period is set.
+- If InfluxDB refuses the retention period, DINIS writes a warning to the log. Then DINIS writes the points, and the database keeps its current retention period. For example, an old InfluxDB version cannot change the retention period of a database.
+- If `INFLUXDB3_RETENTION_DAYS` is `0`, DINIS does not change the database. If InfluxDB creates the database at the first write, the data does not expire.
+
+InfluxDB 3 Core can query a time range only if two settings are large enough. In the Docker Compose stack, the `influxdb3` service sets them from `INFLUXDB3_RETENTION_DAYS`:
+
+| InfluxDB setting | Value in the Compose stack | InfluxDB default |
+|---|---|---|
+| `--gen1-lookback-duration` | The retention period | 1 month. At the start, InfluxDB loads the index of the data files only for this time. |
+| `--query-file-limit` | 288 × the number of days (two files for each 10-minute block) | 432 files, approximately 72 hours |
+
+Thus you can query all data in the retention period, also after a restart of InfluxDB. If you use InfluxDB without the Compose stack, set these two options yourself.
+
+**NOTE:** A query over many days reads many files. For example, a query over 60 days reads up to 17,280 files. Such a query is slow and uses much memory in the InfluxDB container.
 
 ### InfluxDB 3 Explorer
 

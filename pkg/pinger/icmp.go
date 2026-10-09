@@ -28,6 +28,10 @@ func checksum(b []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// recvSlice bounds each blocking receive, so a probe notices a cancelled context (engine stop)
+// within this time instead of waiting for its full timeout.
+const recvSlice = 100 * time.Millisecond
+
 // Linux raw-socket ICMP_FILTER option (linux/icmp.h). A set bit in the mask blocks that ICMP type.
 const (
 	solRaw     = 255
@@ -306,9 +310,14 @@ func (p *SingleProber) nativeProbe(ctx context.Context, ip net.IP, timeout time.
 			}, nil
 		}
 
-		// Dynamically adjust receive timeout so syscall does not block past the overall probe deadline
-		remainingTv := syscall.NsecToTimeval(remaining.Nanoseconds())
-		_ = syscall.SetsockoptTimeval(sock.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &remainingTv)
+		// Block at most until the probe deadline, and at most recvSlice at a time so that a
+		// cancelled context is noticed promptly
+		wait := remaining
+		if wait > recvSlice {
+			wait = recvSlice
+		}
+		waitTv := syscall.NsecToTimeval(wait.Nanoseconds())
+		_ = syscall.SetsockoptTimeval(sock.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &waitTv)
 
 		n, from, err := syscall.Recvfrom(sock.fd, buf, 0)
 		recvTime := time.Now()
@@ -316,6 +325,9 @@ func (p *SingleProber) nativeProbe(ctx context.Context, ip net.IP, timeout time.
 			if errno, ok := err.(syscall.Errno); ok && errno == syscall.EINTR {
 				// Interrupted by signal or Go async preemption; retry if within deadline
 				continue
+			}
+			if errno, ok := err.(syscall.Errno); ok && (errno == syscall.EAGAIN || errno == syscall.EWOULDBLOCK) && recvTime.Before(deadline) {
+				continue // receive slice ended; the loop checks the context and the deadline
 			}
 			if isFatalSocketError(err) {
 				isFatal = true

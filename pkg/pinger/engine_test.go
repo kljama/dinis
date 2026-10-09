@@ -489,8 +489,9 @@ func TestProbeIntervalBackoffForLongDownHosts(t *testing.T) {
 		want time.Duration
 		desc string
 	}{
-		{&HostState{IP: "10.0.0.1", Status: StatusDown, LastStateChange: &longAgo}, 5 * time.Minute, "DOWN for 10 minutes backs off"},
-		{&HostState{IP: "10.0.0.2", Status: StatusDown, LastStateChange: &recently}, 60 * time.Second, "DOWN for 1 minute keeps the normal interval"},
+		{&HostState{IP: "10.0.0.1", Status: StatusDown, ConsecutiveFails: 12, LastStateChange: &longAgo}, 5 * time.Minute, "DOWN for 10 minutes backs off"},
+		{&HostState{IP: "10.0.0.2", Status: StatusDown, ConsecutiveFails: 2, LastStateChange: &recently}, 60 * time.Second, "DOWN for 1 minute keeps the normal interval"},
+		{&HostState{IP: "10.0.0.4", Status: StatusDown, ConsecutiveSuccesses: 1, LastStateChange: &longAgo}, 60 * time.Second, "DOWN host whose last probe replied keeps the normal interval"},
 		{&HostState{IP: "10.0.0.3", Status: StatusUp, LastStateChange: &longAgo}, 60 * time.Second, "UP host keeps the normal interval"},
 	}
 	for _, c := range cases {
@@ -668,5 +669,140 @@ func TestScheduleFailingHostsCannotStarveHealthyHosts(t *testing.T) {
 	t.Logf("healthy host: max probe gap after warm-up %v (interval %v)", maxGap, cfg.Interval)
 	if maxGap > 1500*time.Millisecond {
 		t.Errorf("healthy host probe gap reached %v with a 1s interval while unreachable hosts saturated the pool", maxGap)
+	}
+}
+
+// applyProbe applies a probe result as probeAndApply does, including the BeforeStateChange hook.
+func applyProbe(e *Engine, ip string, success bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h := e.hosts[ip]
+	old := h.Status
+	res := PingResult{IP: ip, Success: success, LatencyMs: 1, Error: "Request timeout"}
+	if success {
+		res.Error = ""
+	}
+	e.applyResult(h, res)
+	if h.Status != old && e.BeforeStateChange != nil {
+		e.BeforeStateChange(h, old, h.Status)
+	}
+}
+
+func TestRecoveryThreshold(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.FailThreshold = 2
+	cfg.RecoveryThreshold = 3
+	e := NewEngine(cfg)
+	ip := "10.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusPending}})
+
+	applyProbe(e, ip, true)
+	if h, _ := e.GetHost(ip); h.Status != StatusUp {
+		t.Fatalf("a PENDING host must be UP after its first reply, got %s", h.Status)
+	}
+	applyProbe(e, ip, false)
+	applyProbe(e, ip, false)
+	if h, _ := e.GetHost(ip); h.Status != StatusDown {
+		t.Fatalf("expected DOWN after 2 failures, got %s", h.Status)
+	}
+	// Intermittent replies do not end the outage
+	for _, ok := range []bool{true, true, false, true, true} {
+		applyProbe(e, ip, ok)
+		if h, _ := e.GetHost(ip); h.Status != StatusDown {
+			t.Fatalf("expected the host to stay DOWN before 3 replies in sequence, got %s", h.Status)
+		}
+	}
+	applyProbe(e, ip, true) // third reply in sequence
+	if h, _ := e.GetHost(ip); h.Status != StatusUp {
+		t.Fatalf("expected UP after 3 replies in sequence, got %s", h.Status)
+	}
+}
+
+func TestNormalizeConfigRecoveryThreshold(t *testing.T) {
+	e := NewEngine(EngineConfig{})
+	if e.config.RecoveryThreshold != 1 {
+		t.Fatalf("expected a missing recovery threshold to default to 1, got %d", e.config.RecoveryThreshold)
+	}
+	e.UpdateConfig(EngineConfig{Interval: time.Second})
+	if e.config.RecoveryThreshold != 1 || e.config.FailThreshold != 2 || e.config.Timeout <= 0 || e.config.HistorySize <= 0 {
+		t.Fatalf("UpdateConfig must normalize the configuration, got %+v", e.config)
+	}
+}
+
+// A target-list rebuild built before a status change must not overwrite the alert flags
+// that the status change set.
+func TestStaleTargetListKeepsAlertFlags(t *testing.T) {
+	e := NewEngine(DefaultConfig())
+	ip := "10.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusUp}})
+	e.BeforeStateChange = func(h *HostState, o, n HostStatus) {
+		if n == StatusDown {
+			h.AlertActive, h.AlertID = true, "alt-1"
+		}
+	}
+	stale := map[string]*HostState{ip: {IP: ip, Status: StatusUp, Alias: "core"}}
+
+	applyProbe(e, ip, false)
+	applyProbe(e, ip, false)
+	e.SetTargetsAndIntervals(stale, nil)
+
+	h, _ := e.GetHost(ip)
+	if h.Status != StatusDown || !h.AlertActive || h.AlertID != "alt-1" {
+		t.Fatalf("expected DOWN with its alert flags, got status=%s alertActive=%v id=%q", h.Status, h.AlertActive, h.AlertID)
+	}
+	if h.Alias != "core" {
+		t.Fatalf("expected the metadata of the new target list, got alias %q", h.Alias)
+	}
+	if s := e.GetSummary(); s.AlertsActive != 1 {
+		t.Fatalf("expected 1 active alert in the summary, got %d", s.AlertsActive)
+	}
+}
+
+func TestPingSingleDoesNotChangeExcludedHost(t *testing.T) {
+	e := NewEngine(DefaultConfig())
+	ip := "127.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusExcluded, IsExcluded: true}})
+	changed := false
+	e.BeforeStateChange = func(*HostState, HostStatus, HostStatus) { changed = true }
+
+	res := e.PingSingle(context.Background(), ip)
+	h, _ := e.GetHost(ip)
+	if h.Status != StatusExcluded || h.SentPackets != 0 || len(h.LatencyHistory) != 0 || changed {
+		t.Fatalf("an excluded host must keep its state, got status=%s sent=%d history=%v changed=%v", h.Status, h.SentPackets, h.LatencyHistory, changed)
+	}
+	if res.IP != ip {
+		t.Fatalf("expected the probe result to be returned, got %+v", res)
+	}
+}
+
+func TestPingSingleIgnoresCancelledProbe(t *testing.T) {
+	e := NewEngine(DefaultConfig())
+	ip := "127.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusUp}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.PingSingle(ctx, ip)
+	if h, _ := e.GetHost(ip); h.SentPackets != 0 || h.ConsecutiveFails != 0 {
+		t.Fatalf("a cancelled probe must not count as a failure, got sent=%d fails=%d", h.SentPackets, h.ConsecutiveFails)
+	}
+}
+
+func TestStatusMapAndFillLatencyHistory(t *testing.T) {
+	e := NewEngine(DefaultConfig())
+	e.SetHosts(map[string]*HostState{"10.0.0.1": {IP: "10.0.0.1", Status: StatusPending}})
+	applyProbe(e, "10.0.0.1", true)
+	if m := e.GetStatusMap(); m["10.0.0.1"] != StatusUp {
+		t.Fatalf("unexpected status map %v", m)
+	}
+	lite := e.GetAllHostsLite()
+	e.FillLatencyHistory(lite)
+	if len(lite) != 1 || len(lite[0].LatencyHistory) != 1 {
+		t.Fatalf("expected the history to be filled, got %+v", lite)
+	}
+	if !e.SetHostMeta("10.0.0.1", "core", "rack 4") || e.SetHostMeta("10.9.9.9", "x", "") {
+		t.Fatal("SetHostMeta must report whether the host is monitored")
+	}
+	if h, _ := e.GetHost("10.0.0.1"); h.Alias != "core" || h.Notes != "rack 4" {
+		t.Fatalf("unexpected metadata %q %q", h.Alias, h.Notes)
 	}
 }

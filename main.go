@@ -45,6 +45,7 @@ func main() {
 	influxURLFlag := flag.String("influxdb-url", envOrDefault("INFLUXDB3_URL", ""), "InfluxDB 3 Core URL (INFLUXDB3_URL). Empty disables InfluxDB export.")
 	influxBucketFlag := flag.String("influxdb-bucket", envOrDefault("INFLUXDB3_BUCKET", "dinis"), "InfluxDB bucket/database name (INFLUXDB3_BUCKET)")
 	influxTokenFlag := flag.String("influxdb-token", envOrDefault("INFLUXDB3_TOKEN", ""), "InfluxDB auth token (INFLUXDB3_TOKEN)")
+	influxRetentionFlag := flag.Int("influxdb-retention-days", envIntOrDefault("INFLUXDB3_RETENTION_DAYS", 60), "Retention period in days that DINIS sets on the InfluxDB database before it writes; 0 leaves the database unchanged (INFLUXDB3_RETENTION_DAYS)")
 	apiTokenFlag := flag.String("api-token", os.Getenv("DINIS_API_TOKEN"), "Optional API authentication token for REST endpoints (DINIS_API_TOKEN)")
 	allowedHostsFlag := flag.String("allowed-hosts", os.Getenv("DINIS_ALLOWED_HOSTS"), "Comma-separated list of allowed HTTP Host header values (DINIS_ALLOWED_HOSTS)")
 	allowedClientIPsFlag := flag.String("allowed-client-ips", os.Getenv("DINIS_ALLOWED_CLIENT_IPS"), "Comma-separated list of allowed client IPs/CIDRs for Web UI and API access (DINIS_ALLOWED_CLIENT_IPS)")
@@ -89,15 +90,20 @@ func main() {
 	// Wire optional InfluxDB exporter
 	var influxWriter *influxdb.Writer
 	if *influxURLFlag != "" {
+		retention := ""
+		if *influxRetentionFlag > 0 {
+			retention = fmt.Sprintf("%dd", *influxRetentionFlag)
+		}
 		influxWriter = influxdb.NewWriter(influxdb.Config{
-			URL:    *influxURLFlag,
-			Bucket: *influxBucketFlag,
-			Token:  *influxTokenFlag,
+			URL:             *influxURLFlag,
+			Bucket:          *influxBucketFlag,
+			Token:           *influxTokenFlag,
+			RetentionPeriod: retention,
 		})
 		coord.SetProbeExporter(func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time) {
 			influxWriter.WriteProbe(ip, alias, subnet, latencyMs, success, ts)
 		})
-		log.Printf("[DINIS] InfluxDB export enabled -> %s (bucket: %s)", *influxURLFlag, *influxBucketFlag)
+		log.Printf("[DINIS] InfluxDB export enabled -> %s (bucket: %s, retention: %d days)", *influxURLFlag, *influxBucketFlag, *influxRetentionFlag)
 	}
 
 	coord.Start()
@@ -152,6 +158,9 @@ func main() {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	// SSE streams never end by themselves; close them when the shutdown starts, so it does not
+	// wait for open dashboards
+	httpServer.RegisterOnShutdown(coord.CloseStreams)
 
 	// Background HTTP server listener
 	go func() {

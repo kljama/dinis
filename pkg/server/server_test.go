@@ -2044,7 +2044,7 @@ func TestAlertHistoryLimitQueryParam(t *testing.T) {
 	for i := 1; i <= 15; i++ {
 		ip := fmt.Sprintf("10.88.0.%d", i)
 		coord.alerts.Trigger(ip, fmt.Sprintf("Host-%d", i), "10.88.0.0/24", "Loss")
-		coord.alerts.Resolve(ip)
+		coord.alerts.Resolve(ip, alerts.ResolveRecovered)
 	}
 
 	// 1. Query with ?limit=5
@@ -2422,7 +2422,7 @@ func TestAlertStateSurvivesRestart(t *testing.T) {
 		t.Fatalf("acknowledge failed: %v", err)
 	}
 	coord.alerts.Trigger("192.0.2.78", "", "", "Request timeout")
-	coord.alerts.Resolve("192.0.2.78")
+	coord.alerts.Resolve("192.0.2.78", alerts.ResolveRecovered)
 
 	coord.Stop() // saves the alert state
 	_ = st.Close()
@@ -2496,5 +2496,217 @@ func TestSettingsDownProbeInterval(t *testing.T) {
 	put(`{"downProbeIntervalSec":600}`)
 	if got := put(`{"intervalSec":30}`).DownProbeIntervalSec; got != 600 {
 		t.Errorf("expected partial update to keep downProbeIntervalSec 600, got %d", got)
+	}
+}
+
+func serve(srv *Server, method, url, body string) *httptest.ResponseRecorder {
+	var rdr *strings.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	} else {
+		rdr = strings.NewReader("")
+	}
+	req := httptest.NewRequest(method, url, rdr)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// Un-enrolling a single-IP CIDR target cannot stop monitoring it, so the request is refused
+// and the alert of an ongoing outage stays active.
+func TestUnenrollSingleIPTargetKeepsAlert(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	ip := "192.0.2.10" // TEST-NET-1: never replies
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: ip + "/32", Enabled: true})
+	coord.RebuildTargetList()
+	coord.pinger.PingSingle(context.Background(), ip)
+	coord.pinger.PingSingle(context.Background(), ip)
+	if _, ok := coord.alerts.GetAlertForIP(ip); !ok {
+		t.Fatal("expected an active alert after two failed probes")
+	}
+
+	rec := serve(srv, http.MethodDelete, "/api/hosts/"+ip+"/enrollment", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a single-IP CIDR target, got %d: %s", rec.Code, rec.Body.String())
+	}
+	h, ok := coord.pinger.GetHost(ip)
+	if _, alert := coord.alerts.GetAlertForIP(ip); !ok || h.Status != pinger.StatusDown || !h.AlertActive || !alert {
+		t.Fatalf("expected the host to stay DOWN with its alert, got %+v alert=%v", h, alert)
+	}
+}
+
+func TestUnenrollRangeHostClosesAlertAsRemoved(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	ip := "192.0.2.30"
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "192.0.2.0/24", Enabled: true})
+	_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{IP: ip, CIDR: "192.0.2.0/24"})
+	coord.RebuildTargetList()
+	coord.alerts.Trigger(ip, "", "192.0.2.0/24", "Request timeout")
+
+	if rec := serve(srv, http.MethodDelete, "/api/hosts/"+ip+"/enrollment", ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if _, ok := coord.pinger.GetHost(ip); ok {
+		t.Fatal("expected the host to be no longer monitored")
+	}
+	hist := coord.alerts.GetAlertHistory(1)
+	if len(hist) != 1 || hist[0].IP != ip || hist[0].ResolveReason != alerts.ResolveRemoved {
+		t.Fatalf("expected the alert closed with reason %q, got %+v", alerts.ResolveRemoved, hist)
+	}
+}
+
+func TestExclusionClosesAlertAsExcluded(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	ip := "192.0.2.40"
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: ip + "/32", Enabled: true})
+	coord.RebuildTargetList()
+	coord.alerts.Trigger(ip, "", ip+"/32", "Request timeout")
+
+	if rec := serve(srv, http.MethodPost, "/api/exclusions", `{"rule":"192.0.2.0/24","reason":"lab"}`); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	hist := coord.alerts.GetAlertHistory(1)
+	if len(hist) != 1 || hist[0].ResolveReason != alerts.ResolveExcluded {
+		t.Fatalf("expected the alert closed with reason %q, got %+v", alerts.ResolveExcluded, hist)
+	}
+	h, _ := coord.pinger.GetHost(ip)
+	if h.ExclusionRule != "192.0.2.0/24" {
+		t.Fatalf("expected the host to name its exclusion rule, got %q", h.ExclusionRule)
+	}
+
+	// The host IP is not a rule: deleting it must fail, not report success
+	if rec := serve(srv, http.MethodDelete, "/api/exclusions?rule="+ip, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for a rule that does not exist, got %d", rec.Code)
+	}
+	if rec := serve(srv, http.MethodDelete, "/api/exclusions?rule=192.0.2.0/24", ""); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for the subnet rule, got %d", rec.Code)
+	}
+	if h, _ := coord.pinger.GetHost(ip); h.IsExcluded {
+		t.Fatal("expected the host to be monitored again")
+	}
+}
+
+func TestManualPingOnExcludedHostChangesNothing(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	ip := "192.0.2.20"
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: ip + "/32", Enabled: true})
+	_ = coord.store.AddOrUpdateExclusion(store.ExclusionConfig{Rule: ip, Enabled: true})
+	coord.RebuildTargetList()
+
+	for i := 0; i < 2; i++ {
+		if rec := serve(srv, http.MethodPost, "/api/hosts/"+ip+"/ping", ""); rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		time.Sleep(1100 * time.Millisecond) // manual pings are limited to one per second
+	}
+	h, _ := coord.pinger.GetHost(ip)
+	if _, alert := coord.alerts.GetAlertForIP(ip); h.Status != pinger.StatusExcluded || h.SentPackets != 0 || alert {
+		t.Fatalf("expected the excluded host unchanged and no alert, got status=%s sent=%d alert=%v", h.Status, h.SentPackets, alert)
+	}
+	if s := coord.pinger.GetSummary(); s.ExcludedCount < 1 || s.DownCount != 0 {
+		t.Fatalf("unexpected summary %+v", s)
+	}
+}
+
+func TestExplorerPageIncludesLatencyHistory(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	coord.pinger.PingSingle(context.Background(), "127.0.0.1")
+	coord.pinger.PingSingle(context.Background(), "127.0.0.1")
+
+	rec := serve(srv, http.MethodGet, "/api/hosts?page=1&limit=50&status=all&search=&sort=status&lightweight=true", "")
+	var page struct {
+		Hosts []*pinger.HostState `json:"hosts"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range page.Hosts {
+		if h.IP == "127.0.0.1" {
+			if len(h.LatencyHistory) != 2 {
+				t.Fatalf("expected 2 history values on the page, got %v", h.LatencyHistory)
+			}
+			return
+		}
+	}
+	t.Fatal("127.0.0.1 not on the page")
+}
+
+func TestShutdownDoesNotWaitForSSE(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	ts := httptest.NewUnstartedServer(srv)
+	ts.Config.RegisterOnShutdown(coord.CloseStreams)
+	ts.Start()
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 64)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("expected the first SSE event, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := ts.Config.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("shutdown waited %v for the open SSE stream", d)
+	}
+
+	// After CloseStreams, new streams are refused
+	rec := serve(srv, http.MethodGet, "/api/stream", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for a new stream during shutdown, got %d", rec.Code)
+	}
+}
+
+func TestRebuildUsesLongestPrefix(t *testing.T) {
+	_, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "10.50.0.0/16", Description: "Campus", Enabled: true})
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "10.50.5.0/24", Description: "Server room", Enabled: true})
+	_ = coord.store.AddOrUpdateCIDR(store.CIDRConfig{CIDR: "10.50.6.0/24", Description: "Disabled", Enabled: false})
+	for _, ip := range []string{"10.50.5.7", "10.50.6.1", "10.50.200.9"} {
+		_ = coord.store.AddOrUpdateDiscoveredHost(store.DiscoveredHost{IP: ip, CIDR: "10.50.0.0/16"})
+	}
+	coord.RebuildTargetList()
+
+	want := map[string][2]string{
+		"10.50.5.7":   {"10.50.5.0/24", "Server room"},
+		"10.50.6.1":   {"10.50.0.0/16", "Campus"}, // the /24 is disabled
+		"10.50.200.9": {"10.50.0.0/16", "Campus"},
+	}
+	for ip, w := range want {
+		h, ok := coord.pinger.GetHost(ip)
+		if !ok || h.CIDR != w[0] || h.Alias != w[1] {
+			t.Errorf("%s: got cidr=%q alias=%q, want %q %q", ip, h.CIDR, h.Alias, w[0], w[1])
+		}
+	}
+}
+
+func TestSettingsRecoveryThreshold(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+	if got := coord.store.GetSettings().RecoveryThreshold; got != 2 {
+		t.Fatalf("expected the default recovery threshold 2, got %d", got)
+	}
+	rec := serve(srv, http.MethodPut, "/api/settings", `{"recoveryThreshold":3}`)
+	if rec.Code != http.StatusOK || coord.store.GetSettings().RecoveryThreshold != 3 {
+		t.Fatalf("expected recoveryThreshold 3 to be saved, got %d %s", rec.Code, rec.Body.String())
+	}
+	serve(srv, http.MethodPut, "/api/settings", `{"recoveryThreshold":0}`)
+	if got := coord.store.GetSettings().RecoveryThreshold; got != 1 {
+		t.Fatalf("expected recoveryThreshold 0 to be clamped to 1, got %d", got)
 	}
 }

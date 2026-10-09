@@ -30,6 +30,7 @@
       intervalSec: 60.0,
       timeoutMs: 1000,
       failThreshold: 2,
+      recoveryThreshold: 2,
       concurrency: 100,
       discoveryIntervalMin: 240,
       autoDiscovery: true
@@ -212,6 +213,8 @@
     detailMinRTT: document.getElementById('detailMinRTT'),
     detailAvgRTT: document.getElementById('detailAvgRTT'),
     detailP95RTT: document.getElementById('detailP95RTT'),
+    detailP95Label: document.getElementById('detailP95Label'),
+    detailJitterLabel: document.getElementById('detailJitterLabel'),
     detailMaxRTT: document.getElementById('detailMaxRTT'),
     detailLoss: document.getElementById('detailLoss'),
     detailJitter: document.getElementById('detailJitter'),
@@ -240,6 +243,7 @@
     inputInterval: document.getElementById('inputInterval'),
     inputTimeout: document.getElementById('inputTimeout'),
     inputFailThreshold: document.getElementById('inputFailThreshold'),
+    inputRecoveryThreshold: document.getElementById('inputRecoveryThreshold'),
     inputConcurrency: document.getElementById('inputConcurrency'),
     inputDownProbeInterval: document.getElementById('inputDownProbeInterval'),
     settingsSubnetsList: document.getElementById('settingsSubnetsList'),
@@ -598,6 +602,7 @@
           el.detailWindowTabs.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
           tab.classList.add('active');
           state.chartWindow = tab.dataset.window;
+          showWindowStats({ p95: null, jitter: null }, state.chartWindow);
           loadHostHistory(state.selectedHostIP, state.chartWindow);
         });
       });
@@ -1046,7 +1051,8 @@
 
     // Filter Chip Badge Counts
     if (el.countAll) el.countAll.textContent = (s.totalTargets || 0).toLocaleString();
-    if (el.countDown) el.countDown.textContent = (s.downCount || 0).toLocaleString();
+    // The "down" filter lists unacknowledged DOWN hosts; acknowledged ones have their own chip
+    if (el.countDown) el.countDown.textContent = Math.max(0, (s.downCount || 0) - (s.ackCount || 0)).toLocaleString();
     if (el.countAck) el.countAck.textContent = (s.ackCount ?? (s.alertsActive - s.alertsUnack) ?? 0).toLocaleString();
     if (el.countUp) el.countUp.textContent = (s.upCount || 0).toLocaleString();
     if (el.countExcluded) el.countExcluded.textContent = (s.excludedCount || 0).toLocaleString();
@@ -1681,8 +1687,9 @@
     ctx.stroke();
   }
 
-  // High-Precision Historical Time Series Chart for Host Modal
-  function drawHistoricalChart(canvas, points) {
+  // Historical time series chart for the host modal. Points are placed by their timestamp in
+  // the window; the line breaks at missing buckets and at buckets without a reply.
+  function drawHistoricalChart(canvas, points, windowMs) {
     const ctx = canvas.getContext('2d');
     const width = canvas.width;
     const height = canvas.height;
@@ -1699,11 +1706,18 @@
       return;
     }
 
-    const avgs = points.map(p => p.avgLatencyMs || 0).filter(v => v > 0);
+    const end = Date.now();
+    const start = end - (windowMs || 3600e3);
+    const xOf = t => ((t - start) / (end - start)) * width;
+    // The middle of a bucket, but not later than now (the hour in progress)
+    const centerOf = p => Math.min(new Date(p.timestamp).getTime() + (p.bucketDurationSec || 60) * 500, end);
+    const hasLatency = p => (p.upRatio || 0) > 0 && p.avgLatencyMs > 0;
+
+    const avgs = points.filter(hasLatency).map(p => p.avgLatencyMs);
     const minVal = avgs.length > 0 ? Math.min(...avgs) * 0.8 : 0;
     const maxVal = avgs.length > 0 ? Math.max(...avgs) * 1.2 : 10;
     const range = maxVal - minVal || 1;
-    const step = width / Math.max(points.length - 1, 1);
+    const yOf = v => height - ((v - minVal) / range) * (height - 20) - 10;
 
     // Draw background grid lines
     ctx.strokeStyle = 'rgba(255,255,255,0.06)';
@@ -1713,52 +1727,144 @@
     ctx.lineTo(width, height / 2);
     ctx.stroke();
 
-    // Draw filled area gradient
+    // Line segments: a new segment starts after a missing bucket or a bucket without replies
+    const segments = [];
+    let seg = [];
+    let prevT = null;
+    points.forEach(p => {
+      const t = new Date(p.timestamp).getTime();
+      const bucketMs = (p.bucketDurationSec || 60) * 1000;
+      const gap = prevT !== null && t - prevT > bucketMs * 1.5;
+      if (seg.length > 0 && (gap || !hasLatency(p))) {
+        segments.push(seg);
+        seg = [];
+      }
+      if (hasLatency(p)) seg.push({ x: xOf(centerOf(p)), y: yOf(p.avgLatencyMs) });
+      prevT = t;
+    });
+    if (seg.length > 0) segments.push(seg);
+
     const gradient = ctx.createLinearGradient(0, 0, 0, height);
     gradient.addColorStop(0, 'rgba(6, 182, 212, 0.35)');
     gradient.addColorStop(1, 'rgba(6, 182, 212, 0.0)');
 
-    ctx.beginPath();
-    ctx.moveTo(0, height);
+    segments.forEach(sg => {
+      if (sg.length === 1) {
+        ctx.fillStyle = '#06b6d4';
+        ctx.beginPath();
+        ctx.arc(sg[0].x, sg[0].y, 2.5, 0, 2 * Math.PI);
+        ctx.fill();
+        return;
+      }
+      ctx.beginPath();
+      ctx.moveTo(sg[0].x, height);
+      sg.forEach(pt => ctx.lineTo(pt.x, pt.y));
+      ctx.lineTo(sg[sg.length - 1].x, height);
+      ctx.closePath();
+      ctx.fillStyle = gradient;
+      ctx.fill();
 
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i];
-      const x = i * step;
-      const val = p.avgLatencyMs || 0;
-      const norm = (val - minVal) / range;
-      const y = height - (norm * (height - 20)) - 10;
-      ctx.lineTo(x, y);
-    }
+      ctx.beginPath();
+      sg.forEach((pt, i) => (i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y)));
+      ctx.strokeStyle = '#06b6d4';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
 
-    ctx.lineTo((points.length - 1) * step, height);
-    ctx.closePath();
-    ctx.fillStyle = gradient;
-    ctx.fill();
-
-    // Draw main line
-    ctx.beginPath();
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i];
-      const x = i * step;
-      const val = p.avgLatencyMs || 0;
-      const norm = (val - minVal) / range;
-      const y = height - (norm * (height - 20)) - 10;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.strokeStyle = '#06b6d4';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    // Draw Loss bars if any packet loss occurred
-    points.forEach((p, idx) => {
+    // Loss bars, one bucket wide
+    points.forEach(p => {
       if (p.packetLossPct > 0) {
-        const x = idx * step;
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.7)';
+        const bucketPx = ((p.bucketDurationSec || 60) * 1000 / (end - start)) * width;
+        const barWidth = Math.max(2, Math.min(10, bucketPx));
         const barHeight = (p.packetLossPct / 100.0) * height;
-        ctx.fillRect(x - 2, height - barHeight, 4, barHeight);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.7)';
+        ctx.fillRect(xOf(centerOf(p)) - barWidth / 2, height - barHeight, barWidth, barHeight);
       }
     });
+  }
+
+  // Windows of the host detail chart and of its P95 and jitter values
+  const CHART_WINDOWS = {
+    realtime: { label: 'last 25 probes' },
+    '1h': { label: 'last hour', ms: 3600e3 },
+    '24h': { label: 'last 24 h', ms: 24 * 3600e3 },
+    '168h': { label: 'last 7 days', ms: 168 * 3600e3 }
+  };
+
+  // P95 and jitter of the live latency history (-1 marks a lost probe)
+  function liveStats(history) {
+    const valid = (history || []).filter(v => v >= 0);
+    let p95 = null;
+    let jitter = null;
+    if (valid.length > 0) {
+      const sorted = valid.slice().sort((a, b) => a - b);
+      p95 = sorted[Math.max(0, Math.ceil(0.95 * sorted.length) - 1)];
+    }
+    if (valid.length > 1) {
+      let sum = 0;
+      for (let i = 1; i < valid.length; i++) sum += Math.abs(valid[i] - valid[i - 1]);
+      jitter = sum / (valid.length - 1);
+    }
+    return { p95, jitter };
+  }
+
+  // P95 and jitter of a whole history window. A point has the percentiles of its own bucket
+  // only, so the window P95 is estimated from the mixture of the bucket distributions
+  // (piecewise linear through min, P50, P95, P99 and max, weighted by successful probes).
+  // Jitter is the mean of the bucket jitters, weighted the same way.
+  const KNOT_PROBS = [0, 0.5, 0.95, 0.99, 1];
+
+  function bucketCdf(knots, x) {
+    if (x < knots[0]) return 0;
+    if (x >= knots[4]) return 1;
+    for (let k = 0; k < 4; k++) {
+      const a = knots[k];
+      const b = knots[k + 1];
+      if (x < b) {
+        return b > a ? KNOT_PROBS[k] + (KNOT_PROBS[k + 1] - KNOT_PROBS[k]) * (x - a) / (b - a) : KNOT_PROBS[k + 1];
+      }
+    }
+    return 1;
+  }
+
+  function windowStats(points) {
+    const buckets = [];
+    let jitterSum = 0;
+    let jitterWeight = 0;
+    (points || []).forEach(p => {
+      const w = (p.sampleCount || 0) * (p.upRatio || 0);
+      if (w <= 0) return;
+      const knots = [p.minLatencyMs, p.p50LatencyMs, p.p95LatencyMs, p.p99LatencyMs, p.maxLatencyMs].map(v => v || 0);
+      for (let k = 1; k < knots.length; k++) knots[k] = Math.max(knots[k], knots[k - 1]);
+      buckets.push({ w, knots });
+      if (p.jitterMs !== null && p.jitterMs !== undefined) {
+        jitterSum += p.jitterMs * w;
+        jitterWeight += w;
+      }
+    });
+    if (buckets.length === 0) return { p95: null, jitter: null };
+
+    const total = buckets.reduce((sum, b) => sum + b.w, 0);
+    const cdf = x => buckets.reduce((sum, b) => sum + b.w * bucketCdf(b.knots, x), 0) / total;
+    let lo = Math.min(...buckets.map(b => b.knots[0]));
+    let hi = Math.max(...buckets.map(b => b.knots[4]));
+    let p95 = lo;
+    if (cdf(lo) < 0.95) {
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        if (cdf(mid) >= 0.95) hi = mid; else lo = mid;
+      }
+      p95 = hi;
+    }
+    return { p95, jitter: jitterWeight > 0 ? jitterSum / jitterWeight : null };
+  }
+
+  function showWindowStats(stats, windowKey) {
+    const label = (CHART_WINDOWS[windowKey] || CHART_WINDOWS.realtime).label;
+    if (el.detailP95Label) el.detailP95Label.textContent = `P95 Latency (${label})`;
+    if (el.detailJitterLabel) el.detailJitterLabel.textContent = `Jitter (${label})`;
+    el.detailP95RTT.textContent = stats.p95 !== null ? `${stats.p95.toFixed(2)} ms` : '-- ms';
+    el.detailJitter.textContent = stats.jitter !== null ? `${stats.jitter.toFixed(2)} ms` : '-- ms';
   }
 
   // -------------------------------------------------------------
@@ -1768,6 +1874,8 @@
   async function openHostDetailModal(ip) {
     if (state.selectedHostIP !== ip) {
       state.metaFormDirty = false;
+      state.historyPoints = [];
+      showWindowStats({ p95: null, jitter: null }, state.chartWindow);
     }
     state.selectedHostIP = ip;
     if (el.detailHostIP) el.detailHostIP.textContent = ip;
@@ -1797,6 +1905,7 @@
     if (window === 'realtime') {
       if (state.selectedHostData) {
         drawSparkline(el.detailSparklineCanvas, state.selectedHostData.latencyHistory || [], state.selectedHostData.status);
+        showWindowStats(liveStats(state.selectedHostData.latencyHistory), window);
       }
       return;
     }
@@ -1804,15 +1913,12 @@
     try {
       const res = await apiFetch(`/api/hosts/${ip}/history?window=${window}`);
       if (res.ok) {
-        state.historyPoints = await res.json();
-        drawHistoricalChart(el.detailSparklineCanvas, state.historyPoints);
-
-        // Update P95 and Jitter from historical data if present
-        if (state.historyPoints.length > 0) {
-          const latest = state.historyPoints[state.historyPoints.length - 1];
-          if (latest.p95LatencyMs) el.detailP95RTT.textContent = `${latest.p95LatencyMs.toFixed(2)} ms`;
-          if (latest.jitterMs) el.detailJitter.textContent = `${latest.jitterMs.toFixed(2)} ms`;
-        }
+        const points = await res.json();
+        // Another host or window was selected while this request ran
+        if (ip !== state.selectedHostIP || window !== state.chartWindow) return;
+        state.historyPoints = points || [];
+        drawHistoricalChart(el.detailSparklineCanvas, state.historyPoints, CHART_WINDOWS[window] ? CHART_WINDOWS[window].ms : undefined);
+        showWindowStats(windowStats(state.historyPoints), window);
       }
     } catch (e) {
       console.error('Failed to load host history:', e);
@@ -1844,12 +1950,8 @@
     el.detailPackets.textContent = `${h.sentPackets || 0} / ${h.recvPackets || 0}`;
     el.detailLastSeen.textContent = h.lastSeen ? formatTimeAgo(new Date(h.lastSeen)) : 'Never';
 
-    // Latency chart
-    if (state.chartWindow === 'realtime') {
-      drawSparkline(el.detailSparklineCanvas, h.latencyHistory || [], h.status);
-    } else {
-      loadHostHistory(h.ip, state.chartWindow);
-    }
+    // Latency chart, P95 and jitter of the selected window
+    loadHostHistory(h.ip, state.chartWindow);
 
     // Form inputs (keep unsaved edits across periodic refreshes)
     if (!state.metaFormDirty) {
@@ -1919,10 +2021,21 @@
 
     try {
       if (isExcl) {
-        await apiFetch(`/api/exclusions?rule=${encodeURIComponent(state.selectedHostIP)}`, { method: 'DELETE' });
-        showToast(`Exclusion rule removed for ${state.selectedHostIP}`, 'success');
+        // The rule that excludes the host can be a subnet rule
+        const rule = state.selectedHostData.exclusionRule || state.selectedHostIP;
+        if (rule !== state.selectedHostIP &&
+            !confirm(`${state.selectedHostIP} is excluded by the rule ${rule}. Remove this rule? It applies to all hosts in ${rule}.`)) {
+          return;
+        }
+        const res = await apiFetch(`/api/exclusions?rule=${encodeURIComponent(rule)}`, { method: 'DELETE' });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          showToast(data.error || `Failed to remove exclusion rule ${rule} (HTTP ${res.status})`, 'error');
+          return;
+        }
+        showToast(`Exclusion rule ${rule} removed`, 'success');
       } else {
-        await apiFetch('/api/exclusions', {
+        const res = await apiFetch('/api/exclusions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1931,6 +2044,11 @@
             enabled: true
           })
         });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          showToast(data.error || `Failed to exclude ${state.selectedHostIP} (HTTP ${res.status})`, 'error');
+          return;
+        }
         showToast(`Excluded ${state.selectedHostIP} from active monitoring`, 'info');
       }
 
@@ -1964,6 +2082,9 @@
           fetchAlerts(),
           fetchSummary()
         ]);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showToast(data.error || `Un-enroll failed (HTTP ${res.status})`, 'error');
       }
     } catch (e) {
       showToast(`Un-enroll error: ${e.message}`, 'error');
@@ -2079,14 +2200,22 @@
       return;
     }
 
+    // Why an alert was closed: the host recovered, or monitoring stopped (configuration change)
+    const resolvePills = {
+      recovered: '<span class="status-pill pill-up">RECOVERED</span>',
+      excluded: '<span class="status-pill pill-excl" title="Closed because an exclusion rule now covers the host">CLOSED: EXCLUDED</span>',
+      removed: '<span class="status-pill pill-excl" title="Closed because the host is no longer monitored">CLOSED: REMOVED</span>'
+    };
+
     state.alertHistory.forEach(alt => {
       const item = document.createElement('div');
       item.className = 'alert-item resolved';
+      const pill = resolvePills[alt.resolveReason] || '<span class="status-pill pill-up">RESOLVED</span>';
 
       item.innerHTML = `
         <div class="alert-item-header">
           <div class="alert-item-ip">${escapeHtml(alt.ip)}</div>
-          <span class="status-pill pill-up">RESOLVED</span>
+          ${pill}
         </div>
         <div class="alert-meta">
           <span>Target: <strong>${escapeHtml(alt.alias || alt.cidr || 'Single IP')}</strong></span>
@@ -2554,6 +2683,7 @@
     el.inputInterval.value = s.intervalSec || 60;
     el.inputTimeout.value = s.timeoutMs || 1000;
     el.inputFailThreshold.value = s.failThreshold || 2;
+    el.inputRecoveryThreshold.value = s.recoveryThreshold || 2;
     el.inputConcurrency.value = s.concurrency || 100;
     el.inputDownProbeInterval.value = s.downProbeIntervalSec ?? 300;
     renderSettingsSubnetsList();
@@ -2571,6 +2701,7 @@
       intervalSec: parseFloat(el.inputInterval.value),
       timeoutMs: parseInt(el.inputTimeout.value, 10),
       failThreshold: parseInt(el.inputFailThreshold.value, 10),
+      recoveryThreshold: parseInt(el.inputRecoveryThreshold.value, 10),
       concurrency: parseInt(el.inputConcurrency.value, 10),
       downProbeIntervalSec: parseInt(el.inputDownProbeInterval.value, 10),
       autoDiscovery: parseInt(el.inputDiscoveryInterval.value, 10) > 0

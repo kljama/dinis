@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// Retention per host. Minute rollups only serve history windows up to 2h and the hourly
-// aggregation (last 60 points); longer windows read the hourly series.
+// Retention per host. Minute rollups only serve history windows up to 2h; longer windows read
+// the hourly series.
 const (
 	MinuteRollupRetention = 120 // 2 hours of 1-minute rollups
 	HourRollupRetention   = 720 // 30 days of 1-hour rollups
@@ -34,77 +34,97 @@ type RollupPoint struct {
 	PacketLossPct     float64       `json:"packetLossPct"`
 	SampleCount       int           `json:"sampleCount"`
 	UpRatio           float64       `json:"upRatio"`
-	JitterMs          float64       `json:"jitterMs"` // Mean consecutive latency variance
+	// JitterMs is the mean difference between consecutive successful probes, including the
+	// step from the last probe before the bucket. nil (JSON null) if there is no such pair.
+	JitterMs *float64 `json:"jitterMs"`
+	// Partial marks the bucket in progress (the current hour up to the last full minute).
+	Partial bool `json:"partial,omitempty"`
 }
 
-// ComputeRollup aggregates raw samples into a single statistical RollupPoint.
-func ComputeRollup(bucketTime time.Time, duration time.Duration, samples []RawSample) RollupPoint {
-	if len(samples) == 0 {
-		return RollupPoint{
-			Timestamp:         bucketTime,
-			BucketDuration:    duration,
-			BucketDurationSec: duration.Seconds(),
-			BucketDurationStr: duration.String(),
-		}
+// jitterState carries the last successful latency of a host across buckets.
+type jitterState struct {
+	last float64
+	has  bool
+}
+
+// bucketStats accumulates the samples of one bucket.
+type bucketStats struct {
+	total, fails int
+	sum          float64
+	min, max     float64
+	valid        []float64 // successful latencies
+	jitterSum    float64
+	jitterN      int
+}
+
+func (b *bucketStats) reset() {
+	*b = bucketStats{valid: b.valid[:0], min: math.MaxFloat64}
+}
+
+func (b *bucketStats) add(lat float64, ok bool, js *jitterState) {
+	b.total++
+	if !ok || lat < 0 {
+		b.fails++
+		return
 	}
-
-	var validLatencies []float64
-	var sumLatency float64
-	var failCount int
-	minLat := math.MaxFloat64
-	maxLat := 0.0
-
-	for _, s := range samples {
-		if s.Success && s.LatencyMs >= 0 {
-			validLatencies = append(validLatencies, s.LatencyMs)
-			sumLatency += s.LatencyMs
-			if s.LatencyMs < minLat {
-				minLat = s.LatencyMs
-			}
-			if s.LatencyMs > maxLat {
-				maxLat = s.LatencyMs
-			}
-		} else {
-			failCount++
-		}
+	b.valid = append(b.valid, lat)
+	b.sum += lat
+	if lat < b.min {
+		b.min = lat
 	}
+	if lat > b.max {
+		b.max = lat
+	}
+	if js.has {
+		b.jitterSum += math.Abs(lat - js.last)
+		b.jitterN++
+	}
+	js.last, js.has = lat, true
+}
 
-	total := len(samples)
-	lossPct := (float64(failCount) / float64(total)) * 100.0
-	upRatio := float64(len(validLatencies)) / float64(total)
-
-	rp := RollupPoint{
+func emptyPoint(bucketTime time.Time, duration time.Duration) RollupPoint {
+	return RollupPoint{
 		Timestamp:         bucketTime,
 		BucketDuration:    duration,
 		BucketDurationSec: duration.Seconds(),
 		BucketDurationStr: duration.String(),
-		PacketLossPct:     lossPct,
-		SampleCount:       total,
-		UpRatio:           upRatio,
 	}
+}
 
-	if len(validLatencies) > 0 {
-		rp.MinLatencyMs = minLat
-		rp.MaxLatencyMs = maxLat
-		rp.AvgLatencyMs = sumLatency / float64(len(validLatencies))
-
-		// Calculate jitter (RFC 3550 standard mean consecutive variance) over chronological samples
-		if len(validLatencies) > 1 {
-			var sumDiff float64
-			for i := 1; i < len(validLatencies); i++ {
-				sumDiff += math.Abs(validLatencies[i] - validLatencies[i-1])
-			}
-			rp.JitterMs = sumDiff / float64(len(validLatencies)-1)
-		}
-
-		// Sort latencies only after temporal metrics like jitter are calculated
-		sort.Float64s(validLatencies)
-		rp.P50LatencyMs = getPercentile(validLatencies, 0.50)
-		rp.P95LatencyMs = getPercentile(validLatencies, 0.95)
-		rp.P99LatencyMs = getPercentile(validLatencies, 0.99)
+// point returns the rollup of the bucket. It sorts b.valid.
+func (b *bucketStats) point(bucketTime time.Time, duration time.Duration) RollupPoint {
+	rp := emptyPoint(bucketTime, duration)
+	if b.total == 0 {
+		return rp
 	}
-
+	rp.SampleCount = b.total
+	rp.PacketLossPct = float64(b.fails) / float64(b.total) * 100.0
+	rp.UpRatio = float64(len(b.valid)) / float64(b.total)
+	if len(b.valid) > 0 {
+		rp.MinLatencyMs = b.min
+		rp.MaxLatencyMs = b.max
+		rp.AvgLatencyMs = b.sum / float64(len(b.valid))
+		sort.Float64s(b.valid)
+		rp.P50LatencyMs = getPercentile(b.valid, 0.50)
+		rp.P95LatencyMs = getPercentile(b.valid, 0.95)
+		rp.P99LatencyMs = getPercentile(b.valid, 0.99)
+	}
+	if b.jitterN > 0 {
+		j := b.jitterSum / float64(b.jitterN)
+		rp.JitterMs = &j
+	}
 	return rp
+}
+
+// ComputeRollup aggregates raw samples into a single statistical RollupPoint. Jitter only
+// uses the pairs of consecutive samples inside the bucket.
+func ComputeRollup(bucketTime time.Time, duration time.Duration, samples []RawSample) RollupPoint {
+	b := bucketStats{min: math.MaxFloat64}
+	var js jitterState
+	for _, s := range samples {
+		b.add(s.LatencyMs, s.Success, &js)
+	}
+	return b.point(bucketTime, duration)
 }
 
 func getPercentile(sorted []float64, pct float64) float64 {
@@ -121,106 +141,204 @@ func getPercentile(sorted []float64, pct float64) float64 {
 	return sorted[idx]
 }
 
-// AggregateRollups aggregates multiple smaller RollupPoints (e.g. 1-minute rollups)
-// into a higher-tier RollupPoint (e.g. 1-hour rollup) using sample-weighted statistics and percentiles.
-func AggregateRollups(bucketTime time.Time, duration time.Duration, points []RollupPoint) RollupPoint {
-	if len(points) == 0 {
-		return RollupPoint{
-			Timestamp:         bucketTime,
-			BucketDuration:    duration,
-			BucketDurationSec: duration.Seconds(),
-			BucketDurationStr: duration.String(),
+// Latency histogram of the hour in progress, from which the hourly percentiles are computed.
+// Buckets are log-scaled: each covers a factor of histGamma, so a percentile is exact within
+// about ±2 %. They span histMinMs to histMinMs × histGamma^histBuckets (about 65 s).
+const (
+	histMinMs   = 0.01
+	histGamma   = 1.04
+	histBuckets = 400
+)
+
+var histLnGamma = math.Log(histGamma)
+
+func histIndex(v float64) int {
+	if v <= histMinMs {
+		return 0
+	}
+	i := int(math.Log(v/histMinMs) / histLnGamma)
+	if i >= histBuckets {
+		i = histBuckets - 1
+	}
+	return i
+}
+
+// histValue returns the value that represents bucket i (its geometric middle).
+func histValue(i int) float64 {
+	return histMinMs * math.Pow(histGamma, float64(i)+0.5)
+}
+
+// hourStats accumulates every sample of one hour.
+type hourStats struct {
+	total, fails, valid uint32
+	sum                 float64
+	min, max            float64
+	jitterSum           float64
+	jitterN             uint32
+	hist                []uint16 // allocated on first use, histBuckets entries
+}
+
+func (h *hourStats) reset() {
+	hist := h.hist
+	clear(hist)
+	*h = hourStats{hist: hist}
+}
+
+func (h *hourStats) addBucket(b *bucketStats) {
+	if h.total == 0 {
+		h.min = math.MaxFloat64
+	}
+	h.total += uint32(b.total)
+	h.fails += uint32(b.fails)
+	h.valid += uint32(len(b.valid))
+	h.sum += b.sum
+	h.jitterSum += b.jitterSum
+	h.jitterN += uint32(b.jitterN)
+	if len(b.valid) == 0 {
+		return
+	}
+	if b.min < h.min {
+		h.min = b.min
+	}
+	if b.max > h.max {
+		h.max = b.max
+	}
+	if h.hist == nil {
+		h.hist = make([]uint16, histBuckets)
+	}
+	for _, v := range b.valid {
+		if i := histIndex(v); h.hist[i] < math.MaxUint16 {
+			h.hist[i]++
 		}
 	}
+}
 
-	var totalSamples int
-	var totalValidSamples float64
-	var totalFailedSamples float64
-
-	var weightedLatencySum float64
-	var weightedJitterSum float64
-	var weightedP50Sum float64
-	var weightedP95Sum float64
-	var weightedP99Sum float64
-
-	minLat := math.MaxFloat64
-	maxLat := 0.0
-
-	for _, pt := range points {
-		if pt.SampleCount <= 0 {
-			continue
-		}
-		totalSamples += pt.SampleCount
-		validCount := float64(pt.SampleCount) * pt.UpRatio
-		failCount := float64(pt.SampleCount) * (pt.PacketLossPct / 100.0)
-
-		totalValidSamples += validCount
-		totalFailedSamples += failCount
-
-		if validCount > 0 {
-			weightedLatencySum += pt.AvgLatencyMs * validCount
-			weightedJitterSum += pt.JitterMs * validCount
-			weightedP50Sum += pt.P50LatencyMs * validCount
-			weightedP95Sum += pt.P95LatencyMs * validCount
-			weightedP99Sum += pt.P99LatencyMs * validCount
-
-			if pt.MinLatencyMs > 0 && pt.MinLatencyMs < minLat {
-				minLat = pt.MinLatencyMs
-			}
-			if pt.MaxLatencyMs > maxLat {
-				maxLat = pt.MaxLatencyMs
-			}
+func (h *hourStats) quantile(q float64) float64 {
+	rank := uint32(math.Ceil(q * float64(h.valid)))
+	if rank < 1 {
+		rank = 1
+	}
+	var cum uint32
+	v := h.max
+	for i, n := range h.hist {
+		cum += uint32(n)
+		if cum >= rank {
+			v = histValue(i)
+			break
 		}
 	}
+	return math.Min(math.Max(v, h.min), h.max)
+}
 
-	if totalSamples == 0 {
-		return RollupPoint{
-			Timestamp:         bucketTime,
-			BucketDuration:    duration,
-			BucketDurationSec: duration.Seconds(),
-			BucketDurationStr: duration.String(),
-		}
+func (h *hourStats) point(start time.Time, partial bool) RollupPoint {
+	rp := emptyPoint(start, time.Hour)
+	rp.Partial = partial
+	if h.total == 0 {
+		return rp
 	}
-
-	rp := RollupPoint{
-		Timestamp:         bucketTime,
-		BucketDuration:    duration,
-		BucketDurationSec: duration.Seconds(),
-		BucketDurationStr: duration.String(),
-		SampleCount:       totalSamples,
-		PacketLossPct:     (totalFailedSamples / float64(totalSamples)) * 100.0,
-		UpRatio:           totalValidSamples / float64(totalSamples),
+	rp.SampleCount = int(h.total)
+	rp.PacketLossPct = float64(h.fails) / float64(h.total) * 100.0
+	rp.UpRatio = float64(h.valid) / float64(h.total)
+	if h.valid > 0 {
+		rp.MinLatencyMs = h.min
+		rp.MaxLatencyMs = h.max
+		rp.AvgLatencyMs = h.sum / float64(h.valid)
+		rp.P50LatencyMs = h.quantile(0.50)
+		rp.P95LatencyMs = h.quantile(0.95)
+		rp.P99LatencyMs = h.quantile(0.99)
 	}
-
-	if totalValidSamples > 0 {
-		if minLat != math.MaxFloat64 {
-			rp.MinLatencyMs = minLat
-		}
-		rp.MaxLatencyMs = maxLat
-		rp.AvgLatencyMs = math.Round((weightedLatencySum/totalValidSamples)*100) / 100
-		rp.JitterMs = math.Round((weightedJitterSum/totalValidSamples)*100) / 100
-		rp.P50LatencyMs = math.Round((weightedP50Sum/totalValidSamples)*100) / 100
-		rp.P95LatencyMs = math.Round((weightedP95Sum/totalValidSamples)*100) / 100
-		rp.P99LatencyMs = math.Round((weightedP99Sum/totalValidSamples)*100) / 100
+	if h.jitterN > 0 {
+		j := h.jitterSum / float64(h.jitterN)
+		rp.JitterMs = &j
 	}
-
 	return rp
 }
 
+// hostAgg is the rollup state of one host: the jitter carry and the hour in progress.
+type hostAgg struct {
+	mu     sync.Mutex
+	jitter jitterState
+	hour   int64 // UnixNano start of the hour in stats; 0 if none
+	stats  hourStats
+}
+
+// rollupMinute rolls up the samples of rb timestamped in [start, end), adds them to the hour
+// in progress, and returns the minute point (false if the bucket has no samples). b is a
+// scratch buffer.
+func (a *hostAgg) rollupMinute(rb *HostRingBuffer, start, end time.Time, b *bucketStats) (RollupPoint, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	b.reset()
+	startNs, endNs := start.UnixNano(), end.UnixNano()
+	rb.mu.RLock()
+	older, newer := rb.partsUnsafe()
+	for _, part := range [2][]packedSample{older, newer} {
+		for _, s := range part {
+			if s.ts >= startNs && s.ts < endNs {
+				b.add(round3(s.lat), s.ok, &a.jitter)
+			}
+		}
+	}
+	rb.mu.RUnlock()
+	if b.total == 0 {
+		return RollupPoint{}, false
+	}
+
+	if hour := start.Truncate(time.Hour).UnixNano(); a.hour != hour {
+		a.stats.reset()
+		a.hour = hour
+	}
+	a.stats.addBucket(b)
+	return b.point(start, time.Minute), true
+}
+
+// rollupHour returns the point of the hour starting at start if it is the hour in progress,
+// and ends that hour. An older unfinished hour (after a pause) is dropped.
+func (a *hostAgg) rollupHour(start time.Time) (RollupPoint, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	startNs := start.UnixNano()
+	var p RollupPoint
+	ok := a.hour == startNs && a.stats.total > 0
+	if ok {
+		p = a.stats.point(start, false)
+	}
+	if a.hour != 0 && a.hour <= startNs {
+		a.stats.reset()
+		a.hour = 0
+	}
+	return p, ok
+}
+
+// currentHour returns the hour in progress as a partial point.
+func (a *hostAgg) currentHour() (RollupPoint, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.hour == 0 || a.stats.total == 0 {
+		return RollupPoint{}, false
+	}
+	return a.stats.point(time.Unix(0, a.hour), true), true
+}
+
 // packedRollup is the compact in-memory form of a RollupPoint. It is pointer-free
-// (not scanned by the GC) and about a third of the size: a series holds hundreds of
-// points for each of thousands of hosts.
+// (not scanned by the GC) and 44 bytes: a series holds hundreds of points for each of
+// thousands of hosts, and a full hour series (720 points) then fits a 32 KB size class.
 type packedRollup struct {
-	ts                           int64 // UnixNano; 0 for a zero timestamp
+	ts                           uint32 // Unix seconds (bucket starts are whole seconds); 0 for a zero timestamp
 	min, max, avg, p50, p95, p99 float32
-	loss, upRatio, jitter        float32
+	loss, upRatio, jitter        float32 // jitter is NaN when the point has none
 	count                        uint32
 }
 
 func packRollup(p RollupPoint) packedRollup {
-	var ts int64
+	var ts uint32
 	if !p.Timestamp.IsZero() {
-		ts = p.Timestamp.UnixNano()
+		ts = uint32(p.Timestamp.Unix())
+	}
+	jitter := float32(math.NaN())
+	if p.JitterMs != nil {
+		jitter = float32(*p.JitterMs)
 	}
 	return packedRollup{
 		ts:      ts,
@@ -232,7 +350,7 @@ func packRollup(p RollupPoint) packedRollup {
 		p99:     float32(p.P99LatencyMs),
 		loss:    float32(p.PacketLossPct),
 		upRatio: float32(p.UpRatio),
-		jitter:  float32(p.JitterMs),
+		jitter:  jitter,
 		count:   uint32(p.SampleCount),
 	}
 }
@@ -245,7 +363,12 @@ func round3(v float32) float64 {
 func (pr packedRollup) unpack(bucket time.Duration) RollupPoint {
 	var ts time.Time
 	if pr.ts != 0 {
-		ts = time.Unix(0, pr.ts)
+		ts = time.Unix(int64(pr.ts), 0)
+	}
+	var jitter *float64
+	if !math.IsNaN(float64(pr.jitter)) {
+		j := round3(pr.jitter)
+		jitter = &j
 	}
 	return RollupPoint{
 		Timestamp:         ts,
@@ -261,7 +384,7 @@ func (pr packedRollup) unpack(bucket time.Duration) RollupPoint {
 		PacketLossPct:     round3(pr.loss),
 		SampleCount:       int(pr.count),
 		UpRatio:           round3(pr.upRatio),
-		JitterMs:          round3(pr.jitter),
+		JitterMs:          jitter,
 	}
 }
 
@@ -271,8 +394,7 @@ type RollupSeries struct {
 	points   []packedRollup
 	bucket   time.Duration
 	capacity int
-	head     int
-	count    int
+	head     int // position of the oldest point once the series is full
 }
 
 // NewRollupSeries creates a series buffer with a fixed capacity for rollups of the given bucket duration.
@@ -281,7 +403,7 @@ func NewRollupSeries(capacity int, bucket time.Duration) *RollupSeries {
 		capacity = MinuteRollupRetention
 	}
 	return &RollupSeries{
-		points:   make([]packedRollup, 0, 8),
+		points:   make([]packedRollup, 0, min(8, capacity)),
 		bucket:   bucket,
 		capacity: capacity,
 	}
@@ -294,17 +416,18 @@ func (rs *RollupSeries) Append(point RollupPoint) {
 
 	packed := packRollup(point)
 	if len(rs.points) < rs.capacity {
+		if len(rs.points) == cap(rs.points) {
+			grown := make([]packedRollup, len(rs.points), grownCap(cap(rs.points), rs.capacity))
+			copy(grown, rs.points)
+			rs.points = grown
+		}
 		rs.points = append(rs.points, packed)
-		rs.count = len(rs.points)
-		rs.head = (rs.head + 1) % rs.capacity
+		rs.head = len(rs.points) % rs.capacity
 		return
 	}
 
 	rs.points[rs.head] = packed
 	rs.head = (rs.head + 1) % rs.capacity
-	if rs.count < rs.capacity {
-		rs.count++
-	}
 }
 
 // GetAll returns all recorded rollup points in chronological order.

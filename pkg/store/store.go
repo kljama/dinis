@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,9 @@ import (
 	"syscall"
 	"time"
 )
+
+// ErrNotFound reports that the entry to change or delete does not exist.
+var ErrNotFound = errors.New("not found")
 
 // CIDRConfig represents a configured CIDR block to monitor.
 type CIDRConfig struct {
@@ -52,9 +56,12 @@ type AppSettings struct {
 	IntervalSec          float64 `json:"intervalSec"`
 	TimeoutMs            int     `json:"timeoutMs"`
 	FailThreshold        int     `json:"failThreshold"`
-	Concurrency          int     `json:"concurrency"`
-	MaxMetricHosts       int     `json:"maxMetricHosts"` // Capacity limit for time-series metric retention
-	AutoDiscovery        bool    `json:"autoDiscovery"`
+	// RecoveryThreshold is the number of successful probes in sequence that a DOWN host needs
+	// to be UP again. Values above 1 stop a host with intermittent loss from flapping.
+	RecoveryThreshold int  `json:"recoveryThreshold"`
+	Concurrency       int  `json:"concurrency"`
+	MaxMetricHosts    int  `json:"maxMetricHosts"` // Capacity limit for time-series metric retention
+	AutoDiscovery     bool `json:"autoDiscovery"`
 	// DownProbeIntervalSec: hosts DOWN for at least this long are probed this often (if longer
 	// than their normal interval). 0 probes DOWN hosts at their normal interval.
 	DownProbeIntervalSec int `json:"downProbeIntervalSec"`
@@ -67,6 +74,7 @@ func DefaultSettings() AppSettings {
 		IntervalSec:          60,  // 60s ping cycle
 		TimeoutMs:            1000,
 		FailThreshold:        2,
+		RecoveryThreshold:    2,
 		Concurrency:          100,
 		MaxMetricHosts:       10000,
 		AutoDiscovery:        true,
@@ -208,6 +216,9 @@ func (s *Store) load() error {
 	}
 	if data.Settings.FailThreshold <= 0 {
 		data.Settings.FailThreshold = defaults.FailThreshold
+	}
+	if data.Settings.RecoveryThreshold <= 0 {
+		data.Settings.RecoveryThreshold = defaults.RecoveryThreshold
 	}
 	if data.Settings.Concurrency <= 0 {
 		data.Settings.Concurrency = defaults.Concurrency
@@ -385,7 +396,7 @@ func (s *Store) AddOrUpdateExclusion(e ExclusionConfig) error {
 	return s.saveUnsafe()
 }
 
-// DeleteExclusion deletes an exclusion rule.
+// DeleteExclusion deletes an exclusion rule. It returns ErrNotFound if no rule matches.
 func (s *Store) DeleteExclusion(rule string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,6 +406,9 @@ func (s *Store) DeleteExclusion(rule string) error {
 		if e.Rule != rule {
 			newList = append(newList, e)
 		}
+	}
+	if len(newList) == len(s.data.Exclusions) {
+		return ErrNotFound
 	}
 	s.data.Exclusions = newList
 	return s.saveUnsafe()

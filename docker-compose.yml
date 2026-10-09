@@ -1,3 +1,10 @@
+# Rotate container logs: nginx logs each request of each open dashboard
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   influxdb3:
     image: influxdb:3-core
@@ -6,9 +13,16 @@ services:
     environment:
       - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
       - INFLUXDB3_NODE_ID=${INFLUXDB3_NODE_ID:-dinis-node}
+      - INFLUXDB3_RETENTION_DAYS=${INFLUXDB3_RETENTION_DAYS:-60}
     entrypoint: ["/bin/sh", "-c"]
+    # With a retention period of N days, all N days stay queryable: the index of Parquet files
+    # loaded at startup covers N days (default 1 month), and a query may read N days of files
+    # (2 files per 10-minute block; default limit 432 files, about 72 hours).
     command:
       - >
+        case "$${INFLUXDB3_RETENTION_DAYS:-60}" in ''|*[!0-9]*) DAYS=0 ;; *) DAYS=$${INFLUXDB3_RETENTION_DAYS:-60} ;; esac;
+        LIMITS="";
+        if [ "$$DAYS" -gt 0 ]; then QFL=$$(( DAYS * 288 )); [ "$$QFL" -ge 432 ] || QFL=432; LIMITS="--gen1-lookback-duration=$${DAYS}d --query-file-limit=$$QFL"; fi;
         if [ -n "$$INFLUXDB3_TOKEN" ]; then
           mkdir -p /var/lib/influxdb3
           echo "{\"token\": \"$$INFLUXDB3_TOKEN\", \"name\": \"admin\"}" > /var/lib/influxdb3/admin-token.json
@@ -18,12 +32,14 @@ services:
             --object-store=file \
             --data-dir=/var/lib/influxdb3/data \
             --admin-token-file=/var/lib/influxdb3/admin-token.json \
+            $$LIMITS \
             --disable-authz health,ping
         else
           exec influxdb3 serve \
             --node-id=$${INFLUXDB3_NODE_ID:-dinis-node} \
             --object-store=file \
             --data-dir=/var/lib/influxdb3/data \
+            $$LIMITS \
             --without-auth
         fi
     ports:
@@ -37,6 +53,7 @@ services:
       retries: 5
       start_period: 3s
     restart: unless-stopped
+    logging: *default-logging
 
   dinis:
     build: .
@@ -58,6 +75,7 @@ services:
       - INFLUXDB3_URL=${INFLUXDB3_URL:-http://influxdb3:8181}
       - INFLUXDB3_BUCKET=${INFLUXDB3_BUCKET:-dinis}
       - INFLUXDB3_TOKEN=${INFLUXDB3_TOKEN:-}
+      - INFLUXDB3_RETENTION_DAYS=${INFLUXDB3_RETENTION_DAYS:-60}
     expose:
       - 8080
     volumes:
@@ -72,6 +90,9 @@ services:
       retries: 3
       start_period: 2s
     restart: unless-stopped
+    # Time for the final alert save and the last InfluxDB flush after SIGTERM
+    stop_grace_period: 30s
+    logging: *default-logging
 
   nginx:
     image: nginx:1.27-alpine
@@ -88,6 +109,7 @@ services:
       influxdb-explorer:
         condition: service_started
     restart: unless-stopped
+    logging: *default-logging
 
   influxdb-explorer:
     image: influxdata/influxdb3-ui:latest
@@ -115,6 +137,7 @@ services:
       influxdb3:
         condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   influxdb3-data:

@@ -99,6 +99,26 @@ jobs:
           BASE_URL: http://localhost
         run: python3 verify_e2e.py
 
+      - name: Verify InfluxDB Retention Period
+        # DINIS creates the database with INFLUXDB3_RETENTION_DAYS (60 in .env.example) before
+        # its first write; the first probe results arrive within one probe interval.
+        run: |
+          cat > /tmp/retention.json <<'EOF'
+          {"db": "_internal", "q": "SELECT retention_period_ns FROM system.databases WHERE database_name = 'dinis'", "format": "json"}
+          EOF
+          for i in $(seq 1 60); do
+            out=$(curl -s -X POST http://localhost:8181/api/v3/query_sql \
+              -H "Authorization: Bearer apiv3_dinis_secret_token" \
+              -H "Content-Type: application/json" -d @/tmp/retention.json)
+            if echo "$out" | grep -q '5184000000000000'; then
+              echo "Database dinis has a retention period of 60 days: $out"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Expected a 60-day retention period (5184000000000000 ns), last answer: $out"
+          exit 1
+
       - name: Dump Container Logs on Failure
         if: failure()
         run: docker compose logs

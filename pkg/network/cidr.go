@@ -118,8 +118,13 @@ func intToIP(n uint32) net.IP {
 // ExclusionMatcher checks whether a given IP matches any exclusion rules in a thread-safe manner.
 type ExclusionMatcher struct {
 	mu       sync.RWMutex
-	exactIPs map[string]string // ip -> reason
+	exactIPs map[string]exactExclusion // normalized ip -> rule
 	subnets  []subnetExclusion
+}
+
+type exactExclusion struct {
+	reason string
+	raw    string // the rule text as configured
 }
 
 type subnetExclusion struct {
@@ -131,7 +136,7 @@ type subnetExclusion struct {
 // NewExclusionMatcher creates a new matcher from a list of IP/CIDR exclusion rules.
 func NewExclusionMatcher() *ExclusionMatcher {
 	return &ExclusionMatcher{
-		exactIPs: make(map[string]string),
+		exactIPs: make(map[string]exactExclusion),
 		subnets:  make([]subnetExclusion, 0),
 	}
 }
@@ -152,7 +157,7 @@ func (m *ExclusionMatcher) AddExclusion(rule string, reason string) error {
 			ip = v4
 		}
 		m.mu.Lock()
-		m.exactIPs[ip.String()] = reason
+		m.exactIPs[ip.String()] = exactExclusion{reason: reason, raw: rule}
 		m.mu.Unlock()
 		return nil
 	}
@@ -173,14 +178,14 @@ func (m *ExclusionMatcher) AddExclusion(rule string, reason string) error {
 }
 
 // Matches checks if the given IP string matches any exclusion.
-// Returns matched bool, matchedRule, and reason.
+// Returns matched bool, matchedRule (the rule text as configured), and reason.
 func (m *ExclusionMatcher) Matches(ipStr string) (bool, string, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	// Fast path: exact raw string match
-	if reason, ok := m.exactIPs[ipStr]; ok {
-		return true, ipStr, reason
+	if e, ok := m.exactIPs[ipStr]; ok {
+		return true, e.raw, e.reason
 	}
 
 	parsed := net.ParseIP(ipStr)
@@ -194,8 +199,8 @@ func (m *ExclusionMatcher) Matches(ipStr string) (bool, string, string) {
 		normIP = v4.String()
 	}
 
-	if reason, ok := m.exactIPs[normIP]; ok {
-		return true, normIP, reason
+	if e, ok := m.exactIPs[normIP]; ok {
+		return true, e.raw, e.reason
 	}
 
 	for _, sub := range m.subnets {

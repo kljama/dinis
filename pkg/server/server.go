@@ -63,6 +63,7 @@ type Coordinator struct {
 	broadcastMu sync.Mutex
 	clientsMu   sync.RWMutex
 	sseClients  map[chan []byte]bool
+	streamsDone bool // CloseStreams ran: no new SSE streams
 	stopChan    chan struct{}
 	stopOnce    sync.Once
 	wg          sync.WaitGroup
@@ -104,12 +105,14 @@ func NewCoordinator(st *store.Store) *Coordinator {
 		Timeout:           time.Duration(settings.TimeoutMs) * time.Millisecond,
 		Concurrency:       settings.Concurrency,
 		FailThreshold:     settings.FailThreshold,
+		RecoveryThreshold: settings.RecoveryThreshold,
 		HistorySize:       25,
 		MaxMetricHosts:    maxMetricHosts,
 		DownProbeInterval: time.Duration(settings.DownProbeIntervalSec) * time.Second,
 	}
 
 	p := pinger.NewEngine(cfg)
+	logHistoryMemory(maxMetricHosts)
 	altMgr := alerts.NewManager(500)
 
 	// Restore alerts, acknowledgements and history from the previous run
@@ -183,14 +186,31 @@ func (c *Coordinator) Stop() {
 		c.wg.Wait()
 		c.pinger.Stop()
 		c.saveAlertState() // final state, after the last probe results are in
-
-		c.clientsMu.Lock()
-		for ch := range c.sseClients {
-			delete(c.sseClients, ch)
-			close(ch)
-		}
-		c.clientsMu.Unlock()
+		c.CloseStreams()
 	})
+}
+
+// CloseStreams ends all open SSE streams and refuses new ones. An SSE stream does not end by
+// itself, and http.Server.Shutdown waits for active requests: register this function with
+// RegisterOnShutdown, so a shutdown does not wait for open dashboards.
+func (c *Coordinator) CloseStreams() {
+	c.clientsMu.Lock()
+	defer c.clientsMu.Unlock()
+	c.streamsDone = true
+	for ch := range c.sseClients {
+		delete(c.sseClients, ch)
+		close(ch)
+	}
+}
+
+// logHistoryMemory logs how much memory the latency history can use.
+func logHistoryMemory(maxHosts int) {
+	mb := timeseries.EstimateMemoryMB(maxHosts)
+	if mb > 4096 {
+		log.Printf("[TIMESERIES] Warning: the latency history of %d hosts can use up to about %d MB of memory. Lower maxMetricHosts if the system has less memory.", maxHosts, mb)
+		return
+	}
+	log.Printf("[TIMESERIES] The latency history of up to %d hosts can use up to about %d MB of memory", maxHosts, mb)
 }
 
 // SetProbeExporter registers a callback that is invoked for every ICMP probe result,
@@ -275,44 +295,23 @@ func (c *Coordinator) RebuildTargetList() {
 		log.Printf("[DINIS] Error pruning unmanaged discovered hosts from disk: %v", err)
 	}
 
-	type parsedCIDR struct {
-		cidr      string
-		ipNet     *net.IPNet
-		prefixLen int
-	}
-	var parsedCIDRs []parsedCIDR
+	index := newCIDRIndex(cidrs)
+	descriptions := make(map[string]string, len(cidrs))
 	for _, cfg := range cidrs {
-		if !cfg.Enabled {
-			continue
-		}
-		_, ipNet, err := net.ParseCIDR(cfg.CIDR)
-		if err == nil && ipNet != nil {
-			ones, _ := ipNet.Mask.Size()
-			parsedCIDRs = append(parsedCIDRs, parsedCIDR{
-				cidr:      cfg.CIDR,
-				ipNet:     ipNet,
-				prefixLen: ones,
-			})
+		if _, ok := descriptions[cfg.CIDR]; !ok && cfg.Description != "" {
+			descriptions[cfg.CIDR] = cfg.Description
 		}
 	}
 
-	hostMap := make(map[string]*pinger.HostState)
+	// One snapshot each, instead of a locked lookup for every host
+	statuses := c.pinger.GetStatusMap()
+	activeAlerts := c.alerts.GetActiveAlertsMap()
+
+	hostMap := make(map[string]*pinger.HostState, len(discovered))
 
 	for ip, disc := range discovered {
-		// Determine best matching enabled CIDR for this IP (longest-prefix match)
-		var matchedCIDR string
-		var maxPrefixLen int = -1
-		parsedIP := net.ParseIP(ip)
-		if parsedIP != nil {
-			for _, pc := range parsedCIDRs {
-				if pc.ipNet.Contains(parsedIP) {
-					if pc.prefixLen > maxPrefixLen {
-						maxPrefixLen = pc.prefixLen
-						matchedCIDR = pc.cidr
-					}
-				}
-			}
-		}
+		// Best matching enabled CIDR for this IP (longest prefix)
+		matchedCIDR := index.lookup(ip)
 
 		// If the host is not static and doesn't belong to any valid enabled CIDR, skip it
 		if !disc.IsStatic && matchedCIDR == "" && !validCIDRs[disc.CIDR] {
@@ -332,30 +331,25 @@ func (c *Coordinator) RebuildTargetList() {
 			}
 		}
 
-		matched, _, reason := matcher.Matches(ip)
+		matched, rule, reason := matcher.Matches(ip)
 		meta := allMeta[ip]
 		alias := meta.Alias
 		if alias == "" {
-			for _, cfg := range cidrs {
-				if cfg.CIDR == hostCIDR && cfg.Description != "" {
-					alias = cfg.Description
-					break
-				}
-			}
+			alias = descriptions[hostCIDR]
 		}
 
 		status := pinger.StatusPending
-		existing, inEngine := c.pinger.GetHost(ip)
+		existingStatus, inEngine := statuses[ip]
 		if matched {
 			status = pinger.StatusExcluded
 		} else if inEngine {
 			// Retain existing live status (e.g. UP, DOWN) across rebuilds
-			status = existing.Status
+			status = existingStatus
 		}
 		var consecutiveFails int
 		var lastStateChange *time.Time
 
-		activeAlert, hasAlert := c.alerts.GetAlertForIP(ip)
+		activeAlert, hasAlert := activeAlerts[ip]
 		alertActive := false
 		alertID := ""
 		alertAck := false
@@ -397,6 +391,7 @@ func (c *Coordinator) RebuildTargetList() {
 			LastStateChange:   lastStateChange,
 			IsExcluded:        matched,
 			ExclusionReason:   reason,
+			ExclusionRule:     rule,
 			DiscoveredAt:      &discAt,
 			LastDiscovered:    &lastDisc,
 			IsStatic:          disc.IsStatic,
@@ -411,11 +406,15 @@ func (c *Coordinator) RebuildTargetList() {
 		}
 	}
 
-	// Clean up any active alerts for hosts that are no longer monitored or are now excluded
+	// Close the alerts of hosts that are no longer monitored or are now excluded
+	c.alerts.ResolveIf(func(a *alerts.Alert) bool {
+		_, exists := hostMap[a.IP]
+		return !exists
+	}, alerts.ResolveRemoved)
 	c.alerts.ResolveIf(func(a *alerts.Alert) bool {
 		h, exists := hostMap[a.IP]
-		return !exists || h.IsExcluded
-	})
+		return exists && h.IsExcluded
+	}, alerts.ResolveExcluded)
 
 	subnetIntervals := make(map[string]time.Duration)
 	for _, cfg := range cidrs {
@@ -463,6 +462,117 @@ func (c *Coordinator) invalidateSnapshots() {
 	c.snapMu.Lock()
 	clear(c.snapCache)
 	c.snapMu.Unlock()
+}
+
+// cidrIndex finds the longest enabled CIDR that contains an IP. IPv4 CIDRs are kept in one
+// map per prefix length, so a lookup costs one map access per prefix length in use instead
+// of one test per CIDR.
+type cidrIndex struct {
+	prefixes []int                     // IPv4 prefix lengths in use, longest first
+	v4       map[int]map[uint32]string // prefix length -> network address -> CIDR
+	other    []*net.IPNet              // other (IPv6) CIDRs, tested one by one
+	otherStr []string
+}
+
+func newCIDRIndex(cidrs []store.CIDRConfig) *cidrIndex {
+	idx := &cidrIndex{v4: make(map[int]map[uint32]string)}
+	for _, cfg := range cidrs {
+		if !cfg.Enabled {
+			continue
+		}
+		_, ipNet, err := net.ParseCIDR(cfg.CIDR)
+		if err != nil || ipNet == nil {
+			continue
+		}
+		ones, bits := ipNet.Mask.Size()
+		v4 := ipNet.IP.To4()
+		if bits != 32 || v4 == nil {
+			idx.other = append(idx.other, ipNet)
+			idx.otherStr = append(idx.otherStr, cfg.CIDR)
+			continue
+		}
+		m, ok := idx.v4[ones]
+		if !ok {
+			m = make(map[uint32]string)
+			idx.v4[ones] = m
+			idx.prefixes = append(idx.prefixes, ones)
+		}
+		if _, dup := m[binary.BigEndian.Uint32(v4)]; !dup {
+			m[binary.BigEndian.Uint32(v4)] = cfg.CIDR
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(idx.prefixes)))
+	return idx
+}
+
+// lookup returns the longest enabled CIDR that contains ip, or "".
+func (idx *cidrIndex) lookup(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ""
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		n := binary.BigEndian.Uint32(v4)
+		for _, pl := range idx.prefixes {
+			var mask uint32
+			if pl > 0 {
+				mask = ^uint32(0) << (32 - pl)
+			}
+			if cidr, ok := idx.v4[pl][n&mask]; ok {
+				return cidr
+			}
+		}
+	}
+	best, bestLen := "", -1
+	for i, n := range idx.other {
+		if ones, _ := n.Mask.Size(); ones > bestLen && n.Contains(parsed) {
+			best, bestLen = idx.otherStr[i], ones
+		}
+	}
+	return best
+}
+
+// UpdateHostMeta saves the alias and notes of a host and applies them to the monitored host
+// and its active alert, without rebuilding the target list.
+func (c *Coordinator) UpdateHostMeta(ip, alias, notes string) error {
+	// Serialize with RebuildTargetList, so a rebuild cannot apply older metadata afterwards
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
+
+	if err := c.store.SetHostMeta(store.HostMeta{IP: ip, Alias: alias, Notes: notes}); err != nil {
+		return err
+	}
+	h, ok := c.pinger.GetHost(ip)
+	if !ok {
+		return nil // not monitored: RebuildTargetList applies the metadata when it is
+	}
+	effective := alias
+	if effective == "" {
+		for _, cfg := range c.store.GetCIDRs() {
+			if cfg.CIDR == h.CIDR && cfg.Description != "" {
+				effective = cfg.Description
+				break
+			}
+		}
+	}
+	c.pinger.SetHostMeta(ip, effective, notes)
+	c.alerts.UpdateAlertMetadata(ip, effective, h.CIDR)
+	c.invalidateSnapshots()
+	return nil
+}
+
+// singleIPTargetCIDR returns the enabled CIDR entry that targets exactly ip (for example
+// 10.1.2.3/32), or "".
+func (c *Coordinator) singleIPTargetCIDR(ip string) string {
+	for _, cfg := range c.store.GetCIDRs() {
+		if !cfg.Enabled {
+			continue
+		}
+		if info, err := network.ParseCIDR(cfg.CIDR, cfg.IncludeNetAndBcast); err == nil && info.TotalHosts == 1 && info.IPs[0] == ip {
+			return cfg.CIDR
+		}
+	}
+	return ""
 }
 
 // DeleteCIDR removes a CIDR configuration and stops monitoring the hosts it enrolled.
@@ -899,7 +1009,11 @@ func (c *Coordinator) handleBeforeStateChange(h *pinger.HostState, oldStatus, ne
 		h.AlertAckAt = alt.AcknowledgedAt
 		h.AlertStartedAt = &alt.StartedAt
 	case pinger.StatusUp, pinger.StatusExcluded:
-		c.alerts.Resolve(h.IP)
+		reason := alerts.ResolveRecovered
+		if newStatus == pinger.StatusExcluded {
+			reason = alerts.ResolveExcluded
+		}
+		c.alerts.Resolve(h.IP, reason)
 		h.AlertActive = false
 		h.AlertAcknowledged = false
 		h.AlertID = ""
@@ -1608,6 +1722,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	clientChan := make(chan []byte, 100)
 
 	s.coord.clientsMu.Lock()
+	if s.coord.streamsDone {
+		s.coord.clientsMu.Unlock()
+		http.Error(w, "Server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	if len(s.coord.sseClients) >= s.coord.maxSSEClients {
 		s.coord.clientsMu.Unlock()
 		http.Error(w, "Too many SSE clients", http.StatusServiceUnavailable)
@@ -1867,25 +1986,33 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 		filtered = append(filtered, h)
 	}
 
-	// Sort
+	// Sort. Each IP is parsed once, not in every comparison.
 	if sortField != "" {
-		sort.Slice(filtered, func(i, j int) bool {
-			a, b := filtered[i], filtered[j]
+		type sortItem struct {
+			h  *pinger.HostState
+			ip uint32
+			w  int
+		}
+		items := make([]sortItem, len(filtered))
+		for i, h := range filtered {
+			items[i] = sortItem{h: h, ip: ipToUint32(h.IP), w: getStatusWeight(h)}
+		}
+		sort.Slice(items, func(i, j int) bool {
+			a, b := items[i], items[j]
 			switch sortField {
 			case "ip-asc":
-				return ipToUint32(a.IP) < ipToUint32(b.IP)
+				return a.ip < b.ip
 			case "ip-desc":
-				return ipToUint32(a.IP) > ipToUint32(b.IP)
+				return a.ip > b.ip
 			case "status":
-				wa, wb := getStatusWeight(a), getStatusWeight(b)
-				if wa != wb {
-					return wa < wb
+				if a.w != b.w {
+					return a.w < b.w
 				}
-				return ipToUint32(a.IP) < ipToUint32(b.IP)
+				return a.ip < b.ip
 			case "latency-desc":
-				return a.LatencyMs > b.LatencyMs
+				return a.h.LatencyMs > b.h.LatencyMs
 			case "latency-asc":
-				latA, latB := a.LatencyMs, b.LatencyMs
+				latA, latB := a.h.LatencyMs, b.h.LatencyMs
 				if latA == 0 {
 					latA = 99999
 				}
@@ -1894,11 +2021,14 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 				}
 				return latA < latB
 			case "loss":
-				return a.PacketLoss > b.PacketLoss
+				return a.h.PacketLoss > b.h.PacketLoss
 			default:
-				return ipToUint32(a.IP) < ipToUint32(b.IP)
+				return a.ip < b.ip
 			}
 		})
+		for i := range items {
+			filtered[i] = items[i].h
+		}
 	}
 
 	total := len(filtered)
@@ -1929,6 +2059,10 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pagedHosts := filtered[start:end]
+	if lightweight {
+		// The snapshot has no latency history; add it for the hosts of this page only
+		s.coord.pinger.FillLatencyHistory(pagedHosts)
+	}
 	totalPages := 0
 	if limit > 0 {
 		totalPages = (total + limit - 1) / limit
@@ -2165,12 +2299,17 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 			return
 		}
+		// A single-IP CIDR entry would enroll the host again at once
+		if cidr := s.coord.singleIPTargetCIDR(ip); cidr != "" {
+			writeError(w, http.StatusConflict, fmt.Sprintf("%s is monitored through the CIDR entry %s. To stop monitoring it, delete or disable that entry.", ip, cidr))
+			return
+		}
 		if err := s.coord.store.RemoveDiscoveredHost(ip); err != nil {
 			log.Printf("[DINIS] Error removing host %s: %v", ip, err)
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to un-enroll host: %v", err))
 			return
 		}
-		s.coord.alerts.Resolve(ip)
+		// The rebuild stops monitoring the host and closes its alert (reason "removed")
 		s.coord.RebuildTargetList()
 		writeJSON(w, http.StatusOK, map[string]string{"message": "Host un-enrolled from active monitoring"})
 
@@ -2237,17 +2376,10 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		err := s.coord.store.SetHostMeta(store.HostMeta{
-			IP:    ip,
-			Alias: req.Alias,
-			Notes: req.Notes,
-		})
-		if err != nil {
+		if err := s.coord.UpdateHostMeta(ip, req.Alias, req.Notes); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-
-		s.coord.RebuildTargetList()
 		h, _ := s.coord.pinger.GetHost(ip)
 		writeJSON(w, http.StatusOK, h)
 
@@ -2478,6 +2610,10 @@ func (s *Server) handleExclusions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.coord.store.DeleteExclusion(rule); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("No exclusion rule %q", rule))
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -2617,6 +2753,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		if req.FailThreshold > 100 {
 			req.FailThreshold = 100
 		}
+		if req.RecoveryThreshold <= 0 {
+			req.RecoveryThreshold = 1
+		}
+		if req.RecoveryThreshold > 100 {
+			req.RecoveryThreshold = 100
+		}
 		if req.Concurrency <= 0 {
 			req.Concurrency = 100
 		}
@@ -2640,22 +2782,27 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			req.DownProbeIntervalSec = 86400
 		}
 
+		previousMaxHosts := s.coord.store.GetSettings().MaxMetricHosts
 		if err := s.coord.store.UpdateSettings(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if req.MaxMetricHosts != previousMaxHosts {
+			logHistoryMemory(req.MaxMetricHosts)
+		}
 
-		// Update engine config live
+		// Update engine config live. The target list does not depend on these settings.
 		s.coord.pinger.UpdateConfig(pinger.EngineConfig{
 			Interval:          time.Duration(req.IntervalSec * float64(time.Second)),
 			Timeout:           time.Duration(req.TimeoutMs) * time.Millisecond,
 			Concurrency:       req.Concurrency,
 			FailThreshold:     req.FailThreshold,
+			RecoveryThreshold: req.RecoveryThreshold,
 			HistorySize:       25,
 			MaxMetricHosts:    req.MaxMetricHosts,
 			DownProbeInterval: time.Duration(req.DownProbeIntervalSec) * time.Second,
 		})
-		s.coord.RebuildTargetList()
+		s.coord.invalidateSnapshots()
 
 		s.coord.discMu.Lock()
 		s.coord.discoveryStatus.IntervalMin = req.DiscoveryIntervalMin

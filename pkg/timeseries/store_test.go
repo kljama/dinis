@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -82,8 +83,8 @@ func TestRollupComputation(t *testing.T) {
 	if rp.MinLatencyMs != 12.0 || rp.MaxLatencyMs != 18.0 {
 		t.Errorf("expected min 12 max 18, got min %f max %f", rp.MinLatencyMs, rp.MaxLatencyMs)
 	}
-	if rp.JitterMs != 2.0 {
-		t.Errorf("expected jitter 2.0, got %f", rp.JitterMs)
+	if rp.JitterMs == nil || *rp.JitterMs != 2.0 {
+		t.Errorf("expected jitter 2.0, got %v", rp.JitterMs)
 	}
 }
 
@@ -101,8 +102,8 @@ func TestRollupJitterOrder(t *testing.T) {
 	}
 
 	rp := ComputeRollup(now, 1*time.Minute, samples)
-	if rp.JitterMs != 40.0 {
-		t.Errorf("expected true temporal jitter 40.0 ms, got %f ms", rp.JitterMs)
+	if rp.JitterMs == nil || *rp.JitterMs != 40.0 {
+		t.Errorf("expected true temporal jitter 40.0 ms, got %v ms", rp.JitterMs)
 	}
 	if rp.P50LatencyMs != 10.0 && rp.P50LatencyMs != 50.0 {
 		t.Errorf("unexpected P50 percentile: %f", rp.P50LatencyMs)
@@ -212,74 +213,6 @@ func TestGetSinceClockSkewNonMonotonic(t *testing.T) {
 	}
 	if pts[0].AvgLatencyMs != 2.0 || pts[1].AvgLatencyMs != 4.0 {
 		t.Errorf("unexpected rollup points returned: %+v", pts)
-	}
-}
-
-func TestAggregateRollupsWeightedMath(t *testing.T) {
-	now := time.Now()
-
-	// Minute 1: 10 samples, 10ms avg, P50=10, P95=10, P99=10, jitter=1.0, 0% loss, UpRatio=1.0
-	m1 := RollupPoint{
-		Timestamp:      now.Add(-2 * time.Minute),
-		BucketDuration: 1 * time.Minute,
-		SampleCount:    10,
-		UpRatio:        1.0,
-		PacketLossPct:  0.0,
-		MinLatencyMs:   8.0,
-		MaxLatencyMs:   12.0,
-		AvgLatencyMs:   10.0,
-		P50LatencyMs:   10.0,
-		P95LatencyMs:   12.0,
-		P99LatencyMs:   12.0,
-		JitterMs:       1.0,
-	}
-
-	// Minute 2: 90 samples, 20ms avg, P50=20, P95=25, P99=25, jitter=2.0, 0% loss, UpRatio=1.0
-	m2 := RollupPoint{
-		Timestamp:      now.Add(-1 * time.Minute),
-		BucketDuration: 1 * time.Minute,
-		SampleCount:    90,
-		UpRatio:        1.0,
-		PacketLossPct:  0.0,
-		MinLatencyMs:   15.0,
-		MaxLatencyMs:   30.0,
-		AvgLatencyMs:   20.0,
-		P50LatencyMs:   20.0,
-		P95LatencyMs:   25.0,
-		P99LatencyMs:   25.0,
-		JitterMs:       2.0,
-	}
-
-	hourRollup := AggregateRollups(now, 1*time.Hour, []RollupPoint{m1, m2})
-
-	// Total samples: 100
-	if hourRollup.SampleCount != 100 {
-		t.Errorf("expected SampleCount 100, got %d", hourRollup.SampleCount)
-	}
-
-	// Weighted average latency: (10*10 + 90*20)/100 = 19.0 (NOT (10+20)/2 = 15.0)
-	if hourRollup.AvgLatencyMs != 19.0 {
-		t.Errorf("expected weighted AvgLatencyMs 19.0, got %f", hourRollup.AvgLatencyMs)
-	}
-
-	// Weighted jitter: (10*1.0 + 90*2.0)/100 = 1.9
-	if hourRollup.JitterMs != 1.9 {
-		t.Errorf("expected weighted JitterMs 1.9, got %f", hourRollup.JitterMs)
-	}
-
-	// Weighted P50: (10*10 + 90*20)/100 = 19.0
-	if hourRollup.P50LatencyMs != 19.0 {
-		t.Errorf("expected weighted P50 19.0, got %f", hourRollup.P50LatencyMs)
-	}
-
-	// Weighted P95: (10*12 + 90*25)/100 = (120 + 2250)/100 = 23.7
-	if hourRollup.P95LatencyMs != 23.7 {
-		t.Errorf("expected weighted P95 23.7, got %f", hourRollup.P95LatencyMs)
-	}
-
-	// Min and Max
-	if hourRollup.MinLatencyMs != 8.0 || hourRollup.MaxLatencyMs != 30.0 {
-		t.Errorf("expected min 8.0 max 30.0, got min %f max %f", hourRollup.MinLatencyMs, hourRollup.MaxLatencyMs)
 	}
 }
 
@@ -622,11 +555,11 @@ func TestRollupPointJSONDuration(t *testing.T) {
 }
 
 func TestRollupSeriesPackRoundTrip(t *testing.T) {
-	if size := unsafe.Sizeof(packedRollup{}); size != 48 {
-		t.Errorf("expected packedRollup to be 48 bytes, got %d", size)
+	if size := unsafe.Sizeof(packedRollup{}); size != 44 {
+		t.Errorf("expected packedRollup to be 44 bytes, got %d", size)
 	}
 
-	ts := time.Date(2026, 10, 5, 12, 34, 56, 123456789, time.UTC)
+	ts := time.Date(2026, 10, 5, 12, 34, 0, 0, time.UTC) // bucket starts are whole seconds
 	in := RollupPoint{
 		Timestamp:     ts,
 		MinLatencyMs:  0.137,
@@ -638,7 +571,7 @@ func TestRollupSeriesPackRoundTrip(t *testing.T) {
 		PacketLossPct: 33.333,
 		SampleCount:   60,
 		UpRatio:       0.667,
-		JitterMs:      2.5,
+		JitterMs:      ptr(2.5),
 	}
 
 	rs := NewRollupSeries(5, time.Minute)
@@ -667,7 +600,7 @@ func TestRollupSeriesPackRoundTrip(t *testing.T) {
 		"p99":    {in.P99LatencyMs, out.P99LatencyMs},
 		"loss":   {in.PacketLossPct, out.PacketLossPct},
 		"up":     {in.UpRatio, out.UpRatio},
-		"jitter": {in.JitterMs, out.JitterMs},
+		"jitter": {*in.JitterMs, *out.JitterMs},
 	}
 	for name, p := range pairs {
 		if math.Abs(p[0]-p[1]) > 1e-3 {
@@ -753,5 +686,149 @@ func TestMinuteAndHourRollupsCoverEverySample(t *testing.T) {
 	hp := st.getOrCreateHourSeries("10.0.0.1").GetAll()
 	if len(hp) != 1 || hp[0].SampleCount != want || !hp[0].Timestamp.Equal(hour) {
 		t.Fatalf("expected one hour point with %d samples at %v, got %+v", want, hour, hp)
+	}
+}
+
+func ptr(v float64) *float64 { return &v }
+
+// One sample per minute (the default 60 s interval): the hour point must report the real
+// percentiles of its 60 samples, and jitter across the minute boundaries.
+func TestHourPercentilesAndJitterAtOneSamplePerMinute(t *testing.T) {
+	st := NewStoreWithLimit(10)
+	ip := "10.0.0.1"
+	hour := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+
+	var lat []float64
+	for i := 0; i < 60; i++ {
+		v := 10.0 + float64(i%2)*10.0 // 10, 20, 10, 20, ...
+		if i%12 == 5 {                // 5 spikes of 500 ms (8.3 % of the samples)
+			v = 500
+		}
+		lat = append(lat, v)
+		st.Record(ip, hour.Add(time.Duration(i)*time.Minute+30*time.Second), v, true)
+	}
+	for i := 0; i < 60; i++ {
+		start := hour.Add(time.Duration(i) * time.Minute)
+		st.computeMinuteRollups(start, start.Add(time.Minute))
+	}
+	st.computeHourRollups(hour, hour.Add(time.Hour))
+
+	hp := st.getOrCreateHourSeries(ip).GetAll()
+	if len(hp) != 1 {
+		t.Fatalf("expected 1 hour point, got %d", len(hp))
+	}
+	p := hp[0]
+	var jit float64
+	for i := 1; i < len(lat); i++ {
+		jit += math.Abs(lat[i] - lat[i-1])
+	}
+	jit /= float64(len(lat) - 1)
+
+	within := func(got, want, rel float64) bool { return math.Abs(got-want) <= want*rel }
+	// 30 samples of 10 ms, 25 of 20 ms and 5 of 500 ms: the 30th of 60 sorted values is 10 ms
+	if !within(p.P50LatencyMs, 10, 0.03) {
+		t.Errorf("p50: got %.3f, want about 10", p.P50LatencyMs)
+	}
+	if !within(p.P95LatencyMs, 500, 0.03) || !within(p.P99LatencyMs, 500, 0.03) {
+		t.Errorf("p95/p99: got %.3f/%.3f, want about 500 (the spikes)", p.P95LatencyMs, p.P99LatencyMs)
+	}
+	if p.MaxLatencyMs != 500 || p.MinLatencyMs != 10 {
+		t.Errorf("min/max: got %.3f/%.3f, want 10/500", p.MinLatencyMs, p.MaxLatencyMs)
+	}
+	if p.JitterMs == nil || !within(*p.JitterMs, jit, 0.001) {
+		t.Errorf("jitter: got %v, want %.3f", p.JitterMs, jit)
+	}
+
+	// Each minute has one sample: its jitter is the step from the previous minute's sample
+	m := st.getOrCreateMinuteSeries(ip).GetAll()
+	if m[0].JitterMs != nil {
+		t.Errorf("the first sample has no predecessor: want null jitter, got %v", *m[0].JitterMs)
+	}
+	if m[1].JitterMs == nil || *m[1].JitterMs != 10 {
+		t.Errorf("minute 1: want jitter 10 (step from 10 to 20 ms), got %v", m[1].JitterMs)
+	}
+}
+
+func TestJitterIsNullWithoutSamplePairs(t *testing.T) {
+	rp := ComputeRollup(time.Now(), time.Minute, []RawSample{{Timestamp: time.Now(), LatencyMs: 5, Success: true}})
+	if rp.JitterMs != nil {
+		t.Fatalf("expected null jitter for a single sample, got %v", *rp.JitterMs)
+	}
+	data, _ := json.Marshal(rp)
+	if !strings.Contains(string(data), `"jitterMs":null`) {
+		t.Fatalf("expected jitterMs null in JSON, got %s", data)
+	}
+	rs := NewRollupSeries(2, time.Minute)
+	rs.Append(rp)
+	if got := rs.GetAll()[0].JitterMs; got != nil {
+		t.Fatalf("null jitter must survive packing, got %v", *got)
+	}
+}
+
+// Windows longer than 2 hours read hour points; they must include the hour in progress.
+func TestHostHistoryIncludesHourInProgress(t *testing.T) {
+	st := NewStoreWithLimit(10)
+	ip := "10.0.0.1"
+	now := time.Now()
+	thisHour := now.Truncate(time.Hour)
+	lastHour := thisHour.Add(-time.Hour)
+
+	st.Record(ip, lastHour.Add(10*time.Minute), 5, true)
+	st.computeMinuteRollups(lastHour.Add(10*time.Minute), lastHour.Add(11*time.Minute))
+	st.computeHourRollups(lastHour, thisHour)
+
+	if now.Sub(thisHour) < time.Minute {
+		t.Skip("too close to the start of the hour")
+	}
+	st.Record(ip, thisHour.Add(5*time.Second), 7, true)
+	st.computeMinuteRollups(thisHour, thisHour.Add(time.Minute))
+
+	pts := st.GetHostHistory(ip, 6*time.Hour)
+	if len(pts) != 2 {
+		t.Fatalf("expected the last full hour and the hour in progress, got %d points", len(pts))
+	}
+	if pts[0].Partial || !pts[1].Partial || !pts[1].Timestamp.Equal(thisHour) || pts[1].AvgLatencyMs != 7 {
+		t.Fatalf("unexpected points %+v", pts)
+	}
+
+	// When the hour ends, the hour in progress becomes a normal hour point
+	st.computeHourRollups(thisHour, thisHour.Add(time.Hour))
+	pts = st.GetHostHistory(ip, 6*time.Hour)
+	if len(pts) != 2 || pts[1].Partial {
+		t.Fatalf("expected two complete hour points, got %+v", pts)
+	}
+}
+
+func TestBuffersStopGrowingAtCapacity(t *testing.T) {
+	rb := NewHostRingBuffer(RawSampleRetention)
+	rs := NewRollupSeries(HourRollupRetention, time.Hour)
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		rb.Push(now, 1, true)
+		rs.Append(RollupPoint{Timestamp: now, SampleCount: 1})
+	}
+	if cap(rb.samples) != RawSampleRetention || cap(rs.points) != HourRollupRetention {
+		t.Fatalf("expected no slack: ring cap %d (want %d), series cap %d (want %d)",
+			cap(rb.samples), RawSampleRetention, cap(rs.points), HourRollupRetention)
+	}
+	if size := unsafe.Sizeof(packedSample{}); size != 16 {
+		t.Fatalf("expected packedSample to be 16 bytes, got %d", size)
+	}
+}
+
+func TestComputeSummaryReusesScratch(t *testing.T) {
+	rb := NewHostRingBuffer(8)
+	now := time.Now()
+	for i, v := range []float64{10, 50, 10, 50} {
+		rb.Push(now.Add(time.Duration(i)*time.Second), v, true)
+	}
+	rb.Push(now.Add(5*time.Second), 0, false)
+	scratch := make([]float64, 0, 16)
+	avg, minL, maxL, p95, loss, jitter, count, out := rb.computeSummary(scratch)
+	if avg != 30 || minL != 10 || maxL != 50 || p95 != 50 || loss != 0.2 || jitter != 40 || count != 5 {
+		t.Fatalf("unexpected summary avg=%v min=%v max=%v p95=%v loss=%v jitter=%v count=%v", avg, minL, maxL, p95, loss, jitter, count)
+	}
+	if &out[:1][0] != &scratch[:1][0] {
+		t.Fatal("expected the scratch buffer to be reused")
 	}
 }

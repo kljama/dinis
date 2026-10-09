@@ -7,20 +7,44 @@ import (
 	"time"
 )
 
-// RawSample represents a single ICMP probe result stored in memory.
+// RawSample represents a single ICMP probe result.
 type RawSample struct {
 	Timestamp time.Time
 	LatencyMs float64
 	Success   bool
 }
 
+// packedSample is the in-memory form of a RawSample. It is 16 bytes and pointer-free (a
+// time.Time holds a pointer), so ring buffers are small and the GC does not scan them.
+type packedSample struct {
+	ts  int64 // UnixNano
+	lat float32
+	ok  bool
+}
+
+func (p packedSample) unpack() RawSample {
+	return RawSample{Timestamp: time.Unix(0, p.ts), LatencyMs: round3(p.lat), Success: p.ok}
+}
+
+// grownCap returns the new capacity for a full slice of cur elements that may hold at most
+// limit elements. It doubles but never exceeds limit, so a buffer at its limit has no slack.
+func grownCap(cur, limit int) int {
+	n := cur * 2
+	if n < 8 {
+		n = 8
+	}
+	if n > limit {
+		n = limit
+	}
+	return n
+}
+
 // HostRingBuffer is a fixed-size circular buffer storing the most recent raw probe samples for a single IP.
 type HostRingBuffer struct {
 	mu       sync.RWMutex
-	samples  []RawSample
+	samples  []packedSample
 	capacity int
-	head     int
-	count    int
+	head     int // position of the oldest sample once the buffer is full
 }
 
 // NewHostRingBuffer creates a new ring buffer with the given capacity.
@@ -29,7 +53,7 @@ func NewHostRingBuffer(capacity int) *HostRingBuffer {
 		capacity = RawSampleRetention
 	}
 	return &HostRingBuffer{
-		samples:  make([]RawSample, 0, 8),
+		samples:  make([]packedSample, 0, min(8, capacity)),
 		capacity: capacity,
 	}
 }
@@ -39,24 +63,28 @@ func (rb *HostRingBuffer) Push(timestamp time.Time, latencyMs float64, success b
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	sample := RawSample{
-		Timestamp: timestamp,
-		LatencyMs: latencyMs,
-		Success:   success,
-	}
-
+	s := packedSample{ts: timestamp.UnixNano(), lat: float32(latencyMs), ok: success}
 	if len(rb.samples) < rb.capacity {
-		rb.samples = append(rb.samples, sample)
-		rb.count = len(rb.samples)
-		rb.head = (rb.head + 1) % rb.capacity
+		if len(rb.samples) == cap(rb.samples) {
+			grown := make([]packedSample, len(rb.samples), grownCap(cap(rb.samples), rb.capacity))
+			copy(grown, rb.samples)
+			rb.samples = grown
+		}
+		rb.samples = append(rb.samples, s)
+		rb.head = len(rb.samples) % rb.capacity
 		return
 	}
-
-	rb.samples[rb.head] = sample
+	rb.samples[rb.head] = s
 	rb.head = (rb.head + 1) % rb.capacity
-	if rb.count < rb.capacity {
-		rb.count++
+}
+
+// partsUnsafe returns the samples, oldest first, as two slices of the buffer (the second is
+// empty until the buffer wraps). The caller must hold rb.mu.
+func (rb *HostRingBuffer) partsUnsafe() (older, newer []packedSample) {
+	if len(rb.samples) < rb.capacity {
+		return rb.samples, nil
 	}
+	return rb.samples[rb.head:], rb.samples[:rb.head]
 }
 
 // GetAll returns a chronological slice of all recorded raw samples.
@@ -67,17 +95,13 @@ func (rb *HostRingBuffer) GetAll() []RawSample {
 	if len(rb.samples) == 0 {
 		return nil
 	}
-
-	result := make([]RawSample, len(rb.samples))
-	if len(rb.samples) < rb.capacity {
-		copy(result, rb.samples)
-		return result
+	older, newer := rb.partsUnsafe()
+	result := make([]RawSample, 0, len(rb.samples))
+	for _, part := range [2][]packedSample{older, newer} {
+		for _, s := range part {
+			result = append(result, s.unpack())
+		}
 	}
-
-	// Buffer wrapped around: head points to the oldest sample
-	tailLen := rb.capacity - rb.head
-	copy(result[:tailLen], rb.samples[rb.head:])
-	copy(result[tailLen:], rb.samples[:rb.head])
 	return result
 }
 
@@ -115,59 +139,57 @@ func (rb *HostRingBuffer) GetRange(start, end time.Time) []RawSample {
 
 // ComputeSummary calculates quick statistical metrics over the current ring buffer window.
 func (rb *HostRingBuffer) ComputeSummary() (avgLatency float64, minLatency float64, maxLatency float64, p95Latency float64, lossRatio float64, jitter float64, totalCount int) {
-	samples := rb.GetAll()
-	if len(samples) == 0 {
-		return 0, 0, 0, 0, 0, 0, 0
-	}
+	avgLatency, minLatency, maxLatency, p95Latency, lossRatio, jitter, totalCount, _ = rb.computeSummary(nil)
+	return
+}
 
-	totalCount = len(samples)
-	var successfulLatencies []float64
-	var sumLatency float64
+// computeSummary is ComputeSummary without copying the buffer. It collects the successful
+// latencies in scratch (reused across calls) and returns it for the next call.
+func (rb *HostRingBuffer) computeSummary(scratch []float64) (avgLatency, minLatency, maxLatency, p95Latency, lossRatio, jitter float64, totalCount int, out []float64) {
+	valid := scratch[:0]
+	var sumLatency, sumDiff float64
 	var failCount int
 	minLatency = math.MaxFloat64
-	maxLatency = 0
 
-	for _, s := range samples {
-		if s.Success && s.LatencyMs >= 0 {
-			successfulLatencies = append(successfulLatencies, s.LatencyMs)
-			sumLatency += s.LatencyMs
-			if s.LatencyMs < minLatency {
-				minLatency = s.LatencyMs
+	rb.mu.RLock()
+	older, newer := rb.partsUnsafe()
+	totalCount = len(older) + len(newer)
+	for _, part := range [2][]packedSample{older, newer} {
+		for _, s := range part {
+			if !s.ok || s.lat < 0 {
+				failCount++
+				continue
 			}
-			if s.LatencyMs > maxLatency {
-				maxLatency = s.LatencyMs
+			lat := round3(s.lat)
+			// RFC 3550 style mean consecutive latency variance, in time order
+			if len(valid) > 0 {
+				sumDiff += math.Abs(lat - valid[len(valid)-1])
 			}
-		} else {
-			failCount++
+			valid = append(valid, lat)
+			sumLatency += lat
+			if lat < minLatency {
+				minLatency = lat
+			}
+			if lat > maxLatency {
+				maxLatency = lat
+			}
 		}
 	}
+	rb.mu.RUnlock()
 
+	if totalCount == 0 {
+		return 0, 0, 0, 0, 0, 0, 0, valid
+	}
 	lossRatio = float64(failCount) / float64(totalCount)
 
-	if len(successfulLatencies) > 0 {
-		avgLatency = sumLatency / float64(len(successfulLatencies))
-
-		// RFC 3550 standard mean consecutive latency variance calculated before sorting
-		if len(successfulLatencies) > 1 {
-			var sumDiff float64
-			for i := 1; i < len(successfulLatencies); i++ {
-				sumDiff += math.Abs(successfulLatencies[i] - successfulLatencies[i-1])
-			}
-			jitter = math.Round((sumDiff/float64(len(successfulLatencies)-1))*100) / 100
-		}
-
-		sort.Float64s(successfulLatencies)
-		p95Idx := int(math.Ceil(0.95*float64(len(successfulLatencies)))) - 1
-		if p95Idx < 0 {
-			p95Idx = 0
-		}
-		if p95Idx >= len(successfulLatencies) {
-			p95Idx = len(successfulLatencies) - 1
-		}
-		p95Latency = successfulLatencies[p95Idx]
-	} else {
-		minLatency = 0
+	if len(valid) == 0 {
+		return 0, 0, 0, 0, lossRatio, 0, totalCount, valid
 	}
-
-	return avgLatency, minLatency, maxLatency, p95Latency, lossRatio, jitter, totalCount
+	avgLatency = sumLatency / float64(len(valid))
+	if len(valid) > 1 {
+		jitter = math.Round((sumDiff/float64(len(valid)-1))*100) / 100
+	}
+	sort.Float64s(valid)
+	p95Latency = getPercentile(valid, 0.95)
+	return avgLatency, minLatency, maxLatency, p95Latency, lossRatio, jitter, totalCount, valid
 }
