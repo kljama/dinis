@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"dinis/pkg/alerts"
+	"dinis/pkg/influxdb"
 	"dinis/pkg/network"
 	"dinis/pkg/pinger"
 	"dinis/pkg/store"
@@ -86,6 +87,16 @@ type Coordinator struct {
 	// Short-lived cache of expensive full-snapshot API responses (matrix, outliers)
 	snapMu    sync.Mutex
 	snapCache map[string]cachedSnapshot
+
+	// Optional InfluxDB export (SetInfluxDB). With a querier, history windows over 2 hours
+	// come from InfluxDB.
+	influxWriter  *influxdb.Writer
+	influxQuery   *influxdb.Querier
+	retentionDays int
+	histMu        sync.Mutex
+	histCache     map[string]cachedHistory
+
+	startedAt time.Time
 }
 
 type cachedSnapshot struct {
@@ -112,7 +123,6 @@ func NewCoordinator(st *store.Store) *Coordinator {
 	}
 
 	p := pinger.NewEngine(cfg)
-	logHistoryMemory(maxMetricHosts)
 	altMgr := alerts.NewManager(500)
 
 	// Restore alerts, acknowledgements and history from the previous run
@@ -132,6 +142,7 @@ func NewCoordinator(st *store.Store) *Coordinator {
 		stopChan:      make(chan struct{}),
 		maxSSEClients: defaultMaxSSEClients,
 		snapCache:     make(map[string]cachedSnapshot),
+		histCache:     make(map[string]cachedHistory),
 		discPending:   make(map[string]bool),
 		discoveryStatus: DiscoveryStatus{
 			IntervalMin: settings.DiscoveryIntervalMin,
@@ -161,10 +172,28 @@ func NewCoordinator(st *store.Store) *Coordinator {
 	return c
 }
 
+// SetInfluxDB connects the InfluxDB export: w for health checks and metrics, q (optional) for
+// history windows over 2 hours. With q, the in-memory hour history is not kept. Call it before
+// Start.
+func (c *Coordinator) SetInfluxDB(w *influxdb.Writer, q *influxdb.Querier, retentionDays int) {
+	c.influxWriter = w
+	c.influxQuery = q
+	c.retentionDays = retentionDays
+	if q != nil {
+		c.pinger.GetTimeseriesStore().SetHourHistory(false)
+	}
+}
+
 // Start begins background monitoring and heartbeat routines.
 func (c *Coordinator) Start() {
+	c.startedAt = time.Now()
+	logHistoryMemory(c.store.GetSettings().MaxMetricHosts, c.pinger.GetTimeseriesStore().Stats().HourHistory)
 	c.pinger.Start()
-	c.wg.Add(3)
+	c.wg.Add(4)
+	go func() {
+		defer c.wg.Done()
+		c.lastReplyLoop()
+	}()
 	go func() {
 		defer c.wg.Done()
 		c.heartbeatLoop()
@@ -186,6 +215,7 @@ func (c *Coordinator) Stop() {
 		c.wg.Wait()
 		c.pinger.Stop()
 		c.saveAlertState() // final state, after the last probe results are in
+		c.saveLastReplies()
 		c.CloseStreams()
 	})
 }
@@ -203,9 +233,39 @@ func (c *Coordinator) CloseStreams() {
 	}
 }
 
+// lastReplySaveInterval is how often the last reply time of each host is saved.
+const lastReplySaveInterval = 5 * time.Minute
+
+// lastReplyLoop saves the last reply time of the hosts, so that it survives a restart.
+func (c *Coordinator) lastReplyLoop() {
+	ticker := time.NewTicker(lastReplySaveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			c.saveLastReplies()
+		}
+	}
+}
+
+// saveLastReplies writes the last reply time of each host to the data file.
+func (c *Coordinator) saveLastReplies() {
+	replies := make(map[string]time.Time)
+	for _, h := range c.pinger.GetAllHostsLite() {
+		if h.LastSeen != nil {
+			replies[h.IP] = *h.LastSeen
+		}
+	}
+	if _, err := c.store.UpdateLastReplies(replies); err != nil {
+		log.Printf("[DINIS] Error saving last reply times: %v", err)
+	}
+}
+
 // logHistoryMemory logs how much memory the latency history can use.
-func logHistoryMemory(maxHosts int) {
-	mb := timeseries.EstimateMemoryMB(maxHosts)
+func logHistoryMemory(maxHosts int, hourHistory bool) {
+	mb := timeseries.EstimateMemoryMB(maxHosts, hourHistory)
 	if mb > 4096 {
 		log.Printf("[TIMESERIES] Warning: the latency history of %d hosts can use up to about %d MB of memory. Lower maxMetricHosts if the system has less memory.", maxHosts, mb)
 		return
@@ -380,6 +440,11 @@ func (c *Coordinator) RebuildTargetList() {
 
 		discAt := disc.DiscoveredAt
 		lastDisc := disc.LastDiscovered
+		var lastSeen *time.Time // used only for hosts new to the engine (restart)
+		if disc.LastReply != nil {
+			t := *disc.LastReply
+			lastSeen = &t
+		}
 
 		hostMap[ip] = &pinger.HostState{
 			IP:                ip,
@@ -394,6 +459,7 @@ func (c *Coordinator) RebuildTargetList() {
 			ExclusionRule:     rule,
 			DiscoveredAt:      &discAt,
 			LastDiscovered:    &lastDisc,
+			LastSeen:          lastSeen,
 			IsStatic:          disc.IsStatic,
 			AlertActive:       alertActive,
 			AlertID:           alertID,
@@ -542,23 +608,44 @@ func (c *Coordinator) UpdateHostMeta(ip, alias, notes string) error {
 	if err := c.store.SetHostMeta(store.HostMeta{IP: ip, Alias: alias, Notes: notes}); err != nil {
 		return err
 	}
-	h, ok := c.pinger.GetHost(ip)
-	if !ok {
-		return nil // not monitored: RebuildTargetList applies the metadata when it is
+	c.applyHostMetaUnsafe([]store.HostMeta{{IP: ip, Alias: alias, Notes: notes}})
+	return nil
+}
+
+// ImportHostMeta saves the alias and notes of several hosts at once (one write of the data file)
+// and applies them like UpdateHostMeta.
+func (c *Coordinator) ImportHostMeta(metas []store.HostMeta) error {
+	c.rebuildMu.Lock()
+	defer c.rebuildMu.Unlock()
+	if err := c.store.SetHostMetaBatch(metas); err != nil {
+		return err
 	}
-	effective := alias
-	if effective == "" {
-		for _, cfg := range c.store.GetCIDRs() {
-			if cfg.CIDR == h.CIDR && cfg.Description != "" {
-				effective = cfg.Description
-				break
-			}
+	c.applyHostMetaUnsafe(metas)
+	return nil
+}
+
+// applyHostMetaUnsafe applies saved metadata to the monitored hosts and their active alerts.
+// A host without an alias shows the description of its CIDR. The caller holds rebuildMu.
+func (c *Coordinator) applyHostMetaUnsafe(metas []store.HostMeta) {
+	descriptions := make(map[string]string)
+	for _, cfg := range c.store.GetCIDRs() {
+		if _, ok := descriptions[cfg.CIDR]; !ok && cfg.Description != "" {
+			descriptions[cfg.CIDR] = cfg.Description
 		}
 	}
-	c.pinger.SetHostMeta(ip, effective, notes)
-	c.alerts.UpdateAlertMetadata(ip, effective, h.CIDR)
+	for _, m := range metas {
+		h, ok := c.pinger.GetHost(m.IP)
+		if !ok {
+			continue // not monitored: RebuildTargetList applies the metadata when it is
+		}
+		effective := m.Alias
+		if effective == "" {
+			effective = descriptions[h.CIDR]
+		}
+		c.pinger.SetHostMeta(m.IP, effective, m.Notes)
+		c.alerts.UpdateAlertMetadata(m.IP, effective, h.CIDR)
+	}
 	c.invalidateSnapshots()
-	return nil
 }
 
 // singleIPTargetCIDR returns the enabled CIDR entry that targets exactly ip (for example
@@ -1161,6 +1248,12 @@ type Server struct {
 	assetETags        map[string]string
 	ticketMu          sync.Mutex
 	streamTickets     map[string]time.Time // single-use SSE ticket -> expiry
+	version           string               // reported by /metrics
+}
+
+// SetVersion sets the version that /metrics reports.
+func (s *Server) SetVersion(v string) {
+	s.version = v
 }
 
 // NewServer creates a new HTTP server routing all REST APIs and web dashboard assets.
@@ -1448,6 +1541,9 @@ func (s *Server) isAllowedOrigin(origin, reqHost string) bool {
 // maxRequestBodyBytes limits incoming request JSON bodies to 1 MB to prevent memory exhaustion DoS attacks.
 const maxRequestBodyBytes = 1 << 20 // 1 MB (1,048,576 bytes)
 
+// maxImportBodyBytes limits CSV and configuration imports (a CSV of 65,536 hosts with notes).
+const maxImportBodyBytes = 16 << 20
+
 // maxPaginationLimit defines the maximum allowable limit parameter for paged endpoints.
 const maxPaginationLimit = 500
 
@@ -1457,11 +1553,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
-	// Public Health check endpoint for Docker / Kubernetes liveness & readiness probes
+	// Public health check for Docker and Kubernetes: no authentication, no client filters
 	if r.URL.Path == "/health" || r.URL.Path == "/api/health" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		s.handleHealth(w, r)
 		return
 	}
 
@@ -1480,7 +1574,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Validate API token if configured. Tokens are only accepted in headers so they never
 	// end up in URLs or access logs; the SSE stream (EventSource cannot set headers)
 	// authenticates with a short-lived single-use ticket instead.
-	if s.apiToken != "" && strings.HasPrefix(r.URL.Path, "/api/") {
+	if s.apiToken != "" && (strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/metrics") {
 		token := ""
 		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
@@ -1519,7 +1613,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Limit request body size across all incoming HTTP requests to prevent memory exhaustion attacks
 	if r.Body != nil {
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		limit := int64(maxRequestBodyBytes)
+		if r.URL.Path == "/api/hosts/import" || r.URL.Path == "/api/config" || r.URL.Path == "/api/config/preview" {
+			limit = maxImportBodyBytes
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 			rc := http.NewResponseController(w)
 			_ = rc.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -1565,6 +1663,15 @@ func (s *Server) routes() {
 
 	// Settings
 	s.mux.HandleFunc("/api/settings", s.handleSettings)
+
+	// Transfer: hosts as CSV, configuration as JSON
+	s.mux.HandleFunc("/api/hosts/export", s.handleHostsExport)
+	s.mux.HandleFunc("/api/hosts/import", s.handleHostsImport)
+	s.mux.HandleFunc("/api/config", s.handleConfig)
+	s.mux.HandleFunc("/api/config/preview", s.handleConfigPreview)
+
+	// Prometheus metrics
+	s.mux.HandleFunc("/metrics", s.handleMetrics)
 
 	// Static UI assets
 	if s.distFS != nil {
@@ -2279,6 +2386,18 @@ func (s *Server) handleHostDetailOrAction(w http.ResponseWriter, r *http.Request
 				windowDur = d
 			}
 		}
+		if windowDur > 2*time.Hour && s.coord.influxQuery != nil {
+			if maxWindow := s.coord.maxHistoryWindow(); windowDur > maxWindow {
+				windowDur = maxWindow
+			}
+			history, err := s.coord.influxHistory(r.Context(), ip, windowDur)
+			if err != nil {
+				writeError(w, http.StatusBadGateway, fmt.Sprintf("History from InfluxDB is not available: %v", err))
+				return
+			}
+			writeJSON(w, http.StatusOK, history)
+			return
+		}
 		history := s.coord.pinger.GetTimeseriesStore().GetHostHistory(ip, windowDur)
 		writeJSON(w, http.StatusOK, history)
 
@@ -2721,6 +2840,92 @@ func (s *Server) handleAlertAcknowledgeAll(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, ackAlerts)
 }
 
+// normalizeSettings brings each setting into its valid range. Zero or negative values of
+// timeoutMs, failThreshold, concurrency and maxMetricHosts become the default.
+func normalizeSettings(req store.AppSettings) store.AppSettings {
+	if req.IntervalSec < 0.5 {
+		req.IntervalSec = 0.5
+	}
+	if req.IntervalSec > 3600 {
+		req.IntervalSec = 3600
+	}
+	if req.TimeoutMs <= 0 {
+		req.TimeoutMs = 1000
+	}
+	if req.TimeoutMs > 30000 {
+		req.TimeoutMs = 30000
+	}
+	if req.FailThreshold <= 0 {
+		req.FailThreshold = 2
+	}
+	if req.FailThreshold > 100 {
+		req.FailThreshold = 100
+	}
+	if req.RecoveryThreshold <= 0 {
+		req.RecoveryThreshold = 1
+	}
+	if req.RecoveryThreshold > 100 {
+		req.RecoveryThreshold = 100
+	}
+	if req.Concurrency <= 0 {
+		req.Concurrency = 100
+	}
+	if req.Concurrency > 1024 {
+		req.Concurrency = 1024
+	}
+	if req.DiscoveryIntervalMin < 0 {
+		req.DiscoveryIntervalMin = 0
+	}
+	if req.MaxMetricHosts <= 0 {
+		req.MaxMetricHosts = 10000
+	} else if req.MaxMetricHosts < 500 {
+		req.MaxMetricHosts = 500
+	} else if req.MaxMetricHosts > 500000 {
+		req.MaxMetricHosts = 500000
+	}
+	if req.DownProbeIntervalSec < 0 {
+		req.DownProbeIntervalSec = 0
+	}
+	if req.DownProbeIntervalSec > 86400 {
+		req.DownProbeIntervalSec = 86400
+	}
+	return req
+}
+
+// applySettings saves normalized settings and applies them to the running engine. The target
+// list does not depend on them.
+func (c *Coordinator) applySettings(req store.AppSettings) error {
+	previousMaxHosts := c.store.GetSettings().MaxMetricHosts
+	if err := c.store.UpdateSettings(req); err != nil {
+		return err
+	}
+	c.applyEngineSettings(req, previousMaxHosts)
+	return nil
+}
+
+// applyEngineSettings applies saved settings to the engine and the discovery schedule.
+func (c *Coordinator) applyEngineSettings(req store.AppSettings, previousMaxHosts int) {
+	if req.MaxMetricHosts != previousMaxHosts {
+		logHistoryMemory(req.MaxMetricHosts, c.pinger.GetTimeseriesStore().Stats().HourHistory)
+	}
+	c.pinger.UpdateConfig(pinger.EngineConfig{
+		Interval:          time.Duration(req.IntervalSec * float64(time.Second)),
+		Timeout:           time.Duration(req.TimeoutMs) * time.Millisecond,
+		Concurrency:       req.Concurrency,
+		FailThreshold:     req.FailThreshold,
+		RecoveryThreshold: req.RecoveryThreshold,
+		HistorySize:       25,
+		MaxMetricHosts:    req.MaxMetricHosts,
+		DownProbeInterval: time.Duration(req.DownProbeIntervalSec) * time.Second,
+	})
+	c.invalidateSnapshots()
+
+	c.discMu.Lock()
+	c.discoveryStatus.IntervalMin = req.DiscoveryIntervalMin
+	c.updateNextRunUnsafe(req.DiscoveryIntervalMin)
+	c.discMu.Unlock()
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -2735,80 +2940,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if req.IntervalSec < 0.5 {
-			req.IntervalSec = 0.5
-		}
-		if req.IntervalSec > 3600 {
-			req.IntervalSec = 3600
-		}
-		if req.TimeoutMs <= 0 {
-			req.TimeoutMs = 1000
-		}
-		if req.TimeoutMs > 30000 {
-			req.TimeoutMs = 30000
-		}
-		if req.FailThreshold <= 0 {
-			req.FailThreshold = 2
-		}
-		if req.FailThreshold > 100 {
-			req.FailThreshold = 100
-		}
-		if req.RecoveryThreshold <= 0 {
-			req.RecoveryThreshold = 1
-		}
-		if req.RecoveryThreshold > 100 {
-			req.RecoveryThreshold = 100
-		}
-		if req.Concurrency <= 0 {
-			req.Concurrency = 100
-		}
-		if req.Concurrency > 1024 {
-			req.Concurrency = 1024
-		}
-		if req.DiscoveryIntervalMin < 0 {
-			req.DiscoveryIntervalMin = 0
-		}
-		if req.MaxMetricHosts <= 0 {
-			req.MaxMetricHosts = 10000
-		} else if req.MaxMetricHosts < 500 {
-			req.MaxMetricHosts = 500
-		} else if req.MaxMetricHosts > 500000 {
-			req.MaxMetricHosts = 500000
-		}
-		if req.DownProbeIntervalSec < 0 {
-			req.DownProbeIntervalSec = 0
-		}
-		if req.DownProbeIntervalSec > 86400 {
-			req.DownProbeIntervalSec = 86400
-		}
+		req = normalizeSettings(req)
 
-		previousMaxHosts := s.coord.store.GetSettings().MaxMetricHosts
-		if err := s.coord.store.UpdateSettings(req); err != nil {
+		if err := s.coord.applySettings(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if req.MaxMetricHosts != previousMaxHosts {
-			logHistoryMemory(req.MaxMetricHosts)
-		}
-
-		// Update engine config live. The target list does not depend on these settings.
-		s.coord.pinger.UpdateConfig(pinger.EngineConfig{
-			Interval:          time.Duration(req.IntervalSec * float64(time.Second)),
-			Timeout:           time.Duration(req.TimeoutMs) * time.Millisecond,
-			Concurrency:       req.Concurrency,
-			FailThreshold:     req.FailThreshold,
-			RecoveryThreshold: req.RecoveryThreshold,
-			HistorySize:       25,
-			MaxMetricHosts:    req.MaxMetricHosts,
-			DownProbeInterval: time.Duration(req.DownProbeIntervalSec) * time.Second,
-		})
-		s.coord.invalidateSnapshots()
-
-		s.coord.discMu.Lock()
-		s.coord.discoveryStatus.IntervalMin = req.DiscoveryIntervalMin
-		s.coord.updateNextRunUnsafe(req.DiscoveryIntervalMin)
-		s.coord.discMu.Unlock()
-
 		writeJSON(w, http.StatusOK, req)
 
 	default:

@@ -48,7 +48,8 @@
     // Detail modal & historical charts
     selectedHostIP: null,
     selectedHostData: null,
-    chartWindow: 'realtime', // 'realtime', '1h', '24h', '168h'
+    chartWindow: 'realtime', // 'realtime', '1h', '24h', '168h', '720h', '1440h'
+    historyLoad: { key: '', at: 0 }, // last history request of a long window (see loadHostHistory)
     historyPoints: [],
 
     sseConnected: false,
@@ -248,6 +249,15 @@
     inputDownProbeInterval: document.getElementById('inputDownProbeInterval'),
     settingsSubnetsList: document.getElementById('settingsSubnetsList'),
     btnSettingsOpenSubnets: document.getElementById('btnSettingsOpenSubnets'),
+    btnExportConfig: document.getElementById('btnExportConfig'),
+    btnImportConfig: document.getElementById('btnImportConfig'),
+    inputImportConfig: document.getElementById('inputImportConfig'),
+
+    // Host CSV export and import (explorer)
+    btnExportHostsCSV: document.getElementById('btnExportHostsCSV'),
+    btnImportHostsCSV: document.getElementById('btnImportHostsCSV'),
+    inputImportHostsCSV: document.getElementById('inputImportHostsCSV'),
+    chartTab60d: document.getElementById('chartTab60d'),
 
     // Toast Container
     toastContainer: document.getElementById('toastContainer'),
@@ -275,6 +285,7 @@
   // Initialize Application
   async function init() {
     setupEventListeners();
+    updateHistoryTabs();
     try {
       await Promise.all([
         fetchSettings(),
@@ -580,6 +591,20 @@
     el.btnCancelSettings.addEventListener('click', closeSettingsModal);
     el.formSettings.addEventListener('submit', handleSaveSettings);
 
+    // Configuration file and host CSV
+    if (el.btnExportConfig) el.btnExportConfig.addEventListener('click', () => downloadFromAPI('/api/config', 'dinis-config.json'));
+    if (el.btnImportConfig) el.btnImportConfig.addEventListener('click', () => el.inputImportConfig.click());
+    if (el.inputImportConfig) el.inputImportConfig.addEventListener('change', handleImportConfig);
+    if (el.btnExportHostsCSV) {
+      el.btnExportHostsCSV.addEventListener('click', () => {
+        // Excel with a comma as decimal separator (for example German) expects semicolons
+        const delimiter = (1.5).toLocaleString().includes(',') ? 'semicolon' : 'comma';
+        downloadFromAPI(`/api/hosts/export?delimiter=${delimiter}`, 'dinis-hosts.csv');
+      });
+    }
+    if (el.btnImportHostsCSV) el.btnImportHostsCSV.addEventListener('click', () => el.inputImportHostsCSV.click());
+    if (el.inputImportHostsCSV) el.inputImportHostsCSV.addEventListener('change', handleImportHostsCSV);
+
     // Host Detail Modal
     el.btnCloseHostDetailModal.addEventListener('click', closeHostDetailModal);
     el.formHostMeta.addEventListener('submit', handleSaveHostMeta);
@@ -602,6 +627,7 @@
           el.detailWindowTabs.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
           tab.classList.add('active');
           state.chartWindow = tab.dataset.window;
+          state.historyLoad = { key: '', at: 0 };
           showWindowStats({ p95: null, jitter: null }, state.chartWindow);
           loadHostHistory(state.selectedHostIP, state.chartWindow);
         });
@@ -1689,6 +1715,20 @@
 
   // Historical time series chart for the host modal. Points are placed by their timestamp in
   // the window; the line breaks at missing buckets and at buckets without a reply.
+  // Shows a text in place of a chart (no data, or an error)
+  function drawChartMessage(canvas, text, isError = false) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = isError ? 'rgba(239, 68, 68, 0.9)' : 'rgba(255,255,255,0.4)';
+    ctx.font = '12px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    const maxChars = Math.max(20, Math.floor(canvas.width / 7));
+    const shown = text.length > maxChars ? text.slice(0, maxChars - 1) + '…' : text;
+    ctx.fillText(shown, canvas.width / 2, canvas.height / 2);
+  }
+
   function drawHistoricalChart(canvas, points, windowMs) {
     const ctx = canvas.getContext('2d');
     const width = canvas.width;
@@ -1697,12 +1737,7 @@
     ctx.clearRect(0, 0, width, height);
 
     if (!points || points.length === 0) {
-      ctx.fillStyle = 'rgba(255,255,255,0.05)';
-      ctx.fillRect(0, 0, width, height);
-      ctx.fillStyle = 'rgba(255,255,255,0.4)';
-      ctx.font = '12px Inter, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('Accumulating historical rollup metrics...', width / 2, height / 2);
+      drawChartMessage(canvas, 'Accumulating historical rollup metrics...');
       return;
     }
 
@@ -1788,8 +1823,15 @@
     realtime: { label: 'last 25 probes' },
     '1h': { label: 'last hour', ms: 3600e3 },
     '24h': { label: 'last 24 h', ms: 24 * 3600e3 },
-    '168h': { label: 'last 7 days', ms: 168 * 3600e3 }
+    '168h': { label: 'last 7 days', ms: 168 * 3600e3 },
+    '720h': { label: 'last 30 days', ms: 720 * 3600e3 },
+    '1440h': { label: 'last 60 days', ms: 1440 * 3600e3 }
   };
+
+  // Windows longer than this come from InfluxDB (if it is configured). DINIS caches those
+  // answers for 60 s, so the modal does not request them more often.
+  const LONG_WINDOW_MS = 2 * 3600e3;
+  const LONG_WINDOW_REFRESH_MS = 60e3;
 
   // P95 and jitter of the live latency history (-1 marks a lost probe)
   function liveStats(history) {
@@ -1910,17 +1952,36 @@
       return;
     }
 
+    // The periodic refresh of the modal requests a long window at most once a minute
+    const windowMs = CHART_WINDOWS[window] ? CHART_WINDOWS[window].ms : undefined;
+    const key = `${ip}|${window}`;
+    if (windowMs > LONG_WINDOW_MS) {
+      if (state.historyLoad.key === key && Date.now() - state.historyLoad.at < LONG_WINDOW_REFRESH_MS) return;
+      state.historyLoad = { key, at: Date.now() };
+    }
+
     try {
       const res = await apiFetch(`/api/hosts/${ip}/history?window=${window}`);
-      if (res.ok) {
-        const points = await res.json();
-        // Another host or window was selected while this request ran
-        if (ip !== state.selectedHostIP || window !== state.chartWindow) return;
-        state.historyPoints = points || [];
-        drawHistoricalChart(el.detailSparklineCanvas, state.historyPoints, CHART_WINDOWS[window] ? CHART_WINDOWS[window].ms : undefined);
-        showWindowStats(windowStats(state.historyPoints), window);
+      // Another host or window was selected while this request ran
+      if (ip !== state.selectedHostIP || window !== state.chartWindow) return;
+      if (!res.ok) {
+        let msg = `History is not available (HTTP ${res.status})`;
+        try {
+          const body = await res.json();
+          if (body && body.error) msg = body.error;
+        } catch (_) { /* no JSON body */ }
+        state.historyPoints = [];
+        state.historyLoad = { key: '', at: 0 }; // try again at the next refresh
+        drawChartMessage(el.detailSparklineCanvas, msg, true);
+        showWindowStats({ p95: null, jitter: null }, window);
+        return;
       }
+      const points = await res.json();
+      state.historyPoints = points || [];
+      drawHistoricalChart(el.detailSparklineCanvas, state.historyPoints, windowMs);
+      showWindowStats(windowStats(state.historyPoints), window);
     } catch (e) {
+      state.historyLoad = { key: '', at: 0 };
       console.error('Failed to load host history:', e);
     }
   }
@@ -2725,6 +2786,156 @@
     } catch (err) {
       showToast(`Failed to save settings: ${err.message}`, 'error');
     }
+  }
+
+  // -------------------------------------------------------------
+  // FILE EXPORT AND IMPORT (host CSV, configuration file)
+  // -------------------------------------------------------------
+
+  // Downloads an API answer as a file (a plain link cannot send the API token)
+  async function downloadFromAPI(url, fallbackName) {
+    try {
+      const res = await apiFetch(url);
+      if (!res.ok) {
+        showToast(`Export failed: ${await errorText(res)}`, 'error');
+        return;
+      }
+      const match = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
+      const blobUrl = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = match ? match[1] : fallbackName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    } catch (e) {
+      showToast(`Export failed: ${e.message}`, 'error');
+    }
+  }
+
+  async function errorText(res) {
+    try {
+      const body = await res.json();
+      if (body && body.error) return body.error;
+    } catch (_) { /* no JSON body */ }
+    return `HTTP ${res.status}`;
+  }
+
+  // Reads the selected file and clears the input, so the same file can be selected again
+  async function takeSelectedFile(input) {
+    const file = input.files && input.files[0];
+    input.value = '';
+    return file ? file.text() : null;
+  }
+
+  function plural(n, one, many) {
+    return `${n} ${n === 1 ? one : many}`;
+  }
+
+  function listLines(title, items, total) {
+    if (!items || items.length === 0) return '';
+    const shown = items.slice(0, 10).map(i => `  • ${i}`).join('\n');
+    const more = (total || items.length) > 10 ? `\n  … and ${(total || items.length) - 10} more` : '';
+    return `\n${title}:\n${shown}${more}\n`;
+  }
+
+  async function handleImportHostsCSV() {
+    const text = await takeSelectedFile(el.inputImportHostsCSV);
+    if (text === null) return;
+    try {
+      const post = dryRun => apiFetch(`/api/hosts/import${dryRun ? '?dryRun=true' : ''}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/csv; charset=utf-8' },
+        body: text
+      });
+      const res = await post(true);
+      if (!res.ok) {
+        showToast(`Import failed: ${await errorText(res)}`, 'error');
+        return;
+      }
+      const plan = await res.json();
+      const summary = `${plural(plan.rows, 'row', 'rows')}: ${plural(plan.updated, 'host changes', 'hosts change')}, ` +
+        `${plural(plan.unchanged, 'stays', 'stay')} the same.` +
+        listLines('Not monitored (ignored)', plan.unknown, plan.unknownCount) +
+        listLines('Invalid rows (ignored)', plan.invalid, plan.invalidCount);
+      if (plan.updated === 0) {
+        alert(`Nothing to import.\n\n${summary}`);
+        return;
+      }
+      if (!confirm(`Import the alias and notes from this file?\n\n${summary}`)) return;
+
+      const applied = await post(false);
+      if (!applied.ok) {
+        showToast(`Import failed: ${await errorText(applied)}`, 'error');
+        return;
+      }
+      const result = await applied.json();
+      showToast(`Alias and notes of ${plural(result.updated, 'host', 'hosts')} imported`, 'success');
+      fetchHosts(state.currentPage);
+      if (state.selectedHostIP) openHostDetailModal(state.selectedHostIP);
+    } catch (e) {
+      showToast(`Import failed: ${e.message}`, 'error');
+    }
+  }
+
+  async function handleImportConfig() {
+    const text = await takeSelectedFile(el.inputImportConfig);
+    if (text === null) return;
+    try {
+      const send = (url, method) => apiFetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: text
+      });
+      const res = await send('/api/config/preview', 'POST');
+      if (!res.ok) {
+        showToast(`Import failed: ${await errorText(res)}`, 'error');
+        return;
+      }
+      const ch = await res.json();
+      if (!ch.valid) {
+        alert(`DINIS cannot use this file. Nothing was changed.\n${listLines('Errors', ch.errors)}`);
+        return;
+      }
+      if (ch.total === 0) {
+        showToast('The file is the same as the current configuration', 'info');
+        return;
+      }
+      const summary =
+        listLines('Subnets added', ch.cidrs.added) +
+        listLines('Subnets removed', ch.cidrs.removed) +
+        listLines('Subnets changed', ch.cidrs.changed) +
+        listLines('Exclusion rules added', ch.exclusions.added) +
+        listLines('Exclusion rules removed', ch.exclusions.removed) +
+        listLines('Exclusion rules changed', ch.exclusions.changed) +
+        listLines('Settings changed', ch.settings);
+      if (!confirm(`Replace the configuration? ${plural(ch.total, 'change', 'changes')}:\n${summary}`)) return;
+
+      const applied = await send('/api/config', 'PUT');
+      if (!applied.ok) {
+        showToast(`Import failed: ${await errorText(applied)}`, 'error');
+        return;
+      }
+      showToast(`Configuration replaced (${plural(ch.total, 'change', 'changes')})`, 'success');
+      closeSettingsModal();
+      await Promise.all([fetchSettings(), fetchCIDRs(), fetchExclusions()]);
+      fetchSubnetsMatrix();
+      fetchHosts(state.currentPage);
+      fetchSummary();
+    } catch (e) {
+      showToast(`Import failed: ${e.message}`, 'error');
+    }
+  }
+
+  // The 60-day window needs InfluxDB; without it, DINIS keeps 30 days in memory
+  async function updateHistoryTabs() {
+    if (!el.chartTab60d) return;
+    try {
+      const res = await fetch('/health');
+      const report = await res.json();
+      el.chartTab60d.style.display = report && report.influxdb ? '' : 'none';
+    } catch (_) { /* keep the tab */ }
   }
 
   // -------------------------------------------------------------

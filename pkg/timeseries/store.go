@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,10 +63,26 @@ const DefaultMaxHosts = 5000
 // progress, and the map and list entries.
 const BytesPerHost = 44 * 1024
 
+// BytesPerHostWithoutHourHistory is the same without the hour points and the hour in progress
+// (see SetHourHistory), measured.
+const BytesPerHostWithoutHourHistory = 9 * 1024
+
 // EstimateMemoryMB returns the memory in MB that the latency history of maxHosts hosts uses
 // when all of them have a full history.
-func EstimateMemoryMB(maxHosts int) int {
-	return int(int64(maxHosts) * BytesPerHost / (1 << 20))
+func EstimateMemoryMB(maxHosts int, hourHistory bool) int {
+	perHost := int64(BytesPerHost)
+	if !hourHistory {
+		perHost = BytesPerHostWithoutHourHistory
+	}
+	return int(int64(maxHosts) * perHost / (1 << 20))
+}
+
+// StoreStats is a snapshot of the store for metrics.
+type StoreStats struct {
+	HostsWithHistory    int
+	MaxHosts            int
+	DroppedSamplesTotal uint64 // samples not recorded because the host limit was reached
+	HourHistory         bool
 }
 
 // Store manages in-memory multi-tier time-series metric retention and rollups for all IPs.
@@ -81,7 +98,12 @@ type Store struct {
 
 	// Samples dropped because the host limit was reached, reported via a rate-limited log
 	droppedSamples   uint64
+	droppedTotal     uint64
 	lastCapacityWarn time.Time
+
+	// noHourHistory: hour points are not kept (windows over 2 hours come from elsewhere,
+	// for example InfluxDB). The zero value keeps them.
+	noHourHistory atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -130,6 +152,38 @@ func (s *Store) SetCapacity(maxHosts int) {
 	}
 }
 
+// SetHourHistory sets whether the store keeps hour points (30 days) for history windows over
+// 2 hours. Without them, each host needs about a fifth of the memory. Turning it off drops the
+// hour points that exist.
+func (s *Store) SetHourHistory(enabled bool) {
+	s.noHourHistory.Store(!enabled)
+	if enabled {
+		return
+	}
+	s.mu.Lock()
+	clear(s.hourSeries)
+	aggs := make([]*hostAgg, 0, len(s.aggs))
+	for _, a := range s.aggs {
+		aggs = append(aggs, a)
+	}
+	s.mu.Unlock()
+	for _, a := range aggs {
+		a.dropHour()
+	}
+}
+
+// Stats returns a snapshot of the store for metrics.
+func (s *Store) Stats() StoreStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return StoreStats{
+		HostsWithHistory:    len(s.rawBuffers),
+		MaxHosts:            s.maxHosts,
+		DroppedSamplesTotal: s.droppedTotal,
+		HourHistory:         !s.noHourHistory.Load(),
+	}
+}
+
 // Start launches the background automated downsampling ticker.
 // Safe to call multiple times; redundant calls while running are ignored.
 func (s *Store) Start() {
@@ -173,6 +227,7 @@ func (s *Store) getOrCreateRawBuffer(ip string) *HostRingBuffer {
 	// every host with no history. Slots free up when hosts are pruned or removed.
 	if s.lruList.Len() >= s.maxHosts {
 		s.droppedSamples++
+		s.droppedTotal++
 		if now := time.Now(); now.Sub(s.lastCapacityWarn) >= time.Minute {
 			log.Printf("[TIMESERIES] Metric host limit (%d) reached; %d samples from additional hosts not recorded. Raise MaxMetricHosts to retain history for all hosts.", s.maxHosts, s.droppedSamples)
 			s.lastCapacityWarn = now
@@ -296,6 +351,9 @@ func (s *Store) GetHostHistory(ip string, window time.Duration) []RollupPoint {
 	}
 
 	// Use 1-hour rollups for longer windows, plus the hour in progress
+	if s.noHourHistory.Load() {
+		return nil
+	}
 	s.mu.RLock()
 	hs, ok := s.hourSeries[ip]
 	agg := s.aggs[ip]
@@ -503,7 +561,7 @@ func (s *Store) computeMinuteRollups(start, end time.Time) {
 			continue
 		}
 
-		if rollup, ok := s.getOrCreateAgg(ip).rollupMinute(rb, start, end, &b); ok {
+		if rollup, ok := s.getOrCreateAgg(ip).rollupMinute(rb, start, end, &b, !s.noHourHistory.Load()); ok {
 			s.getOrCreateMinuteSeries(ip).Append(rollup)
 		}
 	}
@@ -513,6 +571,9 @@ func (s *Store) computeMinuteRollups(start, end time.Time) {
 // a 1-hour point, timestamped at the start of the bucket. Percentiles come from all samples
 // of the hour (see hourStats), not from the minute points.
 func (s *Store) computeHourRollups(start, end time.Time) {
+	if s.noHourHistory.Load() {
+		return
+	}
 	s.mu.RLock()
 	ips := make([]string, 0, len(s.aggs))
 	for ip := range s.aggs {

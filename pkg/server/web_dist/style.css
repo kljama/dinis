@@ -691,7 +691,14 @@ body {
 .toolbar-right {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.75rem;
+}
+
+.transfer-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .sort-select-wrapper {
@@ -1875,6 +1882,7 @@ body {
 
 .chart-window-tabs {
   display: inline-flex;
+  flex-wrap: wrap;
   background: rgba(0, 0, 0, 0.25);
   padding: 2px;
   border-radius: var(--radius-sm);

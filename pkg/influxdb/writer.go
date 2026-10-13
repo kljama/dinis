@@ -31,6 +31,12 @@ type Writer struct {
 	dbReady     atomic.Bool
 	lastDBError time.Time
 
+	// Counters for Stats
+	started      time.Time
+	lastSuccess  atomic.Int64 // UnixNano of the last successful write
+	writeErrors  atomic.Uint64
+	droppedLines atomic.Uint64
+
 	mu    sync.Mutex
 	buf   bytes.Buffer
 	count int
@@ -40,6 +46,34 @@ type Writer struct {
 	flushSignal   chan struct{}
 	stopChan      chan struct{}
 	wg            sync.WaitGroup
+}
+
+// Stats is a snapshot of the writer for health checks and metrics.
+type Stats struct {
+	BufferedBytes int       // data waiting for the next write
+	LastSuccess   time.Time // zero before the first successful write
+	Started       time.Time
+	WriteErrors   uint64 // writes and database setups that failed after their retries
+	DroppedLines  uint64 // probe results dropped (buffer full, or refused by InfluxDB)
+	DatabaseReady bool   // the database has its retention period (or none is configured)
+}
+
+// Stats returns a snapshot of the writer.
+func (w *Writer) Stats() Stats {
+	w.mu.Lock()
+	buffered := w.buf.Len()
+	w.mu.Unlock()
+	s := Stats{
+		BufferedBytes: buffered,
+		Started:       w.started,
+		WriteErrors:   w.writeErrors.Load(),
+		DroppedLines:  w.droppedLines.Load(),
+		DatabaseReady: w.dbReady.Load(),
+	}
+	if ns := w.lastSuccess.Load(); ns != 0 {
+		s.LastSuccess = time.Unix(0, ns)
+	}
+	return s
 }
 
 // Config holds InfluxDB writer configuration.
@@ -88,6 +122,7 @@ func NewWriter(cfg Config) *Writer {
 		batchSize:     cfg.BatchSize,
 		flushSignal:   make(chan struct{}, 1),
 		stopChan:      make(chan struct{}),
+		started:       time.Now(),
 	}
 	if w.retention == "" {
 		w.dbReady.Store(true)
@@ -129,6 +164,7 @@ func (w *Writer) WriteProbe(ip string, alias string, subnet string, latencyMs fl
 		w.buf.Write(b)
 		w.count++
 	} else {
+		w.droppedLines.Add(1)
 		log.Printf("[INFLUXDB] Buffer ceiling reached (%d bytes); dropping newest probe metric to prevent OOM", maxBufferSize)
 	}
 	shouldSignal := w.count >= w.batchSize
@@ -180,7 +216,9 @@ func (w *Writer) retainFailedPayload(payload []byte) {
 				dropped = excess + i
 			}
 		}
-		log.Printf("[INFLUXDB] Buffer ceiling reached; dropping the %d oldest buffered lines to prevent OOM", bytes.Count(payload[:dropped], []byte{'\n'}))
+		lines := bytes.Count(payload[:dropped], []byte{'\n'})
+		w.droppedLines.Add(uint64(lines))
+		log.Printf("[INFLUXDB] Buffer ceiling reached; dropping the %d oldest buffered lines to prevent OOM", lines)
 		payload = payload[dropped:]
 	}
 	var newBuf bytes.Buffer
@@ -253,6 +291,7 @@ func (w *Writer) flush() {
 
 	if !w.dbReady.Load() {
 		if err := w.ensureDatabase(); err != nil {
+			w.writeErrors.Add(1)
 			if time.Since(w.lastDBError) >= time.Minute {
 				log.Printf("[INFLUXDB] Database setup failed, data stays buffered: %v", err)
 				w.lastDBError = time.Now()
@@ -285,6 +324,7 @@ func (w *Writer) flush() {
 				continue
 			}
 			log.Printf("[INFLUXDB] Write failed after retries: %v", err)
+			w.writeErrors.Add(1)
 			w.retainFailedPayload(payload)
 			return
 		}
@@ -294,6 +334,7 @@ func (w *Writer) flush() {
 		_ = resp.Body.Close()
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			w.lastSuccess.Store(time.Now().UnixNano())
 			return
 		}
 
@@ -304,8 +345,11 @@ func (w *Writer) flush() {
 		}
 
 		log.Printf("[INFLUXDB] Write returned status %d", resp.StatusCode)
+		w.writeErrors.Add(1)
 		if resp.StatusCode >= 500 {
 			w.retainFailedPayload(payload)
+		} else {
+			w.droppedLines.Add(uint64(bytes.Count(payload, []byte{'\n'})))
 		}
 		return
 	}

@@ -1,6 +1,7 @@
 package pinger
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"sync"
@@ -804,5 +805,44 @@ func TestStatusMapAndFillLatencyHistory(t *testing.T) {
 	}
 	if h, _ := e.GetHost("10.0.0.1"); h.Alias != "core" || h.Notes != "rack 4" {
 		t.Fatalf("unexpected metadata %q %q", h.Alias, h.Notes)
+	}
+}
+
+func TestStatsCountProbesAndScheduleLag(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Interval = 500 * time.Millisecond
+	e := NewEngine(cfg)
+	e.SetHosts(map[string]*HostState{"127.0.0.1": {IP: "127.0.0.1", Status: StatusPending}})
+	if s := e.Stats(); s.Running {
+		t.Fatal("expected a stopped engine before Start")
+	}
+	e.Start()
+	deadline := time.Now().Add(5 * time.Second)
+	for e.Stats().ProbesTotal == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	s := e.Stats()
+	if !s.Running || s.ProbesTotal == 0 || s.LastProbe.IsZero() || s.ScheduledHosts != 1 || s.Workers == 0 {
+		t.Fatalf("unexpected stats after the first probe: %+v", s)
+	}
+
+	// A probe that is overdue by one minute shows as schedule lag
+	e.mu.Lock()
+	ent := &schedEntry{ip: "10.0.0.99", due: e.mono() - time.Minute, index: -1}
+	e.schedPushUnsafe(ent)
+	e.mu.Unlock()
+	lag := e.Stats().HealthyLag
+	e.mu.Lock()
+	if ent.index >= 0 {
+		heap.Remove(&e.healthyQ, ent.index)
+	}
+	e.mu.Unlock()
+	if lag < 59*time.Second {
+		t.Fatalf("expected about 60 s of schedule lag, got %v", lag)
+	}
+
+	e.Stop()
+	if s := e.Stats(); s.Running || s.BusyWorkers != 0 {
+		t.Fatalf("expected a stopped engine without busy workers, got %+v", s)
 	}
 }

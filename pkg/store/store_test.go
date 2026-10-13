@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStore(t *testing.T) {
@@ -503,5 +504,70 @@ func TestAlertStateFile(t *testing.T) {
 	}
 	if ok, err := st.LoadAlertState(&v); err != nil || !ok || v["active"] != 2 {
 		t.Fatalf("expected saved state back, got ok=%v err=%v v=%v", ok, err, v)
+	}
+}
+
+func TestLastReplyPersistsAndMergeKeepsNewest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dinis.json")
+	st, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.AddOrUpdateDiscoveredHost(DiscoveredHost{IP: "10.0.0.1", CIDR: "10.0.0.0/24"})
+	t1 := time.Now().Add(-time.Hour).Truncate(time.Second)
+	n, err := st.UpdateLastReplies(map[string]time.Time{"10.0.0.1": t1, "10.9.9.9": t1})
+	if err != nil || n != 1 {
+		t.Fatalf("expected 1 changed host (unknown IPs are ignored), got %d %v", n, err)
+	}
+	if n, _ := st.UpdateLastReplies(map[string]time.Time{"10.0.0.1": t1.Add(-time.Minute)}); n != 0 {
+		t.Fatal("an older time must not replace a newer one")
+	}
+	// A discovery sweep writes the host again: the saved last reply stays
+	_ = st.AddOrUpdateDiscoveredHostsBatch([]DiscoveredHost{{IP: "10.0.0.1", CIDR: "10.0.0.0/24"}})
+	_ = st.Close()
+
+	st2, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	h, _ := st2.GetDiscoveredHost("10.0.0.1")
+	if h.LastReply == nil || !h.LastReply.Equal(t1) {
+		t.Fatalf("expected the last reply %v after a restart, got %v", t1, h.LastReply)
+	}
+}
+
+func TestReplaceConfigAndMetaBatch(t *testing.T) {
+	st, err := NewStore(filepath.Join(t.TempDir(), "dinis.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_ = st.AddOrUpdateDiscoveredHost(DiscoveredHost{IP: "8.8.8.8", CIDR: "8.8.8.8/32", IsStatic: true})
+	settings := DefaultSettings()
+	settings.IntervalSec = 30
+	err = st.ReplaceConfig(ConfigReplacement{
+		CIDRs:       []CIDRConfig{{CIDR: "10.1.0.0/24", Enabled: true}},
+		Exclusions:  []ExclusionConfig{{Rule: "10.1.0.1", Enabled: true}},
+		Settings:    settings,
+		RemoveHosts: []string{"8.8.8.8"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := st.GetCIDRs(); len(c) != 1 || c[0].CIDR != "10.1.0.0/24" {
+		t.Fatalf("unexpected CIDRs %+v", c)
+	}
+	if e := st.GetExclusions(); len(e) != 1 || st.GetSettings().IntervalSec != 30 {
+		t.Fatalf("unexpected exclusions %+v or settings", e)
+	}
+	if _, ok := st.GetDiscoveredHost("8.8.8.8"); ok {
+		t.Fatal("expected the static host of the removed CIDR to be deleted")
+	}
+	if err := st.SetHostMetaBatch([]HostMeta{{IP: "10.1.0.5", Alias: "a"}, {IP: "10.1.0.6", Notes: "n"}}); err != nil {
+		t.Fatal(err)
+	}
+	if m := st.GetAllHostMeta(); m["10.1.0.5"].Alias != "a" || m["10.1.0.6"].Notes != "n" || m["10.1.0.5"].UpdatedAt.IsZero() {
+		t.Fatalf("unexpected metadata %+v", m)
 	}
 }

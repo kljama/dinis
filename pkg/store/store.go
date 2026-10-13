@@ -48,6 +48,9 @@ type DiscoveredHost struct {
 	DiscoveredAt   time.Time `json:"discoveredAt"`
 	LastDiscovered time.Time `json:"lastDiscovered"`
 	IsStatic       bool      `json:"isStatic"`
+	// LastReply is the time of the last reply to a probe, saved periodically so that it
+	// survives a restart.
+	LastReply *time.Time `json:"lastReply,omitempty"`
 }
 
 // AppSettings holds dynamic configuration tunable via Web UI settings modal.
@@ -471,12 +474,38 @@ func (s *Store) mergeDiscoveredHostUnsafe(h DiscoveredHost) {
 		if !h.IsStatic && existing.IsStatic {
 			h.IsStatic = true
 		}
+		if existing.LastReply != nil && (h.LastReply == nil || h.LastReply.Before(*existing.LastReply)) {
+			h.LastReply = existing.LastReply
+		}
 	} else if h.DiscoveredAt.IsZero() {
 		h.DiscoveredAt = time.Now()
 	}
 	h.LastDiscovered = time.Now()
 
 	s.data.DiscoveredHosts[h.IP] = h
+}
+
+// UpdateLastReplies sets the last reply time of enrolled hosts where the given time is newer,
+// and saves once. It returns the number of changed hosts.
+func (s *Store) UpdateLastReplies(replies map[string]time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := 0
+	for ip, t := range replies {
+		h, ok := s.data.DiscoveredHosts[ip]
+		if !ok || (h.LastReply != nil && !t.After(*h.LastReply)) {
+			continue
+		}
+		t := t
+		h.LastReply = &t
+		s.data.DiscoveredHosts[ip] = h
+		changed++
+	}
+	if changed == 0 {
+		return 0, nil
+	}
+	return changed, s.saveUnsafe()
 }
 
 // RemoveDiscoveredHost removes an IP from the discovered/monitored set.
@@ -540,6 +569,44 @@ func (s *Store) SetHostMeta(meta HostMeta) error {
 
 	meta.UpdatedAt = time.Now()
 	s.data.HostMeta[meta.IP] = meta
+	return s.saveUnsafe()
+}
+
+// SetHostMetaBatch sets the alias and notes of several hosts and saves once.
+func (s *Store) SetHostMetaBatch(metas []HostMeta) error {
+	if len(metas) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for _, m := range metas {
+		m.UpdatedAt = now
+		s.data.HostMeta[m.IP] = m
+	}
+	return s.saveUnsafe()
+}
+
+// ConfigReplacement is a complete configuration for ReplaceConfig.
+type ConfigReplacement struct {
+	CIDRs      []CIDRConfig
+	Exclusions []ExclusionConfig
+	Settings   AppSettings
+	// RemoveHosts are enrolled hosts to delete with the configuration change (the static
+	// entries of single-IP CIDRs that the new configuration no longer has).
+	RemoveHosts []string
+}
+
+// ReplaceConfig replaces the CIDRs, the exclusions and the settings, and saves once.
+func (s *Store) ReplaceConfig(c ConfigReplacement) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.CIDRs = append(make([]CIDRConfig, 0, len(c.CIDRs)), c.CIDRs...)
+	s.data.Exclusions = append(make([]ExclusionConfig, 0, len(c.Exclusions)), c.Exclusions...)
+	s.data.Settings = c.Settings
+	for _, ip := range c.RemoveHosts {
+		delete(s.data.DiscoveredHosts, ip)
+	}
 	return s.saveUnsafe()
 }
 

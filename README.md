@@ -83,20 +83,22 @@ DINIS shows the alerts only in the dashboard. DINIS does not send email, webhook
 
 DINIS keeps its data in these locations:
 
-- **Data file.** This JSON file contains the CIDRs, the exclusion rules, the discovered hosts, the host aliases and notes, and the settings.
+- **Data file.** This JSON file contains the CIDRs, the exclusion rules, the discovered hosts, the host aliases and notes, and the settings. It also contains the time of the last reply of each host. DINIS saves these times each 5 minutes and when it stops. Thus, after a restart, DINIS shows when each host replied last.
 - **Alert state file.** This file is in the same directory as the data file. Its name is the name of the data file with `.alerts.json` in place of the extension. For example, `data/dinis.json` gives `data/dinis.alerts.json`. The file contains:
   - The active alerts and their acknowledgements.
   - The last 500 resolved alerts. Each host has a maximum of 20 of these alerts. Thus a host with frequent outages cannot remove the alerts of all other hosts from the history.
 
   DINIS saves this file each 5 seconds while alerts change. DINIS also saves the file when it stops.
-- **Memory.** DINIS keeps the latency history only in memory. After a restart, the history is empty. For each host, the history contains:
+- **Memory.** DINIS keeps a latency history in memory. After a restart, this history is empty. For each host, the history contains:
   - The last 128 raw samples.
   - 1-minute rollups for 2 hours.
-  - 1-hour rollups for 30 days.
+  - 1-hour rollups for 30 days. DINIS keeps these rollups only if the InfluxDB export is off.
 
-  Each rollup contains one full clock minute or one full clock hour. For long-term data, use the InfluxDB export. Refer to [Retention and query range](#retention-and-query-range).
+  Each rollup contains one full clock minute or one full clock hour.
 
-  The history of one host uses approximately 44 KB of memory. For the default `maxMetricHosts` of 10,000 hosts, this is approximately 430 MB. At the start and when you change `maxMetricHosts`, DINIS writes an estimate to the log.
+  If the InfluxDB export is on, DINIS reads history windows of more than 2 hours from InfluxDB. This history is available for the full retention period (default 60 days), also after a restart of DINIS. Refer to [History windows](#history-windows).
+
+  The history of one host uses approximately 9 KB of memory with the InfluxDB export, and approximately 44 KB without it. For the default `maxMetricHosts` of 10,000 hosts, this is approximately 90 MB or 430 MB. At the start and when you change `maxMetricHosts`, DINIS writes an estimate to the log.
 - **Lock file.** The file `<data file>.lock` makes sure that only one DINIS process uses a data file.
 
 After a restart, each active alert keeps its ID, its start time, and its acknowledgement. A host with an active alert starts with the status `DOWN`. All other hosts start with the status `PENDING`.
@@ -106,7 +108,7 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
 - DINIS operates only with IPv4. DINIS accepts an IPv6 address as a `/128` target. But each probe to this target fails, and its status is `DOWN`.
 - A CIDR entry can contain a maximum of a /16 range (65,536 addresses). DINIS rejects larger ranges. For a larger range, add more than one CIDR entry.
 - When DINIS starts without a data file, it adds three targets: `127.0.0.1`, `1.1.1.1`, and `8.8.8.8`. The last two targets are public DNS resolvers. To stop the pings to them, delete their CIDR entries.
-- DINIS keeps the latency history for a maximum of `maxMetricHosts` hosts. The default is 10,000. DINIS also probes the other hosts and starts alerts for them. But these hosts have no history charts. Each host with a history uses approximately 44 KB of memory.
+- DINIS keeps the latency history for a maximum of `maxMetricHosts` hosts. The default is 10,000. DINIS also probes the other hosts and starts alerts for them. But these hosts have no history charts. Each host with a history uses approximately 9 KB of memory with the InfluxDB export, and approximately 44 KB without it.
 
 ## Prerequisites
 
@@ -219,7 +221,7 @@ curl -N http://localhost:8080/api/stream
 
 ### Authentication
 
-If you set `DINIS_API_TOKEN`, each `/api/*` request must send the token in a header. Use one of these headers:
+If you set `DINIS_API_TOKEN`, each `/api/*` request and each `/metrics` request must send the token in a header. Use one of these headers:
 
 - `Authorization: Bearer <token>`
 - `X-API-Key: <token>`
@@ -249,7 +251,8 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health`, `/api/health` | Health check. It does not use authentication. It always returns `{"status":"ok"}`. |
+| `GET` | `/health`, `/api/health` | Health check. It does not use authentication. It returns `200` for the status `ok` or `degraded`, and `503` for `fail`. Refer to [Health check and metrics](#health-check-and-metrics). |
+| `GET` | `/metrics` | Metrics in the Prometheus text format. If you set a token, the request must contain it. Refer to [Health check and metrics](#health-check-and-metrics). |
 | `GET` | `/api/summary` | Values for all hosts: the number of hosts for each status, the number of alerts, the average latency, the probe rate, and the subnet capacity. The probe rate gives the probes each second and the average time between two probes. |
 | `GET` | `/api/stream` | Server-Sent Events stream. If you set a token, add a ticket with `?ticket=`. |
 | `POST` | `/api/stream/ticket` | Gives a ticket for one stream connection. You can use the ticket for 30 seconds. The request must contain the API token header. |
@@ -262,6 +265,8 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | `GET` | `/api/hosts` | Returns the hosts. Refer to the query parameters below. |
 | `GET` | `/api/hosts/{ip}` | Returns the details of one host, with the alias and the notes. |
 | `GET` | `/api/hosts/{ip}/history` | Returns the latency and loss history (`?window=1h`). Refer to [History windows](#history-windows). |
+| `GET` | `/api/hosts/export` | Returns all monitored hosts as a CSV file (`?delimiter=semicolon` for semicolons). Refer to [Host aliases and notes as CSV](#host-aliases-and-notes-as-csv). |
+| `POST` | `/api/hosts/import` | Sets the alias and the notes of monitored hosts from a CSV file (`?dryRun=true` only shows the result). Refer to [Host aliases and notes as CSV](#host-aliases-and-notes-as-csv). |
 | `POST` | `/api/hosts/{ip}/ping` | Probes one IPv4 address immediately. Maximum one probe each second for each address. |
 | `POST` | `/api/hosts/{ip}/promote` | Makes the host a static target. DINIS monitors a static target also after you delete its range. |
 | `PUT`, `POST` | `/api/hosts/{ip}/meta` | Sets the alias and the notes. The request replaces both values. If a field is not in the request, its value becomes empty. |
@@ -276,6 +281,9 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 | `POST` | `/api/alerts/acknowledge-all` | Acknowledges all active alerts. Fields: `ackBy`, `note`. |
 | `GET` | `/api/alerts/history` | Returns the resolved alerts, the last alert first (`?limit=100`, maximum 500). The field `resolveReason` gives the reason. Refer to [Alerts](#alerts). |
 | `GET`, `PUT`, `POST` | `/api/settings` | Reads or changes the runtime settings. Refer to [Settings](#settings). |
+| `GET` | `/api/config` | Returns the configuration file: the CIDRs, the exclusion rules, and the settings. Refer to [Configuration file](#configuration-file). |
+| `PUT`, `POST` | `/api/config` | Replaces the configuration with a configuration file. Refer to [Configuration file](#configuration-file). |
+| `POST` | `/api/config/preview` | Shows the changes and the errors of a configuration file. DINIS changes nothing. |
 
 #### Query parameters for `/api/hosts`
 
@@ -293,18 +301,157 @@ curl -N "http://localhost:8080/api/stream?ticket=$TICKET"
 
 #### History windows
 
-- The `window` parameter is a Go duration, for example `30m`, `1h`, `24h`, or `168h`.
-- For a window of 2 hours or less, DINIS returns 1-minute rollups. For a longer window, DINIS returns 1-hour rollups and the current hour. The maximum is 30 days.
+The `window` parameter is a Go duration, for example `30m`, `1h`, `24h`, `168h`, `720h` (30 days), or `1440h` (60 days).
+
+For a window of 2 hours or less, DINIS returns 1-minute rollups from memory. The timestamp of each point is the start of its minute.
+
+For a longer window with the InfluxDB export, DINIS reads the history from InfluxDB:
+
+- Each point contains 1 hour. For a window of more than 30 days, each point contains more hours, so that the response has a maximum of 720 points. For example, a point of a 60-day window contains 2 hours.
+- The maximum window is the retention period (`INFLUXDB3_RETENTION_DAYS`), but not less than 30 days. DINIS makes a longer window shorter.
+- The timestamp of each point is the start of its period. The periods start at full UTC hours.
+- The first point and the last point have `"partial": true`. They contain only a part of their period.
+- `p50LatencyMs`, `p95LatencyMs`, and `p99LatencyMs` are approximate percentiles of all successful probes in the point.
+- `jitterMs` is the mean difference between two consecutive successful probes. The first successful probe of the window has no previous probe.
+- DINIS keeps each response for 60 seconds. During this time, a request with the same host and window gets the same response.
+- A window of many days reads many files in InfluxDB. The first response can take some seconds.
+- If InfluxDB does not respond or returns an error, DINIS returns `502` with the error text. The dashboard shows this text in the chart.
+
+For a longer window without the InfluxDB export, DINIS returns 1-hour rollups from memory and the current hour:
+
+- The maximum window is 30 days.
+- The timestamp of each point is the start of its hour.
 - The point of the current hour has `"partial": true`. It contains the data up to the last full minute.
-- The timestamp of each point is the start of its minute or its hour.
 - `p50LatencyMs`, `p95LatencyMs`, and `p99LatencyMs` are the percentiles of all samples in the point. For a 1-hour point, the error is approximately 2 % of the value.
 - `jitterMs` is the mean difference between two consecutive successful probes. The first difference starts at the last probe before the point. If the point has no such pair, the value is `null`.
-- DINIS keeps the history only in memory. After a restart, the history is empty.
-- The first 1-hour point is available shortly after the end of the first full clock hour. This point contains only the data after the start of DINIS.
+- After a restart, the history is empty. The first 1-hour point is available shortly after the end of the first full clock hour. This point contains only the data after the start of DINIS.
+
+The dashboard shows the windows 1 hour, 24 hours, 7 days, and 30 days. With the InfluxDB export, it also shows 60 days.
 
 #### Probe response
 
 `/api/hosts/{ip}/ping` returns `{"IP", "Success", "Latency", "LatencyMs", "Error", "Timestamp"}`. These keys start with a capital letter. The keys of all other endpoints start with a lowercase letter.
+
+### Health check and metrics
+
+`/health` (also `/api/health`) shows if the monitoring operates correctly. It does not use authentication. The Docker health check of the DINIS container uses it.
+
+| Status | HTTP status | Meaning |
+|---|---|---|
+| `ok` | `200` | DINIS probes all hosts on schedule. |
+| `degraded` | `200` | DINIS probes, but there is a problem. The probes of failing hosts are more than 5 minutes late (for example, during a large outage). Or the InfluxDB export has data in its buffer, and no write was successful for 2 minutes. |
+| `fail` | `503` | The monitoring does not operate. The probe engine does not run, or the probes of hosts that reply are more than 2 minutes late. Then the probe capacity is too low or the engine is stuck. |
+
+The response shows the status of each part:
+
+```json
+{
+  "status": "ok",
+  "probing": {"status": "ok", "scheduledHosts": 1250, "scheduleLagSec": 0, "lastProbe": "2026-10-12T15:41:16Z"},
+  "influxdb": {"status": "ok", "bufferedBytes": 0, "lastWrite": "2026-10-12T15:41:20Z"}
+}
+```
+
+The `influxdb` part is only in the response if the InfluxDB export is on.
+
+`/metrics` gives the values of DINIS in the Prometheus text format. If you set `DINIS_API_TOKEN`, the request must contain the token. This is an example of a Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: dinis
+    authorization:
+      credentials: <DINIS_API_TOKEN>
+    static_configs:
+      - targets: ["dinis.example.com:8080"]
+```
+
+| Metric | Description |
+|---|---|
+| `dinis_health_status` | The result of the health check: `0` ok, `1` degraded, `2` fail. |
+| `dinis_hosts{status}` | The monitored hosts for each status (`up`, `down`, `pending`, `excluded`). |
+| `dinis_alerts{state}` | The active alerts (`firing`, `acknowledged`). |
+| `dinis_probe_rate_per_second` | The planned probes each second. |
+| `dinis_probes_total`, `dinis_probe_failures_total` | The scheduled probes and the probes without a reply since the start. |
+| `dinis_probe_workers`, `dinis_probe_workers_busy` | The probe workers, and the probes that run now. |
+| `dinis_probe_schedule_lag_seconds{queue}` | The time that the most overdue probe waits for a worker. `healthy`: hosts that reply. `suspect`: hosts whose last probe failed. |
+| `dinis_last_probe_timestamp_seconds` | The end of the last scheduled probe (Unix time). |
+| `dinis_history_hosts`, `dinis_history_hosts_max` | The hosts with a latency history in memory, and the limit (`maxMetricHosts`). |
+| `dinis_history_samples_dropped_total` | The probe results without a history, because the limit was reached. |
+| `dinis_discovery_running`, `dinis_discovery_last_run_timestamp_seconds` | `1` while a discovery sweep runs, and the end of the last sweep. |
+| `dinis_sse_clients` | The open dashboard event streams. |
+| `dinis_influxdb_buffer_bytes` | The probe data that waits for the next InfluxDB write. |
+| `dinis_influxdb_write_errors_total` | The InfluxDB writes and database setups that failed after all retries. |
+| `dinis_influxdb_lines_dropped_total` | The probe results that DINIS did not write to InfluxDB (buffer full, or refused by InfluxDB). |
+| `dinis_influxdb_database_ready` | `1` when the database has its retention period. |
+| `dinis_influxdb_last_write_timestamp_seconds` | The last successful InfluxDB write (Unix time). |
+| `dinis_build_info{version}`, `dinis_start_time_seconds` | The version and the start time of DINIS. |
+| `go_goroutines`, `go_memstats_heap_alloc_bytes`, `go_memstats_sys_bytes` | The Go runtime values. |
+
+The `dinis_influxdb_*` metrics are only available if the InfluxDB export is on.
+
+### Host aliases and notes as CSV
+
+`GET /api/hosts/export` gives all monitored hosts as a CSV file. The columns are `ip`, `alias`, `notes`, `subnet`, `status`, `static`, and `last_reply`.
+
+- The file starts with a UTF-8 byte order mark. Excel then shows special characters (for example umlauts) correctly.
+- Add `?delimiter=semicolon` to get semicolons in place of commas. Excel with a comma as the decimal separator (for example, German) expects semicolons.
+- In the dashboard, click **Export CSV** in the explorer view. The dashboard selects the delimiter from the language settings of the browser.
+
+`POST /api/hosts/import` sets the alias and the notes of monitored hosts from a CSV file. Send the file as the request body.
+
+- The file must have an `ip` column, and an `alias` column, a `notes` column, or both. DINIS ignores all other columns. Thus you can edit an exported file and import it again.
+- The delimiter can be a comma or a semicolon. DINIS finds the delimiter in the first line.
+- If a column is not in the file, the value does not change. An empty cell deletes the value.
+- If an IP address is in more than one row, the last row applies.
+- DINIS ignores rows with an IP address that it does not monitor, and rows that it cannot read. The response shows these rows (a maximum of 100 for each type).
+- With `?dryRun=true`, DINIS only shows the result. It changes nothing.
+- The maximum file size is 16 MB.
+- In the dashboard, click **Import CSV** in the explorer view. The dashboard shows the result of a dry run first. Then you confirm the import.
+
+```bash
+curl -o dinis-hosts.csv "http://localhost:8080/api/hosts/export?delimiter=semicolon"
+curl -X POST -H "Content-Type: text/csv" --data-binary @dinis-hosts.csv "http://localhost:8080/api/hosts/import?dryRun=true"
+curl -X POST -H "Content-Type: text/csv" --data-binary @dinis-hosts.csv "http://localhost:8080/api/hosts/import"
+```
+
+The response shows the number of rows, of changed hosts (`updated`), and of hosts without a change (`unchanged`). It also shows the ignored rows (`unknown`, `invalid`).
+
+### Configuration file
+
+`GET /api/config` gives the configuration of DINIS as a JSON file. The file contains the CIDRs, the exclusion rules, and the settings. It does not contain the discovered hosts, the aliases and notes, and the alerts. Use the file as a backup, or to copy the configuration to a different DINIS instance.
+
+```json
+{
+  "version": 1,
+  "exportedAt": "2026-10-12T15:41:16Z",
+  "settings": {"intervalSec": 60, "timeoutMs": 1000, "failThreshold": 2},
+  "cidrs": [
+    {"cidr": "192.168.1.0/24", "description": "LAN", "enabled": true, "includeNetAndBcast": false}
+  ],
+  "exclusions": [
+    {"rule": "192.168.1.5", "reason": "Lab", "enabled": true}
+  ]
+}
+```
+
+`PUT /api/config` replaces the configuration with a file:
+
+- The file replaces all CIDRs and all exclusion rules. DINIS deletes the CIDRs and the rules that are not in the file. The file must contain `cidrs` and `exclusions`. An empty list deletes all entries.
+- A setting that is not in the file keeps its value. DINIS changes values that are out of range to the nearest permitted value, as for `/api/settings`.
+- If a deleted CIDR is a single IP address, DINIS also deletes its static host.
+- CIDRs and rules that stay keep their creation time.
+- For each new enabled CIDR, DINIS starts a discovery sweep if `autoDiscovery` is `true`.
+- If the file has an error, DINIS returns `400` with the list of errors. DINIS changes nothing.
+
+`POST /api/config/preview` shows the changes and the errors of a file. DINIS changes nothing. The response lists the added, the deleted, and the changed CIDRs and rules, and the changed settings.
+
+```bash
+curl -o dinis-config.json http://localhost:8080/api/config
+curl -X POST -H "Content-Type: application/json" --data-binary @dinis-config.json http://localhost:8080/api/config/preview
+curl -X PUT -H "Content-Type: application/json" --data-binary @dinis-config.json http://localhost:8080/api/config
+```
+
+In the dashboard, open the settings and use **Export** or **Import** in the section **Configuration File**. The dashboard shows the changes first. Then you confirm the import.
 
 ### Remove a target
 
@@ -451,9 +598,9 @@ InfluxDB 3 Core can query a time range only if two settings are large enough. In
 | `--gen1-lookback-duration` | The retention period | 1 month. At the start, InfluxDB loads the index of the data files only for this time. |
 | `--query-file-limit` | 288 × the number of days (two files for each 10-minute block) | 432 files, approximately 72 hours |
 
-Thus you can query all data in the retention period, also after a restart of InfluxDB. If you use InfluxDB without the Compose stack, set these two options yourself.
+Thus you can query all data in the retention period, also after a restart of InfluxDB. If you use InfluxDB without the Compose stack, set these two options yourself. With the InfluxDB defaults, the history windows of more than approximately 72 hours fail (for example, the 7-day window of the dashboard chart). The chart then shows the error of InfluxDB.
 
-**NOTE:** A query over many days reads many files. For example, a query over 60 days reads up to 17,280 files. Such a query is slow and uses much memory in the InfluxDB container.
+**NOTE:** A query over many days reads many files. For example, a query over 60 days reads up to 17,280 files. Such a query is slow and uses much memory in the InfluxDB container. The 30-day and 60-day windows of the dashboard chart are such queries. DINIS keeps each response for 60 seconds.
 
 ### InfluxDB 3 Explorer
 
@@ -531,10 +678,10 @@ The default settings are for a safe test network. Before you use DINIS on a diff
 ├── .github/workflows/    # CI: gofmt, go vet, tests with the race detector, configuration checks, end-to-end test
 └── pkg/
     ├── alerts/           # Alert life cycle: start, acknowledgement, resolution, history, export for restarts
-    ├── influxdb/         # InfluxDB 3 exporter for line protocol, with batches
+    ├── influxdb/         # InfluxDB 3 exporter for line protocol, with batches. SQL queries for the long history windows.
     ├── network/          # CIDR parser, IP expansion, exclusion rules
     ├── pinger/           # ICMP sockets, probe engine, probe schedule for each host, UP and DOWN status
-    ├── server/           # Coordinator for the engine, the alerts, the discovery, and the storage. REST API and SSE.
+    ├── server/           # Coordinator for the engine, the alerts, the discovery, and the storage. REST API, SSE, health check, metrics, CSV and configuration file.
     │   └── web_dist/     # Built-in web dashboard
     ├── store/            # Data file and alert state file with atomic writes, lock for one process
     └── timeseries/       # Latency history in memory, rollups, outlier detection

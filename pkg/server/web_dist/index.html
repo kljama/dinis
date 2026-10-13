@@ -282,6 +282,12 @@
           </div>
 
           <div class="toolbar-right">
+            <div class="transfer-actions">
+              <button type="button" id="btnExportHostsCSV" class="btn btn-sm btn-outline" title="Download all monitored hosts with their alias and notes as a CSV file">Export CSV</button>
+              <button type="button" id="btnImportHostsCSV" class="btn btn-sm btn-outline" title="Set the alias and notes of monitored hosts from a CSV file (columns ip, alias, notes)">Import CSV</button>
+              <input type="file" id="inputImportHostsCSV" accept=".csv,text/csv" hidden>
+            </div>
+
             <div class="sort-select-wrapper">
               <label for="sortSelect" class="sort-label">Sort:</label>
               <select id="sortSelect" class="custom-select">
@@ -684,6 +690,8 @@
                   <button class="chart-tab" data-window="1h">1 Hour (1m)</button>
                   <button class="chart-tab" data-window="24h">24 Hours (1h)</button>
                   <button class="chart-tab" data-window="168h">7 Days (1h)</button>
+                  <button class="chart-tab" data-window="720h">30 Days (1h)</button>
+                  <button class="chart-tab" data-window="1440h" id="chartTab60d">60 Days (2h)</button>
                 </div>
                 <span class="chart-current-rtt" id="detailCurrentRTT">-- ms</span>
               </div>
@@ -864,6 +872,16 @@
           <div id="settingsSubnetsList" class="settings-subnets-list">
             <!-- Dynamically populated -->
           </div>
+
+          <div class="modal-section-title d-flex justify-between align-center">
+            <span>Configuration File</span>
+            <div class="transfer-actions">
+              <button type="button" id="btnExportConfig" class="btn btn-sm btn-outline">Export</button>
+              <button type="button" id="btnImportConfig" class="btn btn-sm btn-outline">Import</button>
+            </div>
+          </div>
+          <span class="field-hint">The file contains the subnets, the exclusion rules and the settings. An import shows the changes first. Then it replaces the subnets and the exclusion rules completely.</span>
+          <input type="file" id="inputImportConfig" accept=".json,application/json" hidden>
 
           <div class="modal-footer">
             <button type="button" class="btn btn-outline" id="btnCancelSettings">Cancel</button>

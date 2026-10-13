@@ -1286,8 +1286,9 @@ func TestClientIPFiltering(t *testing.T) {
 }
 
 func TestHealthEndpoints(t *testing.T) {
-	srv, _, cleanup := setupTestServer(t)
+	srv, coord, cleanup := setupTestServer(t)
 	defer cleanup()
+	coord.Start() // /health reports a stopped probe engine as a failure
 
 	// Lock down everything: require API token, restrict allowed hosts, restrict allowed client IPs
 	srv.SetAPIToken("secret-token")

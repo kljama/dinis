@@ -94,12 +94,15 @@ func main() {
 		if *influxRetentionFlag > 0 {
 			retention = fmt.Sprintf("%dd", *influxRetentionFlag)
 		}
-		influxWriter = influxdb.NewWriter(influxdb.Config{
+		influxCfg := influxdb.Config{
 			URL:             *influxURLFlag,
 			Bucket:          *influxBucketFlag,
 			Token:           *influxTokenFlag,
 			RetentionPeriod: retention,
-		})
+		}
+		influxWriter = influxdb.NewWriter(influxCfg)
+		// History windows over 2 hours come from InfluxDB; DINIS keeps no hour history in memory
+		coord.SetInfluxDB(influxWriter, influxdb.NewQuerier(influxCfg), *influxRetentionFlag)
 		coord.SetProbeExporter(func(ip, alias, subnet string, latencyMs float64, success bool, ts time.Time) {
 			influxWriter.WriteProbe(ip, alias, subnet, latencyMs, success, ts)
 		})
@@ -114,6 +117,7 @@ func main() {
 
 	// Initialize HTTP server
 	srvHandler := server.NewServer(coord, *staticFlag)
+	srvHandler.SetVersion(version)
 	if *apiTokenFlag != "" {
 		srvHandler.SetAPIToken(*apiTokenFlag)
 		log.Println("[DINIS] API token authentication enabled for REST endpoints")

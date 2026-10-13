@@ -832,3 +832,44 @@ func TestComputeSummaryReusesScratch(t *testing.T) {
 		t.Fatal("expected the scratch buffer to be reused")
 	}
 }
+
+func TestStoreWithoutHourHistory(t *testing.T) {
+	st := NewStoreWithLimit(2)
+	ip := "10.0.0.1"
+	hour := time.Now().Truncate(time.Hour).Add(-2 * time.Hour)
+	st.Record(ip, hour.Add(10*time.Second), 3, true)
+	st.computeMinuteRollups(hour, hour.Add(time.Minute))
+	st.computeHourRollups(hour, hour.Add(time.Hour))
+	if len(st.getOrCreateHourSeries(ip).GetAll()) != 1 {
+		t.Fatal("expected an hour point while the hour history is on")
+	}
+
+	st.SetHourHistory(false)
+	if st.Stats().HourHistory || len(st.hourSeries) != 0 {
+		t.Fatal("expected the hour history to be off and empty")
+	}
+	next := hour.Add(time.Hour)
+	st.Record(ip, next.Add(10*time.Second), 4, true)
+	st.computeMinuteRollups(next, next.Add(time.Minute))
+	st.computeHourRollups(next, next.Add(time.Hour))
+	if len(st.hourSeries) != 0 || st.GetHostHistory(ip, 6*time.Hour) != nil {
+		t.Fatal("expected no hour points without the hour history")
+	}
+	if pts := st.GetHostHistory(ip, 2*time.Hour); len(pts) == 0 {
+		t.Fatal("expected minute points for windows up to 2 hours")
+	}
+	if a := st.aggs[ip]; a.hour != 0 || a.stats.hist != nil {
+		t.Fatal("expected no hour in progress without the hour history")
+	}
+
+	// Samples of hosts above the limit are counted
+	st.Record("10.0.0.2", time.Now(), 1, true)
+	st.Record("10.0.0.3", time.Now(), 1, true)
+	st.Record("10.0.0.3", time.Now(), 1, true)
+	if s := st.Stats(); s.DroppedSamplesTotal != 2 || s.HostsWithHistory != 2 || s.MaxHosts != 2 {
+		t.Fatalf("unexpected stats %+v", s)
+	}
+	if EstimateMemoryMB(10000, false) >= EstimateMemoryMB(10000, true)/3 {
+		t.Fatal("expected far less memory without the hour history")
+	}
+}

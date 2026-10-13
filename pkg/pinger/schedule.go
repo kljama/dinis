@@ -286,6 +286,7 @@ func (e *Engine) nextJobUnsafe() (probeJob, time.Duration, bool) {
 }
 
 func (e *Engine) startJobUnsafe(ent *schedEntry, now time.Duration) probeJob {
+	e.inFlight++
 	ent.inFlight = true
 	ent.probed = true
 	ent.lastDispatch = now

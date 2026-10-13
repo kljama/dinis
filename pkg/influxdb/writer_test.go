@@ -2,6 +2,7 @@ package influxdb
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -419,5 +420,84 @@ func TestRetainFailedPayloadDropsOnlyOldestLines(t *testing.T) {
 	kept := got[:len(got)-newer.Len()]
 	if len(kept) == 0 || !bytes.HasSuffix(payload.Bytes(), kept) || !bytes.HasPrefix(kept, []byte("icmp_probe,")) {
 		t.Fatalf("expected the newest whole lines of the failed payload to be kept (kept %d bytes)", len(kept))
+	}
+}
+
+func TestQuerierHostHistory(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		if r.URL.Path != "/api/v3/query_sql" || r.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`[
+		 {"bucket_s": 1791800000, "probes": 60, "replies": 58, "min_ms": 1.5, "max_ms": 9.25, "avg_ms": 2.5,
+		  "p50_ms": 2.25, "p95_ms": 5.5, "p99_ms": 9.0, "jitter_ms": 0.75},
+		 {"bucket_s": 1791803600, "probes": 12, "replies": 0, "min_ms": null, "max_ms": null, "avg_ms": null,
+		  "p50_ms": null, "p95_ms": null, "p99_ms": null, "jitter_ms": null}]`))
+	}))
+	defer srv.Close()
+
+	q := NewQuerier(Config{URL: srv.URL + "/", Bucket: "dinis", Token: "tok"})
+	pts, err := q.HostHistory(context.Background(), "10.0.0.1", 24*time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"db":"dinis"`, `"format":"json"`, "ip = '10.0.0.1'", "INTERVAL '86400 seconds'", "INTERVAL '3600 seconds'"} {
+		if !strings.Contains(gotBody, want) {
+			t.Errorf("query is missing %s: %s", want, gotBody)
+		}
+	}
+	if len(pts) != 2 || pts[0].Start.Unix() != 1791800000 || pts[0].Probes != 60 || pts[0].Replies != 58 ||
+		pts[0].P95Ms != 5.5 || pts[0].JitterMs == nil || *pts[0].JitterMs != 0.75 {
+		t.Fatalf("unexpected first point %+v", pts[0])
+	}
+	if pts[1].Replies != 0 || pts[1].JitterMs != nil || pts[1].AvgMs != 0 {
+		t.Fatalf("unexpected point without replies %+v", pts[1])
+	}
+}
+
+func TestQuerierMissingTableAndErrors(t *testing.T) {
+	status, msg := http.StatusInternalServerError, "table 'public.iox.icmp_probe' not found"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(msg))
+	}))
+	defer srv.Close()
+	q := NewQuerier(Config{URL: srv.URL, Bucket: "dinis"})
+	if pts, err := q.HostHistory(context.Background(), "10.0.0.1", time.Hour*24, time.Hour); err != nil || len(pts) != 0 {
+		t.Fatalf("a missing table means no data yet, got %v %v", pts, err)
+	}
+	msg = "query would exceed file limit"
+	if _, err := q.HostHistory(context.Background(), "10.0.0.1", time.Hour*24, time.Hour); err == nil || !strings.Contains(err.Error(), "file limit") {
+		t.Fatalf("expected the InfluxDB error, got %v", err)
+	}
+}
+
+func TestWriterStats(t *testing.T) {
+	status := http.StatusNoContent
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	w := NewWriter(Config{URL: srv.URL, Bucket: "dinis", FlushInterval: time.Hour})
+	defer w.Stop()
+
+	w.WriteProbe("10.0.0.1", "", "", 1, true, time.Now())
+	if s := w.Stats(); s.BufferedBytes == 0 || !s.LastSuccess.IsZero() || !s.DatabaseReady {
+		t.Fatalf("unexpected stats before the flush: %+v", s)
+	}
+	w.flush()
+	if s := w.Stats(); s.BufferedBytes != 0 || s.LastSuccess.IsZero() || s.WriteErrors != 0 {
+		t.Fatalf("unexpected stats after a good write: %+v", s)
+	}
+	status = http.StatusBadRequest // refused: the lines are dropped
+	w.WriteProbe("10.0.0.1", "", "", 1, true, time.Now())
+	w.WriteProbe("10.0.0.2", "", "", 1, true, time.Now())
+	w.flush()
+	if s := w.Stats(); s.WriteErrors != 1 || s.DroppedLines != 2 {
+		t.Fatalf("unexpected stats after a refused write: %+v", s)
 	}
 }

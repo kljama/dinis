@@ -128,6 +128,12 @@ type Engine struct {
 	workerWg      sync.WaitGroup
 	workerStops   []chan struct{} // one stop channel per running worker
 	activeWorkers int32
+	inFlight      int // dispatched probes not yet applied, guarded by mu
+
+	// Counters for Stats
+	probesTotal   atomic.Uint64
+	failuresTotal atomic.Uint64
+	lastProbe     atomic.Int64 // UnixNano of the last completed scheduled probe
 
 	// Callbacks
 	BeforeStateChange func(host *HostState, oldStatus, newStatus HostStatus)
@@ -483,6 +489,7 @@ func (e *Engine) Start() {
 	e.sched = make(map[string]*schedEntry, len(e.hosts))
 	e.healthyQ, e.suspectQ = nil, nil
 	e.suspectInFlight = 0
+	e.inFlight = 0
 	for _, h := range e.hosts {
 		e.schedAddUnsafe(h, true)
 	}
@@ -518,6 +525,7 @@ func (e *Engine) Stop() {
 	e.sched = make(map[string]*schedEntry)
 	e.healthyQ, e.suspectQ = nil, nil
 	e.suspectInFlight = 0
+	e.inFlight = 0
 	e.ctx = nil
 	e.cancel = nil
 	e.mu.Unlock()
@@ -585,6 +593,7 @@ func (e *Engine) probeAndApply(job probeJob) {
 	res := e.prober.Probe(probeCtx, job.ip, timeout)
 
 	e.mu.Lock()
+	e.inFlight--
 	if job.suspect {
 		e.suspectInFlight--
 		e.signalSchedule() // a suspect slot is free again
@@ -605,6 +614,11 @@ func (e *Engine) probeAndApply(job probeJob) {
 	e.applyResult(h, res)
 	newStatus := h.Status
 	statusChanged := (oldStatus != newStatus)
+	e.probesTotal.Add(1)
+	if !res.Success {
+		e.failuresTotal.Add(1)
+	}
+	e.lastProbe.Store(time.Now().UnixNano())
 
 	if statusChanged && e.BeforeStateChange != nil {
 		e.BeforeStateChange(h, oldStatus, newStatus)

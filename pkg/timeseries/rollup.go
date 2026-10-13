@@ -263,9 +263,9 @@ type hostAgg struct {
 }
 
 // rollupMinute rolls up the samples of rb timestamped in [start, end), adds them to the hour
-// in progress, and returns the minute point (false if the bucket has no samples). b is a
-// scratch buffer.
-func (a *hostAgg) rollupMinute(rb *HostRingBuffer, start, end time.Time, b *bucketStats) (RollupPoint, bool) {
+// in progress if keepHour is set, and returns the minute point (false if the bucket has no
+// samples). b is a scratch buffer.
+func (a *hostAgg) rollupMinute(rb *HostRingBuffer, start, end time.Time, b *bucketStats, keepHour bool) (RollupPoint, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -285,12 +285,22 @@ func (a *hostAgg) rollupMinute(rb *HostRingBuffer, start, end time.Time, b *buck
 		return RollupPoint{}, false
 	}
 
-	if hour := start.Truncate(time.Hour).UnixNano(); a.hour != hour {
-		a.stats.reset()
-		a.hour = hour
+	if keepHour {
+		if hour := start.Truncate(time.Hour).UnixNano(); a.hour != hour {
+			a.stats.reset()
+			a.hour = hour
+		}
+		a.stats.addBucket(b)
 	}
-	a.stats.addBucket(b)
 	return b.point(start, time.Minute), true
+}
+
+// dropHour discards the hour in progress and frees its histogram.
+func (a *hostAgg) dropHour() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stats = hourStats{}
+	a.hour = 0
 }
 
 // rollupHour returns the point of the hour starting at start if it is the hour in progress,
