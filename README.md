@@ -49,6 +49,8 @@ DINIS probes each host each `intervalSec` seconds. The default interval is 60 se
 
 Each host has a fixed time slot in its interval. DINIS distributes the probes equally across the interval. Each host has a constant probe rate.
 
+DINIS calculates the time slot from the IP address. Adjacent addresses get time slots that are far apart. For example, at an interval of 30 seconds, the probes to the hosts of a /24 network are 58 to 151 ms apart. Thus DINIS does not send bursts of probes to one network. Some routers, firewalls, and hosts drop a part of such bursts.
+
 - When DINIS adds a host, DINIS sends the first probe not more than 5 seconds later. This rule is for new targets and for hosts that a discovery sweep finds.
 - When you change an interval, DINIS uses the new interval immediately.
 - A new host has the status `PENDING`. After the first reply, the status changes to `UP`.

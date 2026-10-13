@@ -3,7 +3,9 @@ package pinger
 import (
 	"container/heap"
 	"context"
+	"encoding/binary"
 	"hash/fnv"
+	"net/netip"
 	"time"
 )
 
@@ -61,12 +63,36 @@ type probeJob struct {
 	suspect bool // holds a suspect slot until the probe completes
 }
 
+// fibMul32 is 2^32/φ (golden ratio), rounded to an odd number.
+const fibMul32 = 0x9E3779B9
+
 // ipPhase maps an IP to a fixed position in [0, 1) within its probe interval, so hosts that
 // share an interval are spread across it and keep their spacing from one probe to the next.
+//
+// An IPv4 address is multiplied by 2^32/φ (Fibonacci hashing). Consecutive addresses land
+// about 0.618 intervals apart, and any range of addresses fills the interval evenly, so the
+// hosts of a subnet are probed one at a time and never in a burst. A hash of the address
+// text cannot be used: FNV-1a barely changes its high bits when only the last digits change,
+// which put up to 80 hosts of a /24 into the same 11 ms.
 func ipPhase(ip string) float64 {
+	if a, err := netip.ParseAddr(ip); err == nil && a.Unmap().Is4() {
+		b := a.Unmap().As4()
+		return float64(binary.BigEndian.Uint32(b[:])*fibMul32) / (1 << 32)
+	}
+	// Other targets (IPv6): a hash of the text, mixed so that every character changes all bits
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(ip))
-	return float64(h.Sum64()>>11) / float64(1<<53)
+	return float64(mix64(h.Sum64())>>11) / (1 << 53)
+}
+
+// mix64 is the SplitMix64 finalizer: each input bit changes about half of the output bits.
+func mix64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // nextSlot returns the first time after `after` at which a host with the given phase is

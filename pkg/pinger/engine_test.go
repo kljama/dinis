@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -474,6 +475,99 @@ func TestNextSlot(t *testing.T) {
 		if got := nextSlot(c.phase, c.iv, c.after); got != c.want {
 			t.Errorf("%s: nextSlot(%v, %v, %v) = %v, want %v", c.description, c.phase, c.iv, c.after, got, c.want)
 		}
+	}
+}
+
+// probeTimes returns the probe times (ms) within one cycle for hosts with the given interval.
+func probeTimes(ips []string, iv, cycle float64) []float64 {
+	var ts []float64
+	for _, ip := range ips {
+		for t := ipPhase(ip) * iv; t < cycle; t += iv {
+			ts = append(ts, t)
+		}
+	}
+	sort.Float64s(ts)
+	return ts
+}
+
+// maxInWindow returns the largest number of probes within any window of w ms (cyclic).
+func maxInWindow(ts []float64, w, cycle float64) int {
+	best := 0
+	for i, start := range ts {
+		n := 0
+		for j := 0; j < len(ts); j++ {
+			d := ts[(i+j)%len(ts)] - start
+			if d < 0 {
+				d += cycle
+			}
+			if d > w {
+				break
+			}
+			n++
+		}
+		if n > best {
+			best = n
+		}
+	}
+	return best
+}
+
+func subnetIPs(prefix string, nets int) []string {
+	var ips []string
+	for n := 0; n < nets; n++ {
+		for i := 1; i <= 254; i++ {
+			ips = append(ips, fmt.Sprintf("%s.%d.%d", prefix, n, i))
+		}
+	}
+	return ips
+}
+
+// The hosts of a subnet must be spread over the interval. The former FNV hash of the address
+// text put 80 hosts of 10.130.17.0/24 into the same 11 ms; the replies to such bursts were
+// lost in the network.
+func TestIPPhaseSpreadsSubnet(t *testing.T) {
+	var ips []string
+	for i := 1; i <= 254; i++ {
+		ips = append(ips, fmt.Sprintf("10.130.17.%d", i))
+	}
+	ts := probeTimes(ips, 30000, 30000)
+	minGap := ts[0] + 30000 - ts[len(ts)-1]
+	for i := 1; i < len(ts); i++ {
+		if g := ts[i] - ts[i-1]; g < minGap {
+			minGap = g
+		}
+	}
+	// Even spacing would be 118 ms
+	if minGap < 50 {
+		t.Errorf("two hosts of the /24 are probed %.3f ms apart, want at least 50 ms", minGap)
+	}
+	if n := maxInWindow(ts, 10, 30000); n > 1 {
+		t.Errorf("%d probes of the /24 within 10 ms, want 1", n)
+	}
+}
+
+func TestIPPhaseNoBurstsAcrossSubnets(t *testing.T) {
+	// 16 subnets at 30 s and 16 at 60 s: 12,192 probes a minute, 2 per 10 ms on average
+	ts := append(probeTimes(subnetIPs("10.130", 16), 30000, 60000), probeTimes(subnetIPs("10.131", 16), 60000, 60000)...)
+	sort.Float64s(ts)
+	if n := maxInWindow(ts, 10, 60000); n > 4 {
+		t.Errorf("%d probes within 10 ms, want at most 4 (the FNV hash gave 101)", n)
+	}
+}
+
+func TestIPPhaseIsStableAndInRange(t *testing.T) {
+	for _, ip := range []string{"0.0.0.0", "10.130.17.102", "255.255.255.255", "::ffff:10.130.17.102", "2001:db8::1", "not-an-ip"} {
+		p := ipPhase(ip)
+		if p < 0 || p >= 1 || p != ipPhase(ip) {
+			t.Errorf("ipPhase(%q) = %v, want a stable value in [0, 1)", ip, p)
+		}
+	}
+	if ipPhase("::ffff:10.130.17.102") != ipPhase("10.130.17.102") {
+		t.Error("an IPv4-mapped IPv6 address must get the slot of its IPv4 address")
+	}
+	// Other targets: adjacent addresses must not share a slot either
+	if d := ipPhase("2001:db8::1") - ipPhase("2001:db8::2"); d > -0.01 && d < 0.01 {
+		t.Errorf("adjacent IPv6 addresses are only %.5f intervals apart", d)
 	}
 }
 
