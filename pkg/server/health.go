@@ -149,6 +149,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	st := c.pinger.Stats()
 	m.counter("dinis_probes_total", "Scheduled probes completed since the start.", float64(st.ProbesTotal))
 	m.counter("dinis_probe_failures_total", "Scheduled probes without a reply since the start.", float64(st.FailuresTotal))
+	m.counter("dinis_probe_local_errors_total", "Probes that failed because of this machine (for example no buffer space); not counted as packet loss.", float64(st.LocalErrors))
+	m.counter("dinis_probe_late_replies_total", "Echo replies that matched no waiting probe (late or duplicate).", float64(st.LateReplies))
+	m.counter("dinis_icmp_rx_dropped_total", "Packets the kernel dropped because the ICMP socket buffer was full.", float64(st.RxDropped))
+	if st.ProbeMode != "" {
+		m.gauge("dinis_icmp_socket_info", "How DINIS sends probes (mode: ping_socket, raw_socket or ping_command).", 1, "mode", st.ProbeMode)
+	}
 	m.gauge("dinis_probe_workers", "Probe workers.", float64(st.Workers))
 	m.gauge("dinis_probe_workers_busy", "Probes in flight.", float64(st.BusyWorkers))
 	m.header("dinis_probe_schedule_lag_seconds", "gauge", "How long the most overdue probe waits for a worker (healthy: hosts that reply, suspect: hosts whose last probe failed).")

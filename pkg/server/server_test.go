@@ -1166,17 +1166,13 @@ func TestRebuildTargetListPreservesLiveHostMetrics(t *testing.T) {
 	})
 	coord.RebuildTargetList()
 
-	// Perform a successful ping probe on 127.0.0.1 to establish live metrics
-	res := coord.pinger.PingSingle(context.Background(), "127.0.0.1")
-	if !res.Success {
-		t.Fatalf("expected PingSingle to succeed on 127.0.0.1: %v", res.Error)
-	}
-
+	// Scheduled probes of 127.0.0.1 establish live metrics
+	waitForScheduledProbes(t, coord, "127.0.0.1", 1)
 	h, ok := coord.pinger.GetHost("127.0.0.1")
 	if !ok || h.Status != pinger.StatusUp {
-		t.Fatalf("expected host 127.0.0.1 to be UP after PingSingle")
+		t.Fatalf("expected host 127.0.0.1 to be UP after its probes")
 	}
-	if h.SentPackets != 1 || h.RecvPackets != 1 || len(h.LatencyHistory) != 1 {
+	if h.SentPackets == 0 || h.RecvPackets == 0 || len(h.LatencyHistory) == 0 {
 		t.Fatalf("expected initial live stats: sent=%d recv=%d hist=%d", h.SentPackets, h.RecvPackets, len(h.LatencyHistory))
 	}
 
@@ -1195,12 +1191,35 @@ func TestRebuildTargetListPreservesLiveHostMetrics(t *testing.T) {
 	if updatedH.Status != pinger.StatusUp {
 		t.Errorf("expected status UP preserved across rebuild, got %v", updatedH.Status)
 	}
-	if updatedH.SentPackets != 1 || updatedH.RecvPackets != 1 {
-		t.Errorf("expected packet counts preserved, got sent=%d recv=%d", updatedH.SentPackets, updatedH.RecvPackets)
+	if updatedH.SentPackets != h.SentPackets || updatedH.RecvPackets != h.RecvPackets {
+		t.Errorf("expected packet counts preserved, got sent=%d recv=%d, want sent=%d recv=%d",
+			updatedH.SentPackets, updatedH.RecvPackets, h.SentPackets, h.RecvPackets)
 	}
-	if len(updatedH.LatencyHistory) != 1 {
-		t.Errorf("expected latency history preserved, got %d entries", len(updatedH.LatencyHistory))
+	if len(updatedH.LatencyHistory) != len(h.LatencyHistory) {
+		t.Errorf("expected latency history preserved, got %d entries, want %d", len(updatedH.LatencyHistory), len(h.LatencyHistory))
 	}
+}
+
+// waitForScheduledProbes runs the probe engine at its shortest interval until ip has n
+// scheduled probes in its history, then stops it. A manual probe (PingSingle) does not add to
+// the history.
+func waitForScheduledProbes(t *testing.T, coord *Coordinator, ip string, n int) {
+	t.Helper()
+	s := coord.store.GetSettings()
+	s.IntervalSec = 0.5
+	if err := coord.applySettings(normalizeSettings(s)); err != nil {
+		t.Fatal(err)
+	}
+	coord.pinger.Start()
+	defer coord.pinger.Stop()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if h, ok := coord.pinger.GetHost(ip); ok && len(h.LatencyHistory) >= n {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s did not get %d scheduled probes within 10 s", ip, n)
 }
 
 func TestUnexclusionStateTransition(t *testing.T) {
@@ -2616,8 +2635,7 @@ func TestManualPingOnExcludedHostChangesNothing(t *testing.T) {
 func TestExplorerPageIncludesLatencyHistory(t *testing.T) {
 	srv, coord, cleanup := setupTestServer(t)
 	defer cleanup()
-	coord.pinger.PingSingle(context.Background(), "127.0.0.1")
-	coord.pinger.PingSingle(context.Background(), "127.0.0.1")
+	waitForScheduledProbes(t, coord, "127.0.0.1", 2)
 
 	rec := serve(srv, http.MethodGet, "/api/hosts?page=1&limit=50&status=all&search=&sort=status&lightweight=true", "")
 	var page struct {
@@ -2628,8 +2646,8 @@ func TestExplorerPageIncludesLatencyHistory(t *testing.T) {
 	}
 	for _, h := range page.Hosts {
 		if h.IP == "127.0.0.1" {
-			if len(h.LatencyHistory) != 2 {
-				t.Fatalf("expected 2 history values on the page, got %v", h.LatencyHistory)
+			if len(h.LatencyHistory) < 2 {
+				t.Fatalf("expected the history values on the page, got %v", h.LatencyHistory)
 			}
 			return
 		}
@@ -2709,5 +2727,22 @@ func TestSettingsRecoveryThreshold(t *testing.T) {
 	serve(srv, http.MethodPut, "/api/settings", `{"recoveryThreshold":0}`)
 	if got := coord.store.GetSettings().RecoveryThreshold; got != 1 {
 		t.Fatalf("expected recoveryThreshold 0 to be clamped to 1, got %d", got)
+	}
+}
+
+func TestNormalizeSettingsProbeLimits(t *testing.T) {
+	for in, want := range map[int]int{-5: 0, 0: 0, 10: 10, 99999: 3600} {
+		s := store.DefaultSettings()
+		s.ConfirmProbeSec = in
+		if got := normalizeSettings(s).ConfirmProbeSec; got != want {
+			t.Errorf("confirmProbeSec %d: got %d, want %d", in, got, want)
+		}
+	}
+	for in, want := range map[int]int{0: pinger.DefaultConcurrency, 50: 50, 5000: 5000, 20000: maxConcurrency} {
+		s := store.DefaultSettings()
+		s.Concurrency = in
+		if got := normalizeSettings(s).Concurrency; got != want {
+			t.Errorf("concurrency %d: got %d, want %d", in, got, want)
+		}
 	}
 }

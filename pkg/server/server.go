@@ -111,16 +111,8 @@ func NewCoordinator(st *store.Store) *Coordinator {
 	if maxMetricHosts <= 0 {
 		maxMetricHosts = 10000
 	}
-	cfg := pinger.EngineConfig{
-		Interval:          time.Duration(settings.IntervalSec * float64(time.Second)),
-		Timeout:           time.Duration(settings.TimeoutMs) * time.Millisecond,
-		Concurrency:       settings.Concurrency,
-		FailThreshold:     settings.FailThreshold,
-		RecoveryThreshold: settings.RecoveryThreshold,
-		HistorySize:       25,
-		MaxMetricHosts:    maxMetricHosts,
-		DownProbeInterval: time.Duration(settings.DownProbeIntervalSec) * time.Second,
-	}
+	cfg := engineConfig(settings)
+	cfg.MaxMetricHosts = maxMetricHosts
 
 	p := pinger.NewEngine(cfg)
 	altMgr := alerts.NewManager(500)
@@ -188,6 +180,7 @@ func (c *Coordinator) SetInfluxDB(w *influxdb.Writer, q *influxdb.Querier, reten
 func (c *Coordinator) Start() {
 	c.startedAt = time.Now()
 	logHistoryMemory(c.store.GetSettings().MaxMetricHosts, c.pinger.GetTimeseriesStore().Stats().HourHistory)
+	logProbeMode(c.pinger.ProbeMode())
 	c.pinger.Start()
 	c.wg.Add(4)
 	go func() {
@@ -206,6 +199,20 @@ func (c *Coordinator) Start() {
 		defer c.wg.Done()
 		c.alertPersistLoop()
 	}()
+}
+
+// logProbeMode logs how DINIS sends probes.
+func logProbeMode(mode string) {
+	switch mode {
+	case pinger.ModePingSocket:
+		log.Printf("[DINIS] ICMP probes use an unprivileged ping socket")
+	case pinger.ModeRawSocket:
+		log.Printf("[DINIS] ICMP probes use a raw socket (net.ipv4.ping_group_range does not allow ping sockets)")
+	case pinger.ModePingCommand:
+		log.Printf("[DINIS] Warning: no ICMP socket is allowed, so each probe runs the ping command. This is slow and only for small installations; refer to \"Permission for ICMP sockets\" in the README")
+	default:
+		log.Printf("[DINIS] Warning: the ICMP socket could not be opened; each probe tries again")
+	}
 }
 
 // Stop gracefully terminates all subsystems and persists all state.
@@ -856,12 +863,15 @@ func (c *Coordinator) runSweep(all bool, only []string) (discoveredOnline, newDi
 		prober := pinger.NewSingleProber()
 		defer prober.Close()
 		concurrency := settings.Concurrency
-		if concurrency <= 0 {
-			concurrency = 100
+		if concurrency <= 0 || concurrency > maxDiscoveryConcurrency {
+			concurrency = maxDiscoveryConcurrency
 		}
 		if concurrency > len(targets) {
 			concurrency = len(targets)
 		}
+
+		timeout := time.Duration(settings.TimeoutMs) * time.Millisecond
+		timeout = min(max(timeout, discoveryMinTimeout), discoveryMaxTimeout)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -894,7 +904,12 @@ func (c *Coordinator) runSweep(all bool, only []string) (discoveredOnline, newDi
 						if !ok {
 							return
 						}
-						res := prober.Probe(ctx, cand.ip, 750*time.Millisecond)
+						res := prober.Probe(ctx, cand.ip, timeout)
+						if !res.Success && ctx.Err() == nil {
+							// One more probe: a single lost packet would hide the host
+							// until the next sweep
+							res = prober.Probe(ctx, cand.ip, timeout)
+						}
 						if res.Success {
 							now := time.Now()
 							discoveredMu.Lock()
@@ -2840,6 +2855,20 @@ func (s *Server) handleAlertAcknowledgeAll(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, ackAlerts)
 }
 
+const (
+	// maxConcurrency is the largest number of probe workers.
+	maxConcurrency = 10000
+	// A discovery probe waits for the probe timeout setting, but at least discoveryMinTimeout
+	// and at most discoveryMaxTimeout: most addresses of a sweep do not reply, so a long
+	// timeout would make a sweep of a large range take hours.
+	discoveryMinTimeout = 750 * time.Millisecond
+	discoveryMaxTimeout = 2 * time.Second
+	// maxDiscoveryConcurrency limits the parallel probes of a discovery sweep. Most of them go
+	// to unused addresses; each creates an ARP and a conntrack entry, so more would only fill
+	// these kernel tables faster.
+	maxDiscoveryConcurrency = 256
+)
+
 // normalizeSettings brings each setting into its valid range. Zero or negative values of
 // timeoutMs, failThreshold, concurrency and maxMetricHosts become the default.
 func normalizeSettings(req store.AppSettings) store.AppSettings {
@@ -2868,10 +2897,10 @@ func normalizeSettings(req store.AppSettings) store.AppSettings {
 		req.RecoveryThreshold = 100
 	}
 	if req.Concurrency <= 0 {
-		req.Concurrency = 100
+		req.Concurrency = pinger.DefaultConcurrency
 	}
-	if req.Concurrency > 1024 {
-		req.Concurrency = 1024
+	if req.Concurrency > maxConcurrency {
+		req.Concurrency = maxConcurrency
 	}
 	if req.DiscoveryIntervalMin < 0 {
 		req.DiscoveryIntervalMin = 0
@@ -2889,6 +2918,12 @@ func normalizeSettings(req store.AppSettings) store.AppSettings {
 	if req.DownProbeIntervalSec > 86400 {
 		req.DownProbeIntervalSec = 86400
 	}
+	if req.ConfirmProbeSec < 0 {
+		req.ConfirmProbeSec = 0
+	}
+	if req.ConfirmProbeSec > 3600 {
+		req.ConfirmProbeSec = 3600
+	}
 	return req
 }
 
@@ -2903,21 +2938,27 @@ func (c *Coordinator) applySettings(req store.AppSettings) error {
 	return nil
 }
 
+// engineConfig converts the settings into the configuration of the probe engine.
+func engineConfig(s store.AppSettings) pinger.EngineConfig {
+	return pinger.EngineConfig{
+		Interval:          time.Duration(s.IntervalSec * float64(time.Second)),
+		Timeout:           time.Duration(s.TimeoutMs) * time.Millisecond,
+		Concurrency:       s.Concurrency,
+		FailThreshold:     s.FailThreshold,
+		RecoveryThreshold: s.RecoveryThreshold,
+		HistorySize:       25,
+		MaxMetricHosts:    s.MaxMetricHosts,
+		DownProbeInterval: time.Duration(s.DownProbeIntervalSec) * time.Second,
+		ConfirmDelay:      time.Duration(s.ConfirmProbeSec) * time.Second,
+	}
+}
+
 // applyEngineSettings applies saved settings to the engine and the discovery schedule.
 func (c *Coordinator) applyEngineSettings(req store.AppSettings, previousMaxHosts int) {
 	if req.MaxMetricHosts != previousMaxHosts {
 		logHistoryMemory(req.MaxMetricHosts, c.pinger.GetTimeseriesStore().Stats().HourHistory)
 	}
-	c.pinger.UpdateConfig(pinger.EngineConfig{
-		Interval:          time.Duration(req.IntervalSec * float64(time.Second)),
-		Timeout:           time.Duration(req.TimeoutMs) * time.Millisecond,
-		Concurrency:       req.Concurrency,
-		FailThreshold:     req.FailThreshold,
-		RecoveryThreshold: req.RecoveryThreshold,
-		HistorySize:       25,
-		MaxMetricHosts:    req.MaxMetricHosts,
-		DownProbeInterval: time.Duration(req.DownProbeIntervalSec) * time.Second,
-	})
+	c.pinger.UpdateConfig(engineConfig(req))
 	c.invalidateSnapshots()
 
 	c.discMu.Lock()

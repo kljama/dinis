@@ -46,8 +46,10 @@ func TestEngineLifecycle(t *testing.T) {
 	if !ok || h.Status != StatusUp {
 		t.Fatalf("expected host 127.0.0.1 to be UP, got status %s", h.Status)
 	}
-	if h.SentPackets != 1 || h.RecvPackets != 1 {
-		t.Errorf("expected 1 sent, 1 recv, got sent=%d, recv=%d", h.SentPackets, h.RecvPackets)
+	// A manual probe sets the status, not the statistics of the scheduled probes
+	if h.SentPackets != 0 || h.RecvPackets != 0 || len(h.LatencyHistory) != 0 || h.LatencyMs <= 0 || h.LastSeen == nil {
+		t.Errorf("expected status and latency without statistics, got sent=%d recv=%d history=%v latency=%f",
+			h.SentPackets, h.RecvPackets, h.LatencyHistory, h.LatencyMs)
 	}
 
 	summary := engine.GetSummary()
@@ -162,6 +164,12 @@ func TestEngineMinMaxAvgLatencyProgression(t *testing.T) {
 	engine.applyResult(h, PingResult{Success: true, LatencyMs: 5.0})
 	if h.MinLatencyMs != 5.0 || h.MaxLatencyMs != 50.0 {
 		t.Fatalf("expected min=5, max=50 after lower probe, got min=%f, max=%f", h.MinLatencyMs, h.MaxLatencyMs)
+	}
+
+	// The average is the mean of the replies in the history; a lost probe does not count
+	engine.applyResult(h, PingResult{Success: false, Error: "Request timeout"})
+	if h.AvgLatencyMs != 25.0 {
+		t.Fatalf("expected avg=25 (mean of 20, 50 and 5), got %f", h.AvgLatencyMs)
 	}
 }
 
@@ -400,7 +408,7 @@ func TestGetAllHostsLiteOmitsHistory(t *testing.T) {
 	engine.SetHosts(map[string]*HostState{
 		"127.0.0.1": {IP: "127.0.0.1", CIDR: "127.0.0.1/32", Status: StatusPending},
 	})
-	engine.PingSingle(context.Background(), "127.0.0.1")
+	applyProbe(engine, "127.0.0.1", true)
 
 	full := engine.GetAllHosts()
 	if len(full) != 1 || len(full[0].LatencyHistory) == 0 {
@@ -939,4 +947,137 @@ func TestStatsCountProbesAndScheduleLag(t *testing.T) {
 	if s := e.Stats(); s.Running || s.BusyWorkers != 0 {
 		t.Fatalf("expected a stopped engine without busy workers, got %+v", s)
 	}
+}
+
+// fakeProber returns the same result for every probe.
+type fakeProber struct{ res PingResult }
+
+func (f *fakeProber) Probe(_ context.Context, ip string, _ time.Duration) PingResult {
+	r := f.res
+	r.IP = ip
+	return r
+}
+func (f *fakeProber) Mode() string       { return "fake" }
+func (f *fakeProber) Stats() ProberStats { return ProberStats{Mode: "fake"} }
+func (f *fakeProber) Close()             {}
+
+// A probe that fails because of this machine says nothing about the host.
+func TestLocalErrorIsNotPacketLoss(t *testing.T) {
+	e := NewEngine(DefaultConfig())
+	e.prober = &fakeProber{res: PingResult{Error: "no buffer space available", LocalError: true}}
+	ip := "10.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusUp}})
+	recorded := 0
+	e.OnProbeRecorded = func(string, string, string, float64, bool, time.Time) { recorded++ }
+
+	e.mu.Lock()
+	e.inFlight = 1
+	e.mu.Unlock()
+	e.probeAndApply(probeJob{ip: ip})
+	e.PingSingle(context.Background(), ip)
+
+	h, _ := e.GetHost(ip)
+	if h.Status != StatusUp || h.SentPackets != 0 || h.ConsecutiveFails != 0 || len(h.LatencyHistory) != 0 || recorded != 0 {
+		t.Fatalf("a local error must not change the host, got status=%s sent=%d fails=%d history=%v recorded=%d",
+			h.Status, h.SentPackets, h.ConsecutiveFails, h.LatencyHistory, recorded)
+	}
+	if e.localErrorsTotal.Load() != 2 || e.probesTotal.Load() != 0 || e.failuresTotal.Load() != 0 {
+		t.Fatalf("expected 2 local errors and no counted probes, got local=%d probes=%d failures=%d",
+			e.localErrorsTotal.Load(), e.probesTotal.Load(), e.failuresTotal.Load())
+	}
+}
+
+// A host restored as DOWN after a restart is probed within its normal interval, not after
+// the down-probe interval.
+func TestFirstProbeAfterStartUsesNormalInterval(t *testing.T) {
+	cfg := DefaultConfig() // 60 s interval, 5 min down-probe interval
+	e := NewEngine(cfg)
+	e.prober = &fakeProber{res: PingResult{Error: "Request timeout"}}
+	since := time.Now().Add(-time.Hour)
+	ip := "10.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusDown, ConsecutiveFails: 2, LastStateChange: &since}})
+	e.Start()
+	defer e.Stop()
+
+	e.mu.Lock()
+	ent := e.sched[ip]
+	wait, iv := ent.due-e.mono(), ent.iv
+	e.mu.Unlock()
+	if iv != cfg.DownProbeInterval {
+		t.Fatalf("expected the down-probe interval from the second probe on, got %v", iv)
+	}
+	if wait > cfg.Interval {
+		t.Fatalf("first probe in %v, expected within the normal interval %v", wait, cfg.Interval)
+	}
+}
+
+// TestConfirmationProbe follows the schedule of one host through probe results.
+func TestConfirmationProbe(t *testing.T) {
+	setup := func(cfg EngineConfig) (*Engine, func(success bool) (time.Duration, HostStatus)) {
+		e := NewEngine(cfg)
+		ip := "10.0.0.1"
+		e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusUp}})
+		e.mu.Lock()
+		e.schedAddUnsafe(e.hosts[ip], true)
+		e.mu.Unlock()
+		// complete applies a probe result as probeAndApply does and returns the time until
+		// the next probe of the host
+		complete := func(success bool) (time.Duration, HostStatus) {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			ent := e.sched[ip]
+			if ent.index >= 0 {
+				heap.Remove(e.queueFor(ent), ent.index)
+			}
+			ent.inFlight = true
+			h := e.hosts[ip]
+			e.applyResult(h, PingResult{IP: ip, Success: success, LatencyMs: 1, Error: "Request timeout"})
+			e.schedDoneUnsafe(ip, h)
+			return e.sched[ip].due - e.mono(), h.Status
+		}
+		return e, complete
+	}
+	onGrid := func(t *testing.T, wait, iv time.Duration) {
+		t.Helper()
+		if wait < iv/2-time.Second || wait > iv*3/2 {
+			t.Fatalf("expected the next probe on the slot grid (%v to %v away), got %v", iv/2, iv*3/2, wait)
+		}
+	}
+
+	cfg := DefaultConfig() // 60 s interval, 10 s confirmation, 2 failures for DOWN
+	t.Run("outage", func(t *testing.T) {
+		_, complete := setup(cfg)
+		wait, st := complete(false)
+		if st != StatusUp || wait > cfg.ConfirmDelay || wait < cfg.ConfirmDelay-time.Second {
+			t.Fatalf("after the first failure expected UP and a probe in %v, got %s in %v", cfg.ConfirmDelay, st, wait)
+		}
+		wait, st = complete(false)
+		if st != StatusDown {
+			t.Fatalf("expected DOWN after the confirmation probe failed, got %s", st)
+		}
+		onGrid(t, wait, cfg.Interval)
+	})
+	t.Run("single lost probe", func(t *testing.T) {
+		_, complete := setup(cfg)
+		complete(false)
+		wait, st := complete(true)
+		if st != StatusUp {
+			t.Fatalf("expected UP, got %s", st)
+		}
+		onGrid(t, wait, cfg.Interval)
+	})
+	t.Run("disabled", func(t *testing.T) {
+		c := cfg
+		c.ConfirmDelay = 0
+		_, complete := setup(c)
+		wait, _ := complete(false)
+		onGrid(t, wait, c.Interval)
+	})
+	t.Run("interval shorter than the delay", func(t *testing.T) {
+		c := cfg
+		c.Interval = 5 * time.Second
+		_, complete := setup(c)
+		wait, _ := complete(false)
+		onGrid(t, wait, c.Interval)
+	})
 }

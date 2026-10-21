@@ -14,7 +14,7 @@ You give DINIS IPv4 CIDR ranges and single IPv4 addresses. DINIS then does these
 
 ### Discovery
 
-DINIS does not probe all addresses of a CIDR range at each interval. A discovery sweep sends one probe to each address in the range. The timeout of each probe is 750 ms. DINIS monitors only the hosts that reply.
+DINIS does not probe all addresses of a CIDR range at each interval. A discovery sweep sends a probe to each address in the range. If an address does not reply, DINIS sends one more probe. The timeout of each probe is `timeoutMs`, but a minimum of 750 ms and a maximum of 2 seconds. A sweep sends a maximum of 256 probes at the same time. DINIS monitors only the hosts that reply.
 
 DINIS starts a discovery sweep at these times:
 
@@ -55,15 +55,29 @@ DINIS calculates the time slot from the IP address. Adjacent addresses get time 
 - When you change an interval, DINIS uses the new interval immediately.
 - A new host has the status `PENDING`. After the first reply, the status changes to `UP`.
 - After `failThreshold` failed probes in sequence, the status changes to `DOWN`. The default is 2.
+- After a failed probe, DINIS probes the host again after `confirmProbeSec` seconds, not at its next time slot. The default is 10 seconds. DINIS continues until the host replies or its status is `DOWN`. Then the host goes back to its time slot. With the default settings, the status changes to `DOWN` approximately 10 to 70 seconds after an outage starts. This rule applies only if the interval is longer than `confirmProbeSec`. To probe only at the time slots, set `confirmProbeSec` to `0`.
 - After `recoveryThreshold` replies in sequence, a `DOWN` host changes to `UP`. The default is 2. Thus a host with intermittent packet loss does not start a new alert for each lost probe.
+- After a restart, DINIS probes each host within its normal interval. This also applies to a host that was `DOWN`.
+- The statistics of a host contain only the scheduled probes: the packet loss, the minimum, average and maximum latency, and the latency history. A manual probe (`POST /api/hosts/{ip}/ping`) changes only the status and the current latency.
 - The packet loss of a host is the total loss since the start of DINIS.
+- The average latency of a host is the mean of the replies to its last 25 probes.
+
+### Measurement
+
+DINIS sends all probes through one ICMP socket. One reader receives all replies. This section does not apply to the `ping` command method (refer to [Prerequisites](#prerequisites)).
+
+- The round-trip time starts immediately before DINIS sends the request. It ends at the time when the Linux kernel received the reply. Thus a busy DINIS process does not increase the measured latency.
+- If a router or the kernel reports that the host cannot be reached (ICMP Destination Unreachable or Time Exceeded), the probe fails immediately. The reason shows in the last error of the host and in its alert.
+- If a probe fails because of the DINIS system (for example, no free buffer space, or a local firewall rule), DINIS does not count it as packet loss, and the status of the host does not change. DINIS logs these errors a maximum of one time each minute. The metric `dinis_probe_local_errors_total` counts them.
 
 ### Probe capacity during outages
 
-A probe to a host that does not reply uses a worker for the full timeout. Two rules keep the probes to all other hosts at their normal interval during an outage:
+A probe to a host that does not reply uses a worker for the full timeout. A worker that waits for a reply uses only a small amount of memory. Thus the default `concurrency` is 1000 workers. Two rules keep the probes to all other hosts at their normal interval during an outage:
 
 1. Probes to hosts with a failed last probe can use a maximum of three quarters of the workers (`concurrency`). The other workers are for the hosts that reply.
 2. If a host is `DOWN` for more than `downProbeIntervalSec` seconds and its last probe failed, DINIS probes the host only each `downProbeIntervalSec` seconds. The default is 300 seconds. This rule is only for hosts with a shorter normal interval.
+
+With the default settings (1000 workers, a timeout of 1000 ms, an interval of 60 seconds), approximately 45,000 hosts can fail at the same time, and all probes stay on time. Each failing probe uses a worker for `timeoutMs`. Thus a shorter timeout or more workers increase this number.
 
 When a host of rule 2 replies again, DINIS finds this at the next probe. This can occur up to `downProbeIntervalSec` seconds later. After this reply, DINIS probes the host at its normal interval again. To probe `DOWN` hosts at their normal interval, set `downProbeIntervalSec` to `0`.
 
@@ -127,6 +141,17 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
     ```
 
   If DINIS cannot open an ICMP socket, DINIS starts the system `ping` command for each probe. For this method, the system must have the `ping` command. This method is much slower. Use it only for small installations.
+
+  At the start, DINIS writes the method to the log (`ICMP probes use ...`). The metric `dinis_icmp_socket_info` also shows it.
+- **Kernel settings for large installations.** These settings are necessary only for many hosts:
+  - **Neighbor (ARP) table.** For each host in a network that the DINIS system is directly connected to, Linux keeps an ARP entry. With Docker, these are the networks of the Docker host. By default, Linux can delete old entries when the table has more than 128 entries, and it accepts a maximum of 1024 entries. Then probes can wait for a new ARP request, or fail with `neighbour table overflow` in the kernel log. If DINIS monitors more than approximately 100 directly connected hosts, set the limits higher than this number of hosts:
+    ```
+    net.ipv4.neigh.default.gc_thresh1 = 4096
+    net.ipv4.neigh.default.gc_thresh2 = 8192
+    net.ipv4.neigh.default.gc_thresh3 = 16384
+    ```
+  - **Connection tracking.** In a Docker bridge network, Docker translates the address of each probe (NAT). Each probed address uses a conntrack entry for 30 seconds. A discovery sweep of a large range uses many entries. Make sure that `net.netfilter.nf_conntrack_max` is much higher than `net.netfilter.nf_conntrack_count` during a sweep.
+  - **Receive buffer.** DINIS requests a receive buffer of 1 MiB for its ICMP socket. Linux limits it to two times `net.core.rmem_max` (by default 416 KiB). If the metric `dinis_icmp_rx_dropped_total` increases, set `net.core.rmem_max = 1048576`.
 - **Docker and Docker Compose.** These are necessary only for the installation with containers.
 
 ## Installation
@@ -212,7 +237,7 @@ Probe a host one time, immediately:
 curl -X POST http://localhost:8080/api/hosts/192.168.1.1/ping
 ```
 
-- You can probe any IPv4 address. If DINIS monitors the host, DINIS updates the status of the host.
+- You can probe any IPv4 address. If DINIS monitors the host, DINIS updates the status and the current latency of the host. The probe is not part of the statistics and the history of the host.
 - If an exclusion rule applies to the host, DINIS only returns the result. The status of the host does not change.
 - You can probe each address a maximum of one time each second. DINIS returns `429` for more probes.
 
@@ -374,6 +399,10 @@ scrape_configs:
 | `dinis_alerts{state}` | The active alerts (`firing`, `acknowledged`). |
 | `dinis_probe_rate_per_second` | The planned probes each second. |
 | `dinis_probes_total`, `dinis_probe_failures_total` | The scheduled probes and the probes without a reply since the start. |
+| `dinis_probe_local_errors_total` | The probes that failed because of the DINIS system (for example, no free buffer space). DINIS does not count them as packet loss. |
+| `dinis_probe_late_replies_total` | The echo replies that arrived after their probe ended, and duplicate replies. |
+| `dinis_icmp_socket_info{mode}` | How DINIS sends probes: `ping_socket`, `raw_socket`, or `ping_command`. |
+| `dinis_icmp_rx_dropped_total` | The packets that Linux dropped because the receive buffer of the ICMP socket was full. |
 | `dinis_probe_workers`, `dinis_probe_workers_busy` | The probe workers, and the probes that run now. |
 | `dinis_probe_schedule_lag_seconds{queue}` | The time that the most overdue probe waits for a worker. `healthy`: hosts that reply. `suspect`: hosts whose last probe failed. |
 | `dinis_last_probe_timestamp_seconds` | The end of the last scheduled probe (Unix time). |
@@ -489,11 +518,12 @@ If a value is out of range, DINIS uses the nearest value in the range. If `timeo
 | `timeoutMs` | `1000` | 1–30000 | The probe timeout. |
 | `failThreshold` | `2` | 1–100 | The number of failed probes in sequence before the status changes to `DOWN`. |
 | `recoveryThreshold` | `2` | 1–100 | The number of replies in sequence before a `DOWN` host changes to `UP`. `1` resolves the alert at the first reply. |
-| `concurrency` | `100` | 1–1024 | The number of probes at the same time. DINIS uses a new value immediately. |
+| `concurrency` | `1000` | 1–10000 | The number of probes at the same time. DINIS uses a new value immediately. A data file from an earlier version with the earlier default `100` changes to `1000`. |
 | `discoveryIntervalMin` | `240` | 0 or more | The minutes between two automatic discovery sweeps. `0` stops the automatic sweeps. |
 | `autoDiscovery` | `true` | — | If `true`, DINIS starts a sweep when DINIS starts and when you add a CIDR. |
 | `maxMetricHosts` | `10000` | 500–500000 | The maximum number of hosts with a latency history. |
 | `downProbeIntervalSec` | `300` | 0–86400 | The probe interval for hosts that are `DOWN` for longer than this time. `0` stops this function. |
+| `confirmProbeSec` | `10` | 0–3600 | After a failed probe, the time until DINIS probes the host again. `0` probes at the next time slot. Refer to [Probe schedule](#probe-schedule). |
 
 DINIS saves the settings in the data file. If you set `-max-metric-hosts` or `DINIS_MAX_METRIC_HOSTS`, this value replaces `maxMetricHosts` at each start.
 

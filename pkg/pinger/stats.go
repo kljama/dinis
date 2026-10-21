@@ -18,10 +18,17 @@ type Stats struct {
 	ProbesTotal   uint64    // scheduled probes completed since the start
 	FailuresTotal uint64    // scheduled probes without a reply
 	LastProbe     time.Time // completion of the last scheduled probe; zero before the first
+	// LocalErrors counts probes that failed because of this machine; they are not part of
+	// ProbesTotal and FailuresTotal.
+	LocalErrors uint64
+	ProbeMode   string // ModePingSocket, ModeRawSocket or ModePingCommand; empty before the first probe
+	LateReplies uint64 // echo replies that matched no waiting probe (late or duplicate)
+	RxDropped   uint64 // packets the kernel dropped because the socket buffer was full
 }
 
 // Stats returns a snapshot of the engine state.
 func (e *Engine) Stats() Stats {
+	ps := e.prober.Stats()
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -34,6 +41,10 @@ func (e *Engine) Stats() Stats {
 		SuspectBusy:    e.suspectInFlight,
 		ProbesTotal:    e.probesTotal.Load(),
 		FailuresTotal:  e.failuresTotal.Load(),
+		LocalErrors:    e.localErrorsTotal.Load(),
+		ProbeMode:      ps.Mode,
+		LateReplies:    ps.LateReplies,
+		RxDropped:      ps.RxDropped,
 	}
 	if ns := e.lastProbe.Load(); ns != 0 {
 		s.LastProbe = time.Unix(0, ns)
@@ -46,4 +57,11 @@ func (e *Engine) Stats() Stats {
 		s.SuspectLag = now - e.suspectQ[0].due
 	}
 	return s
+}
+
+// ProbeMode returns how the engine sends probes (ModePingSocket, ModeRawSocket or
+// ModePingCommand), opening the ICMP socket if needed. It is empty if no socket could be
+// opened for now.
+func (e *Engine) ProbeMode() string {
+	return e.prober.Mode()
 }
