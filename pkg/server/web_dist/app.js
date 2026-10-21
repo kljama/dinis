@@ -31,7 +31,7 @@
       timeoutMs: 1000,
       failThreshold: 2,
       recoveryThreshold: 2,
-      concurrency: 100,
+      concurrency: 1000,
       discoveryIntervalMin: 240,
       autoDiscovery: true
     },
@@ -244,6 +244,7 @@
     inputInterval: document.getElementById('inputInterval'),
     inputTimeout: document.getElementById('inputTimeout'),
     inputFailThreshold: document.getElementById('inputFailThreshold'),
+    inputConfirmProbe: document.getElementById('inputConfirmProbe'),
     inputRecoveryThreshold: document.getElementById('inputRecoveryThreshold'),
     inputConcurrency: document.getElementById('inputConcurrency'),
     inputDownProbeInterval: document.getElementById('inputDownProbeInterval'),
@@ -1571,7 +1572,7 @@
 
       <div class="host-card-stats">
         <span>Loss: <strong class="${h.packetLoss > 0 ? 'text-down' : ''}">${h.packetLoss}%</strong></span>
-        <span>Avg: <strong>${h.avgLatencyMs ? h.avgLatencyMs.toFixed(1) + 'ms' : '--'}</strong></span>
+        <span title="Mean of the replies to the last 25 scheduled probes">Avg: <strong>${h.avgLatencyMs ? h.avgLatencyMs.toFixed(1) + 'ms' : '--'}</strong></span>
         <span>Pkts: <strong>${h.sentPackets || 0}</strong></span>
       </div>
     `;
@@ -2744,8 +2745,9 @@
     el.inputInterval.value = s.intervalSec || 60;
     el.inputTimeout.value = s.timeoutMs || 1000;
     el.inputFailThreshold.value = s.failThreshold || 2;
+    el.inputConfirmProbe.value = s.confirmProbeSec ?? 10;
     el.inputRecoveryThreshold.value = s.recoveryThreshold || 2;
-    el.inputConcurrency.value = s.concurrency || 100;
+    el.inputConcurrency.value = s.concurrency || 1000;
     el.inputDownProbeInterval.value = s.downProbeIntervalSec ?? 300;
     renderSettingsSubnetsList();
     el.settingsModal.style.display = 'flex';
@@ -2762,6 +2764,7 @@
       intervalSec: parseFloat(el.inputInterval.value),
       timeoutMs: parseInt(el.inputTimeout.value, 10),
       failThreshold: parseInt(el.inputFailThreshold.value, 10),
+      confirmProbeSec: parseInt(el.inputConfirmProbe.value, 10),
       recoveryThreshold: parseInt(el.inputRecoveryThreshold.value, 10),
       concurrency: parseInt(el.inputConcurrency.value, 10),
       downProbeIntervalSec: parseInt(el.inputDownProbeInterval.value, 10),

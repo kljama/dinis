@@ -571,3 +571,31 @@ func TestReplaceConfigAndMetaBatch(t *testing.T) {
 		t.Fatalf("unexpected metadata %+v", m)
 	}
 }
+
+func TestLoadOlderFileMigratesDefaultConcurrency(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		want int
+	}{
+		{"old default", `{"settings":{"concurrency":100}}`, 1000},
+		{"own value", `{"settings":{"concurrency":50}}`, 50},
+		{"current version", `{"schemaVersion":1,"settings":{"concurrency":100}}`, 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "dinis.json")
+			if err := os.WriteFile(path, []byte(tc.file), 0644); err != nil {
+				t.Fatal(err)
+			}
+			st, err := NewStore(path)
+			if err != nil {
+				t.Fatalf("failed to load store: %v", err)
+			}
+			defer st.Close()
+			if got := st.GetSettings().Concurrency; got != tc.want {
+				t.Fatalf("expected concurrency %d, got %d", tc.want, got)
+			}
+		})
+	}
+}

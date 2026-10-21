@@ -169,8 +169,8 @@ func (e *Engine) schedPushUnsafe(ent *schedEntry) {
 }
 
 // schedAddUnsafe starts scheduling a host. With spreadAll its first probe falls on its slot
-// within one interval (used at Start, so startup probes are spread out); otherwise the host
-// is probed within newHostSpread.
+// within one normal interval (used at Start, so startup probes are spread out); otherwise the
+// host is probed within newHostSpread.
 func (e *Engine) schedAddUnsafe(h *HostState, spreadAll bool) {
 	if h.IsExcluded {
 		return
@@ -185,11 +185,14 @@ func (e *Engine) schedAddUnsafe(h *HostState, spreadAll bool) {
 		suspect: h.ConsecutiveFails > 0,
 		index:   -1,
 	}
+	// The first probe falls within the normal interval, also for a host restored as DOWN
+	// after a restart: the down-probe interval only applies from its second probe.
+	first := e.effectiveIntervalUnsafe(h.CIDR)
 	now := e.mono()
 	if spreadAll {
-		ent.due = nextSlot(ent.phase, ent.iv, now)
+		ent.due = nextSlot(ent.phase, first, now)
 	} else {
-		spread := ent.iv
+		spread := first
 		if spread > newHostSpread {
 			spread = newHostSpread
 		}
@@ -281,6 +284,12 @@ func (e *Engine) schedDoneUnsafe(ip string, h *HostState) {
 	// The next slot at least half an interval from now keeps the host on its slot grid and,
 	// after a late dispatch, skips missed slots instead of catching up in a burst.
 	ent.due = nextSlot(ent.phase, ent.iv, e.mono()+ent.iv/2)
+	// A failed probe of a host that is not DOWN yet is confirmed soon, so an outage is found
+	// within about one interval instead of FailThreshold intervals. Afterwards the host is
+	// back on its slot grid.
+	if d := e.config.ConfirmDelay; d > 0 && d < ent.iv && h.ConsecutiveFails > 0 && h.Status != StatusDown {
+		ent.due = e.mono() + d
+	}
 	e.schedPushUnsafe(ent)
 }
 

@@ -2,6 +2,7 @@ package pinger
 
 import (
 	"context"
+	"log"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -30,7 +31,7 @@ type HostState struct {
 	LatencyMs        float64    `json:"latencyMs"`
 	MinLatencyMs     float64    `json:"minLatencyMs"`
 	MaxLatencyMs     float64    `json:"maxLatencyMs"`
-	AvgLatencyMs     float64    `json:"avgLatencyMs"`
+	AvgLatencyMs     float64    `json:"avgLatencyMs"` // mean of the replies in LatencyHistory
 	PacketLoss       float64    `json:"packetLoss"`
 	SentPackets      uint64     `json:"sentPackets"`
 	RecvPackets      uint64     `json:"recvPackets"`
@@ -71,19 +72,29 @@ type EngineConfig struct {
 	// DownProbeInterval is how often a host that has been DOWN for at least this long is
 	// probed, when that is longer than its normal interval. 0 disables the back-off.
 	DownProbeInterval time.Duration
+	// ConfirmDelay: after a failed probe of a host that is not DOWN, the next probe follows
+	// after this delay instead of at the next slot, until the host replies or is DOWN. It
+	// applies when it is shorter than the host's interval. 0 disables it.
+	ConfirmDelay time.Duration
 }
+
+// DefaultConcurrency is the default number of probe workers. A worker waiting for a reply is
+// a parked goroutine, so a pool this large is cheap; it lets many hosts fail at the same time
+// without delaying other probes (each failing probe waits for the whole timeout).
+const DefaultConcurrency = 1000
 
 // DefaultConfig returns default engine settings.
 func DefaultConfig() EngineConfig {
 	return EngineConfig{
 		Interval:          60 * time.Second,
 		Timeout:           1000 * time.Millisecond,
-		Concurrency:       100,
+		Concurrency:       DefaultConcurrency,
 		FailThreshold:     2,
 		RecoveryThreshold: 2,
 		HistorySize:       20,
 		MaxMetricHosts:    10000,
 		DownProbeInterval: 5 * time.Minute,
+		ConfirmDelay:      10 * time.Second,
 	}
 }
 
@@ -104,11 +115,19 @@ type CycleSummary struct {
 	Timestamp      time.Time `json:"timestamp"`
 }
 
+// prober sends the probes: a *SingleProber, or a fake in tests.
+type prober interface {
+	Probe(ctx context.Context, ip string, timeout time.Duration) PingResult
+	Mode() string
+	Stats() ProberStats
+	Close()
+}
+
 // Engine probes every monitored host on its own schedule using a shared worker pool.
 type Engine struct {
 	mu      sync.RWMutex
 	config  EngineConfig
-	prober  *SingleProber
+	prober  prober
 	tsStore *timeseries.Store
 
 	hosts           map[string]*HostState
@@ -134,6 +153,10 @@ type Engine struct {
 	probesTotal   atomic.Uint64
 	failuresTotal atomic.Uint64
 	lastProbe     atomic.Int64 // UnixNano of the last completed scheduled probe
+	// Probes that failed because of this machine (PingResult.LocalError), and when one was
+	// last logged
+	localErrorsTotal atomic.Uint64
+	localErrorLogged atomic.Int64
 
 	// Callbacks
 	BeforeStateChange func(host *HostState, oldStatus, newStatus HostStatus)
@@ -148,7 +171,7 @@ type Engine struct {
 // normalizeConfig replaces invalid configuration values with safe defaults.
 func normalizeConfig(cfg EngineConfig) EngineConfig {
 	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 100
+		cfg.Concurrency = DefaultConcurrency
 	}
 	if cfg.Interval < minProbeInterval {
 		cfg.Interval = minProbeInterval
@@ -164,6 +187,9 @@ func normalizeConfig(cfg EngineConfig) EngineConfig {
 	}
 	if cfg.HistorySize <= 0 {
 		cfg.HistorySize = 20
+	}
+	if cfg.ConfirmDelay < 0 {
+		cfg.ConfirmDelay = 0
 	}
 	return cfg
 }
@@ -479,7 +505,7 @@ func (e *Engine) Start() {
 
 	numWorkers := e.config.Concurrency
 	if numWorkers <= 0 {
-		numWorkers = 100
+		numWorkers = DefaultConcurrency
 	}
 	// Unbuffered: the dispatcher decides which probe goes next when a worker is free.
 	e.workChan = make(chan probeJob)
@@ -609,6 +635,13 @@ func (e *Engine) probeAndApply(job probeJob) {
 		e.mu.Unlock()
 		return
 	}
+	if res.LocalError {
+		// A problem of this machine, not of the host: no packet loss and no status change
+		e.schedDoneUnsafe(job.ip, h)
+		e.mu.Unlock()
+		e.noteLocalError(res)
+		return
+	}
 
 	oldStatus := h.Status
 	e.applyResult(h, res)
@@ -637,8 +670,9 @@ func (e *Engine) probeAndApply(job probeJob) {
 	}
 }
 
-// PingSingle immediately probes a single host and updates its state. The result of an
-// excluded host, and of a probe that ctx cut short, is returned but not applied.
+// PingSingle immediately probes a single host and updates its status. It does not change the
+// statistics and the history, which hold only the scheduled probes. The result of an excluded
+// host, of a probe that ctx cut short and of a local error is returned but not applied.
 func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 	e.mu.RLock()
 	timeout := e.config.Timeout
@@ -646,6 +680,10 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 
 	res := e.prober.Probe(ctx, ip, timeout)
 	if ctx != nil && ctx.Err() != nil && !res.Success {
+		return res
+	}
+	if res.LocalError {
+		e.noteLocalError(res)
 		return res
 	}
 
@@ -660,7 +698,7 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 
 	if exists {
 		oldStatus = h.Status
-		e.applyResult(h, res)
+		e.applyStatus(h, res, time.Now())
 		if h.Status != oldStatus {
 			statusChanged = true
 			if e.BeforeStateChange != nil {
@@ -685,9 +723,21 @@ func (e *Engine) PingSingle(ctx context.Context, ip string) PingResult {
 	return res
 }
 
+// noteLocalError counts a probe that failed because of this machine and logs it, at most
+// once a minute.
+func (e *Engine) noteLocalError(res PingResult) {
+	n := e.localErrorsTotal.Add(1)
+	now := time.Now().UnixNano()
+	last := e.localErrorLogged.Load()
+	if now-last >= int64(time.Minute) && e.localErrorLogged.CompareAndSwap(last, now) {
+		log.Printf("[DINIS] Probe of %s failed on this machine: %s (%d such probes since the start; they do not count as packet loss)", res.IP, res.Error, n)
+	}
+}
+
+// applyResult applies the result of a scheduled probe: the statistics, the history and the
+// status of the host.
 func (e *Engine) applyResult(h *HostState, res PingResult) {
 	now := time.Now()
-	h.LastChecked = &now
 	h.SentPackets++
 
 	if e.tsStore != nil {
@@ -700,67 +750,17 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 
 	if res.Success {
 		h.RecvPackets++
-		h.ConsecutiveFails = 0
-		h.ConsecutiveSuccesses++
-		h.LatencyMs = res.LatencyMs
-		h.LastError = ""
-		h.LastSeen = &now
-
-		if h.RecvPackets == 1 {
+		if h.RecvPackets == 1 || h.MinLatencyMs <= 0 || res.LatencyMs < h.MinLatencyMs {
 			h.MinLatencyMs = res.LatencyMs
+		}
+		if h.RecvPackets == 1 || res.LatencyMs > h.MaxLatencyMs {
 			h.MaxLatencyMs = res.LatencyMs
-			h.AvgLatencyMs = res.LatencyMs
-		} else {
-			if h.MinLatencyMs <= 0 || res.LatencyMs < h.MinLatencyMs {
-				h.MinLatencyMs = res.LatencyMs
-			}
-			if res.LatencyMs > h.MaxLatencyMs {
-				h.MaxLatencyMs = res.LatencyMs
-			}
-			if h.AvgLatencyMs <= 0 {
-				h.AvgLatencyMs = res.LatencyMs
-			} else {
-				h.AvgLatencyMs = math.Round(((h.AvgLatencyMs*0.8)+(res.LatencyMs*0.2))*100) / 100
-			}
 		}
-
-		// Append to history, copying into a fresh slice when trimming
-		// to release the old backing array and prevent a slow memory leak.
-		h.LatencyHistory = append(h.LatencyHistory, res.LatencyMs)
-		if len(h.LatencyHistory) > e.config.HistorySize {
-			trimmed := make([]float64, e.config.HistorySize)
-			copy(trimmed, h.LatencyHistory[len(h.LatencyHistory)-e.config.HistorySize:])
-			h.LatencyHistory = trimmed
-		}
-
-		// A DOWN host is UP again only after RecoveryThreshold replies in sequence, so a host
-		// with intermittent loss does not start a new alert for each lost probe.
-		recovered := h.Status != StatusDown || h.ConsecutiveSuccesses >= e.config.RecoveryThreshold
-		if h.Status != StatusUp && recovered {
-			h.Status = StatusUp
-			h.LastStateChange = &now
-		}
+		e.appendHistory(h, res.LatencyMs)
 	} else {
-		h.ConsecutiveFails++
-		h.ConsecutiveSuccesses = 0
-		h.LastError = res.Error
-
-		// Record -1 in latency history to denote packet loss in graphs.
-		// Same fresh-slice trim as above to prevent backing array leak.
-		h.LatencyHistory = append(h.LatencyHistory, -1)
-		if len(h.LatencyHistory) > e.config.HistorySize {
-			trimmed := make([]float64, e.config.HistorySize)
-			copy(trimmed, h.LatencyHistory[len(h.LatencyHistory)-e.config.HistorySize:])
-			h.LatencyHistory = trimmed
-		}
-
-		if h.ConsecutiveFails >= e.config.FailThreshold {
-			if h.Status != StatusDown {
-				h.Status = StatusDown
-				h.LastStateChange = &now
-			}
-		}
+		e.appendHistory(h, -1) // -1 denotes packet loss in graphs
 	}
+	h.AvgLatencyMs = historyAvg(h.LatencyHistory)
 
 	// Compute cumulative packet loss percentage
 	if h.SentPackets > 0 && h.SentPackets >= h.RecvPackets {
@@ -769,4 +769,63 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 	} else {
 		h.PacketLoss = 0
 	}
+
+	e.applyStatus(h, res, now)
+}
+
+// applyStatus applies a probe result to the state of a host: its status, its current latency
+// and its last error. A manual probe changes only this, not the statistics and the history.
+func (e *Engine) applyStatus(h *HostState, res PingResult, now time.Time) {
+	h.LastChecked = &now
+	if res.Success {
+		h.ConsecutiveFails = 0
+		h.ConsecutiveSuccesses++
+		h.LatencyMs = res.LatencyMs
+		h.LastError = ""
+		h.LastSeen = &now
+
+		// A DOWN host is UP again only after RecoveryThreshold replies in sequence, so a host
+		// with intermittent loss does not start a new alert for each lost probe.
+		recovered := h.Status != StatusDown || h.ConsecutiveSuccesses >= e.config.RecoveryThreshold
+		if h.Status != StatusUp && recovered {
+			h.Status = StatusUp
+			h.LastStateChange = &now
+		}
+		return
+	}
+	h.ConsecutiveFails++
+	h.ConsecutiveSuccesses = 0
+	h.LastError = res.Error
+	if h.ConsecutiveFails >= e.config.FailThreshold && h.Status != StatusDown {
+		h.Status = StatusDown
+		h.LastStateChange = &now
+	}
+}
+
+// appendHistory adds a value to the latency history. When trimming, it copies into a fresh
+// slice to release the old backing array.
+func (e *Engine) appendHistory(h *HostState, v float64) {
+	h.LatencyHistory = append(h.LatencyHistory, v)
+	if len(h.LatencyHistory) > e.config.HistorySize {
+		trimmed := make([]float64, e.config.HistorySize)
+		copy(trimmed, h.LatencyHistory[len(h.LatencyHistory)-e.config.HistorySize:])
+		h.LatencyHistory = trimmed
+	}
+}
+
+// historyAvg returns the mean latency of the replies in the history (lost probes are -1), or
+// 0 if it has no reply.
+func historyAvg(hist []float64) float64 {
+	var sum float64
+	n := 0
+	for _, v := range hist {
+		if v >= 0 {
+			sum += v
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return math.Round(sum/float64(n)*100) / 100
 }

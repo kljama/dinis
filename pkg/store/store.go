@@ -68,6 +68,9 @@ type AppSettings struct {
 	// DownProbeIntervalSec: hosts DOWN for at least this long are probed this often (if longer
 	// than their normal interval). 0 probes DOWN hosts at their normal interval.
 	DownProbeIntervalSec int `json:"downProbeIntervalSec"`
+	// ConfirmProbeSec: after a failed probe of a host that is not DOWN, the host is probed
+	// again after this many seconds instead of at its next interval. 0 disables it.
+	ConfirmProbeSec int `json:"confirmProbeSec"`
 }
 
 // DefaultSettings returns safe production defaults.
@@ -78,15 +81,21 @@ func DefaultSettings() AppSettings {
 		TimeoutMs:            1000,
 		FailThreshold:        2,
 		RecoveryThreshold:    2,
-		Concurrency:          100,
+		Concurrency:          1000,
 		MaxMetricHosts:       10000,
 		AutoDiscovery:        true,
 		DownProbeIntervalSec: 300, // 5 minutes
+		ConfirmProbeSec:      10,
 	}
 }
 
+// schemaVersion is the version of the data file. Version 1 raised the default concurrency
+// from 100 to 1000: a file without a version that still has the old default gets the new one.
+const schemaVersion = 1
+
 // StoreData represents the root persisted JSON structure.
 type StoreData struct {
+	SchemaVersion   int                       `json:"schemaVersion"`
 	CIDRs           []CIDRConfig              `json:"cidrs"`
 	Exclusions      []ExclusionConfig         `json:"exclusions"`
 	HostMeta        map[string]HostMeta       `json:"hostMeta"`
@@ -132,6 +141,7 @@ func NewStore(filePath string) (*Store, error) {
 			HostMeta:        make(map[string]HostMeta),
 			DiscoveredHosts: make(map[string]DiscoveredHost),
 			Settings:        DefaultSettings(),
+			SchemaVersion:   schemaVersion,
 		},
 	}
 
@@ -228,6 +238,13 @@ func (s *Store) load() error {
 	}
 	if data.Settings.MaxMetricHosts <= 0 {
 		data.Settings.MaxMetricHosts = defaults.MaxMetricHosts
+	}
+	// The next save writes the new version; until then this runs again at each start.
+	if data.SchemaVersion < 1 {
+		if data.Settings.Concurrency == 100 {
+			data.Settings.Concurrency = defaults.Concurrency
+		}
+		data.SchemaVersion = 1
 	}
 
 	s.data = data

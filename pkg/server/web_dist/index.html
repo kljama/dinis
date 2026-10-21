@@ -708,7 +708,7 @@
               <span class="d-val font-mono" id="detailMinRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
-              <span class="d-label" title="Exponential moving average: each probe has a weight of 20 %">Avg Latency (moving)</span>
+              <span class="d-label" title="Mean of the replies to the last 25 scheduled probes">Avg Latency (last 25 probes)</span>
               <span class="d-val font-mono" id="detailAvgRTT">-- ms</span>
             </div>
             <div class="detail-metric-box">
@@ -848,6 +848,12 @@
           </div>
 
           <div class="form-group">
+            <label for="inputConfirmProbe">Confirmation Probe Delay (seconds)</label>
+            <input type="number" id="inputConfirmProbe" step="1" min="0" max="3600" required>
+            <span class="field-hint">After a failed probe, the host is probed again after this delay instead of at its next interval, so an outage is found sooner (default 10). 0 waits for the next interval.</span>
+          </div>
+
+          <div class="form-group">
             <label for="inputRecoveryThreshold">Consecutive Replies for Recovery</label>
             <input type="number" id="inputRecoveryThreshold" min="1" max="100" required>
             <span class="field-hint">Consecutive replies a DOWN host needs before it is UP again and its alert is resolved (default 2). Higher values stop hosts with intermittent loss from flapping.</span>
@@ -855,8 +861,8 @@
 
           <div class="form-group">
             <label for="inputConcurrency">Max Worker Concurrency</label>
-            <input type="number" id="inputConcurrency" min="10" max="1000" required>
-            <span class="field-hint">Concurrent goroutines for parallel probing (default 100).</span>
+            <input type="number" id="inputConcurrency" min="10" max="10000" required>
+            <span class="field-hint">Probes that can wait for a reply at the same time (default 1000). A probe of a host that does not reply waits for the whole timeout.</span>
           </div>
 
           <div class="form-group">
