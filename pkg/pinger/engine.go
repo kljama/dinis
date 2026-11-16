@@ -203,16 +203,26 @@ func NewEngine(cfg EngineConfig) *Engine {
 		maxMetricHosts = timeseries.DefaultMaxHosts
 	}
 
+	tsStore := timeseries.NewStoreWithLimit(maxMetricHosts)
+	tsStore.SetRollupGrace(rollupGraceFor(cfg.Timeout))
+
 	return &Engine{
 		config:          cfg,
 		prober:          NewSingleProber(),
-		tsStore:         timeseries.NewStoreWithLimit(maxMetricHosts),
+		tsStore:         tsStore,
 		hosts:           make(map[string]*HostState),
 		subnetIntervals: make(map[string]time.Duration),
 		epoch:           time.Now(),
 		sched:           make(map[string]*schedEntry),
 		schedWake:       make(chan struct{}, 1),
 	}
+}
+
+// rollupGraceFor is how long the store waits after a minute ends before it rolls the minute
+// up. A sample carries the send time of its probe but is recorded when the probe ends, up to
+// one timeout later, so the wait covers the longest timeout.
+func rollupGraceFor(timeout time.Duration) time.Duration {
+	return timeout + time.Second
 }
 
 // GetTimeseriesStore returns the underlying time-series metric store.
@@ -233,6 +243,9 @@ func (e *Engine) UpdateConfig(cfg EngineConfig) {
 	e.config = cfg
 	if cfg.MaxMetricHosts > 0 && e.tsStore != nil {
 		e.tsStore.SetCapacity(cfg.MaxMetricHosts)
+	}
+	if e.tsStore != nil {
+		e.tsStore.SetRollupGrace(rollupGraceFor(cfg.Timeout))
 	}
 	if e.ctx != nil {
 		e.resizeWorkersUnsafe(cfg.Concurrency)
@@ -607,7 +620,10 @@ func (e *Engine) workerLoop(ctx context.Context, workChan <-chan probeJob, stop 
 
 func (e *Engine) probeAndApply(job probeJob) {
 	e.mu.RLock()
-	timeout := e.config.Timeout
+	timeout := job.timeout
+	if timeout <= 0 {
+		timeout = e.config.Timeout
+	}
 	ctx := e.ctx
 	e.mu.RUnlock()
 
@@ -616,7 +632,11 @@ func (e *Engine) probeAndApply(job probeJob) {
 		probeCtx = ctx
 	}
 
+	sent := time.Now()
 	res := e.prober.Probe(probeCtx, job.ip, timeout)
+	if res.Sent.IsZero() {
+		res.Sent = sent
+	}
 
 	e.mu.Lock()
 	e.inFlight--
@@ -740,12 +760,19 @@ func (e *Engine) applyResult(h *HostState, res PingResult) {
 	now := time.Now()
 	h.SentPackets++
 
+	// The sample carries the send time. With the time of the result, a failed probe would be
+	// stamped a whole timeout later than a reply to a probe sent at the same time, and an
+	// outage would start and end late by the timeout.
+	ts := res.Sent
+	if ts.IsZero() {
+		ts = now
+	}
 	if e.tsStore != nil {
-		e.tsStore.Record(h.IP, now, res.LatencyMs, res.Success)
+		e.tsStore.Record(h.IP, ts, res.LatencyMs, res.Success)
 	}
 
 	if e.OnProbeRecorded != nil {
-		e.OnProbeRecorded(h.IP, h.Alias, h.CIDR, res.LatencyMs, res.Success, now)
+		e.OnProbeRecorded(h.IP, h.Alias, h.CIDR, res.LatencyMs, res.Success, ts)
 	}
 
 	if res.Success {

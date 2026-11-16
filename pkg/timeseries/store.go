@@ -105,6 +105,10 @@ type Store struct {
 	// for example InfluxDB). The zero value keeps them.
 	noHourHistory atomic.Bool
 
+	// rollupGrace (ns) is how long after a bucket ends it is rolled up. 0 means
+	// defaultRollupGrace.
+	rollupGrace atomic.Int64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -486,9 +490,9 @@ func (s *Store) GetTopOutliers(limit int, isValidHostFn func(ip string) (valid b
 const (
 	// rollupTick is how often the rollup loop checks for completed buckets.
 	rollupTick = time.Second
-	// rollupGrace is how long after a bucket ends it is rolled up, so probes that finish
-	// right at the boundary are recorded first.
-	rollupGrace = time.Second
+	// defaultRollupGrace is how long after a bucket ends it is rolled up, so probes that
+	// finish right at the boundary are recorded first. SetRollupGrace changes it.
+	defaultRollupGrace = time.Second
 )
 
 // Background Downsampling Routine.
@@ -520,21 +524,40 @@ func (s *Store) rollupLoop() {
 		case <-ticker.C:
 			now := time.Now()
 			// Minutes first: an hour bucket aggregates the minute rollups inside it.
-			nextMinute = rollupDueBuckets(now, nextMinute, time.Minute, s.computeMinuteRollups)
-			nextHour = rollupDueBuckets(now, nextHour, time.Hour, s.computeHourRollups)
+			grace := s.RollupGrace()
+			nextMinute = rollupDueBuckets(now, nextMinute, time.Minute, grace, s.computeMinuteRollups)
+			nextHour = rollupDueBuckets(now, nextHour, time.Hour, grace, s.computeHourRollups)
 		}
 	}
 }
 
-// rollupDueBuckets rolls up every bucket of the given size that ended at least rollupGrace
+// SetRollupGrace sets how long after a bucket ends it is rolled up. A sample recorded after its
+// bucket was rolled up is missing from the rollup, so the grace must cover the time between
+// a sample's timestamp and its recording. d <= 0 restores the default.
+func (s *Store) SetRollupGrace(d time.Duration) {
+	if d <= 0 {
+		d = defaultRollupGrace
+	}
+	s.rollupGrace.Store(int64(d))
+}
+
+// RollupGrace returns how long after a bucket ends it is rolled up.
+func (s *Store) RollupGrace() time.Duration {
+	if d := s.rollupGrace.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return defaultRollupGrace
+}
+
+// rollupDueBuckets rolls up every bucket of the given size that ended at least grace
 // before now, starting with the bucket ending at nextEnd, and returns the end of the next
 // pending bucket. After a long pause (suspend, clock jump) it skips to the most recently
 // completed bucket instead of replaying buckets whose samples are gone.
-func rollupDueBuckets(now, nextEnd time.Time, size time.Duration, compute func(start, end time.Time)) time.Time {
+func rollupDueBuckets(now, nextEnd time.Time, size, grace time.Duration, compute func(start, end time.Time)) time.Time {
 	if now.Sub(nextEnd) > 2*size {
 		nextEnd = now.Truncate(size)
 	}
-	for !now.Before(nextEnd.Add(rollupGrace)) {
+	for !now.Before(nextEnd.Add(grace)) {
 		compute(nextEnd.Add(-size), nextEnd)
 		nextEnd = nextEnd.Add(size)
 	}

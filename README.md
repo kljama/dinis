@@ -58,6 +58,7 @@ DINIS calculates the time slot from the IP address. Adjacent addresses get time 
 - After a failed probe, DINIS probes the host again after `confirmProbeSec` seconds, not at its next time slot. The default is 10 seconds. DINIS continues until the host replies or its status is `DOWN`. Then the host goes back to its time slot. With the default settings, the status changes to `DOWN` approximately 10 to 70 seconds after an outage starts. This rule applies only if the interval is longer than `confirmProbeSec`. To probe only at the time slots, set `confirmProbeSec` to `0`.
 - After `recoveryThreshold` replies in sequence, a `DOWN` host changes to `UP`. The default is 2. Thus a host with intermittent packet loss does not start a new alert for each lost probe.
 - After a restart, DINIS probes each host within its normal interval. This also applies to a host that was `DOWN`.
+- The timeout of a scheduled probe is `timeoutMs`, but a maximum of 90 % of the probe interval of the host. For example, at an interval of 1 second, the timeout is a maximum of 900 ms. DINIS sends the next probe to a host only after the last probe ended. With a longer timeout, a host that does not reply would miss time slots, and an outage would have fewer failed probes than successful probes in the same time. A reply that comes after the timeout counts as packet loss. A manual probe uses the full `timeoutMs`.
 - The statistics of a host contain only the scheduled probes: the packet loss, the minimum, average and maximum latency, and the latency history. A manual probe (`POST /api/hosts/{ip}/ping`) changes only the status and the current latency.
 - The packet loss of a host is the total loss since the start of DINIS.
 - The average latency of a host is the mean of the replies to its last 25 probes.
@@ -66,6 +67,7 @@ DINIS calculates the time slot from the IP address. Adjacent addresses get time 
 
 DINIS sends all probes through one ICMP socket. One reader receives all replies. This section does not apply to the `ping` command method (refer to [Prerequisites](#prerequisites)).
 
+- Each sample in the history and in the InfluxDB export has the time when DINIS sent the probe. This also applies to a probe that timed out. Thus the samples of a host are on its time slots, and an outage does not start or end late by the timeout. DINIS writes a failed sample when its timeout ends, thus the sample arrives in InfluxDB up to `timeoutMs` after its timestamp.
 - The round-trip time starts immediately before DINIS sends the request. It ends at the time when the Linux kernel received the reply. Thus a busy DINIS process does not increase the measured latency.
 - If a router or the kernel reports that the host cannot be reached (ICMP Destination Unreachable or Time Exceeded), the probe fails immediately. The reason shows in the last error of the host and in its alert.
 - If a probe fails because of the DINIS system (for example, no free buffer space, or a local firewall rule), DINIS does not count it as packet loss, and the status of the host does not change. DINIS logs these errors a maximum of one time each minute. The metric `dinis_probe_local_errors_total` counts them.
@@ -515,7 +517,7 @@ If a value is out of range, DINIS uses the nearest value in the range. If `timeo
 | Field | Default | Range | Description |
 |---|---|---|---|
 | `intervalSec` | `60` | 0.5–3600 | The default probe interval for each host. A CIDR can have a different interval. |
-| `timeoutMs` | `1000` | 1–30000 | The probe timeout. |
+| `timeoutMs` | `1000` | 1–30000 | The probe timeout. For scheduled probes, the maximum is 90 % of the probe interval of the host. Refer to [Probe schedule](#probe-schedule). |
 | `failThreshold` | `2` | 1–100 | The number of failed probes in sequence before the status changes to `DOWN`. |
 | `recoveryThreshold` | `2` | 1–100 | The number of replies in sequence before a `DOWN` host changes to `UP`. `1` resolves the alert at the first reply. |
 | `concurrency` | `1000` | 1–10000 | The number of probes at the same time. DINIS uses a new value immediately. A data file from an earlier version with the earlier default `100` changes to `1000`. |

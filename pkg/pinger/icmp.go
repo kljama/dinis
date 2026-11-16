@@ -111,6 +111,9 @@ type PingResult struct {
 	LatencyMs float64
 	Error     string
 	Timestamp time.Time
+	// Sent is when the probe was sent. The engine sets it for scheduled probes; the sample
+	// in the history and in the export carries this time, also for a probe that timed out.
+	Sent time.Time
 	// LocalError marks a probe that failed because of this machine, for example no buffer
 	// space or a local firewall rule. It says nothing about the target.
 	LocalError bool `json:"-"`

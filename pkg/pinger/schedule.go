@@ -15,6 +15,13 @@ const (
 	// newHostSpread bounds how long a host added while the engine runs waits for its first
 	// probe. A batch of new hosts (e.g. after a discovery sweep) is spread over this window.
 	newHostSpread = 5 * time.Second
+	// maxTimeoutShare is the largest part of a host's probe interval that its probe timeout
+	// may use. A probe of a host that does not reply holds the host for the whole timeout, and
+	// the next probe cannot start before it ends. With a timeout of the interval or longer, a
+	// failing host would miss slots, and an outage would have fewer failed probes than the
+	// same time of replies has successful ones. The rest of the interval absorbs dispatch
+	// jitter, so a failing host stays on its own slot.
+	maxTimeoutShare = 0.9
 )
 
 // schedEntry tracks when a host is next due for a probe.
@@ -60,7 +67,8 @@ func (h *schedHeap) Pop() any {
 // probeJob is a probe handed from the dispatcher to a worker.
 type probeJob struct {
 	ip      string
-	suspect bool // holds a suspect slot until the probe completes
+	suspect bool          // holds a suspect slot until the probe completes
+	timeout time.Duration // the configured timeout, at most maxTimeoutShare of the interval
 }
 
 // fibMul32 is 2^32/φ (golden ratio), rounded to an odd number.
@@ -281,9 +289,17 @@ func (e *Engine) schedDoneUnsafe(ip string, h *HostState) {
 	}
 	ent.suspect = h.ConsecutiveFails > 0
 	ent.iv = e.probeIntervalUnsafe(h)
-	// The next slot at least half an interval from now keeps the host on its slot grid and,
-	// after a late dispatch, skips missed slots instead of catching up in a burst.
-	ent.due = nextSlot(ent.phase, ent.iv, e.mono()+ent.iv/2)
+	// The next slot at least half an interval after the last dispatch keeps the host on its
+	// slot grid. It counts from the dispatch, not from the end of the probe: a probe that
+	// waited for its timeout must not push the host past its next slot. A slot that passed
+	// less than half an interval ago is still taken (late); older missed slots are skipped
+	// instead of caught up in a burst.
+	now := e.mono()
+	after := ent.lastDispatch + ent.iv/2
+	if floor := now - ent.iv/2; after < floor {
+		after = floor
+	}
+	ent.due = nextSlot(ent.phase, ent.iv, after)
 	// A failed probe of a host that is not DOWN yet is confirmed soon, so an outage is found
 	// within about one interval instead of FailThreshold intervals. Afterwards the host is
 	// back on its slot grid.
@@ -325,7 +341,15 @@ func (e *Engine) startJobUnsafe(ent *schedEntry, now time.Duration) probeJob {
 	ent.inFlight = true
 	ent.probed = true
 	ent.lastDispatch = now
-	return probeJob{ip: ent.ip, suspect: ent.suspect}
+	return probeJob{ip: ent.ip, suspect: ent.suspect, timeout: probeTimeout(e.config.Timeout, ent.iv)}
+}
+
+// probeTimeout limits the configured timeout to maxTimeoutShare of the host's interval.
+func probeTimeout(timeout, interval time.Duration) time.Duration {
+	if limit := time.Duration(maxTimeoutShare * float64(interval)); timeout > limit {
+		return limit
+	}
+	return timeout
 }
 
 // dispatchLoop hands due probes to the workers. The work channel is unbuffered, so which
