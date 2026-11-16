@@ -186,14 +186,15 @@ After a restart, each active alert keeps its ID, its start time, and its acknowl
    docker compose up -d
    ```
 
-The stack has four containers:
+The stack has four containers and one start job:
 
 | Service | Address | Notes |
 |---|---|---|
-| Nginx → DINIS | `http://<server-ip>` (port `NGINX_HTTP_PORT`, default 80) | Dashboard and REST API, through the reverse proxy |
-| Nginx → InfluxDB 3 Explorer | `http://<server-ip>:8888` (`NGINX_EXPLORER_PORT`) | Admin mode with the configured connection `dinis`. **There is no login.** |
+| Nginx → DINIS | `https://<server-ip>` (port `NGINX_HTTPS_PORT`, default 443) | Dashboard and REST API, through the reverse proxy. Port `NGINX_HTTP_PORT` (default 80) only sends a redirect to HTTPS. |
+| Nginx → InfluxDB 3 Explorer | `https://<server-ip>:8888` (`NGINX_EXPLORER_PORT`) | Admin mode with the configured connection `dinis`. **There is no login.** A plain HTTP request to this port gets a redirect to HTTPS. |
 | InfluxDB 3 Core | `http://<server-ip>:8181` (`INFLUXDB3_PORT`) | Docker publishes this port directly on the host, not through Nginx. |
 | DINIS | Only in the container network (`dinis:8080`) | Has the `NET_RAW` capability for ICMP |
+| nginx-certs | — | Start job. It makes a self-signed certificate if there is no certificate, then it stops. Refer to [HTTPS certificate](#https-certificate). |
 
 **NOTES:**
 
@@ -203,6 +204,38 @@ The stack has four containers:
 - InfluxDB keeps the probe results for `INFLUXDB3_RETENTION_DAYS` days. The default is 60. Refer to [Retention and query range](#retention-and-query-range).
 - Docker keeps a maximum of five log files of 10 MB for each container.
 - When DINIS stops, it has 30 seconds to save the alerts and to send the last points to InfluxDB.
+
+#### HTTPS certificate
+
+Nginx reads the certificate from two files in the directory `NGINX_CERT_DIR` (default `./docker/nginx/certs`):
+
+| File | Contents |
+|---|---|
+| `tls.crt` | The server certificate in PEM format. If the CA uses intermediate certificates, add them after the server certificate in the same file. |
+| `tls.key` | The private key of the server certificate in PEM format, without a password. |
+
+At each start, the `nginx-certs` job does a check of this directory:
+
+- If the two files exist, the job does not change them.
+- If the two files are missing, the job makes a self-signed certificate (ECDSA P-256, 825 days). It uses `TLS_SELF_SIGNED_CN` and `TLS_SELF_SIGNED_SAN` from `.env`. The browser accepts the certificate only for the names and IPs in `TLS_SELF_SIGNED_SAN`, so add the name or IP that you use, for example `DNS:dinis.example.lan,IP:192.168.1.10`.
+- If only one of the two files exists, the job stops with an error, and Nginx does not start.
+
+The browser shows a warning for a self-signed certificate. This is normal.
+
+To use a signed certificate:
+
+1. Copy the certificate (with the intermediate certificates) to `tls.crt` and the key to `tls.key`. Replace the two files. The job gives the self-signed files to the owner of the directory, so root access is not necessary.
+2. Load the new certificate:
+   ```bash
+   docker compose exec nginx nginx -s reload
+   ```
+   Nginx does a check of the configuration and the files before the reload. If a file is not correct, Nginx shows an error and continues with the old certificate.
+
+To get a new self-signed certificate, for example after you change `TLS_SELF_SIGNED_SAN`, remove the two files and run `docker compose up -d --force-recreate nginx-certs nginx`.
+
+**NOTE:** Do not set `NGINX_CERT_DIR` to a Let's Encrypt `live/` directory. The files in that directory are symbolic links to `../../archive/`, and the container cannot follow them. Copy the files instead.
+
+**NOTE:** Port 8181 (InfluxDB) does not go through Nginx and has no TLS. Grafana and other clients send the InfluxDB token on this port without encryption.
 
 ## Use the REST API
 
@@ -570,8 +603,12 @@ DINIS also sends a keepalive comment each 15 seconds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `NGINX_HTTP_PORT` | `80` | The host port for the dashboard and the REST API, through Nginx. |
-| `NGINX_EXPLORER_PORT` | `8888` | The host port for InfluxDB 3 Explorer, through Nginx. |
+| `NGINX_HTTP_PORT` | `80` | The plain HTTP host port. It only sends a redirect to HTTPS on port 443. |
+| `NGINX_HTTPS_PORT` | `443` | The HTTPS host port for the dashboard and the REST API, through Nginx. If you change it, the redirect from port 80 does not go to the correct port. |
+| `NGINX_EXPLORER_PORT` | `8888` | The HTTPS host port for InfluxDB 3 Explorer, through Nginx. |
+| `NGINX_CERT_DIR` | `./docker/nginx/certs` | The directory with `tls.crt` and `tls.key`. Refer to [HTTPS certificate](#https-certificate). |
+| `TLS_SELF_SIGNED_CN` | `localhost` | The common name of the self-signed certificate. |
+| `TLS_SELF_SIGNED_SAN` | `DNS:localhost,IP:127.0.0.1` | The names and IPs of the self-signed certificate. |
 | `INFLUXDB3_PORT` | `8181` | The host port for InfluxDB 3 Core (HTTP API and Flight SQL). Docker publishes this port directly. |
 | `DINIS_PORT` | `8080` | The DINIS port in the container. Do not change this value. The Nginx configuration and the health checks use port 8080. |
 | `DINIS_DATA` | `/data/dinis.json` | The path of the data file in the container, on the `dinis-data` volume. |
@@ -638,7 +675,7 @@ Thus you can query all data in the retention period, also after a restart of Inf
 
 ### InfluxDB 3 Explorer
 
-Use InfluxDB 3 Explorer to examine the tables and to run SQL queries without Grafana. Open `http://<dinis-host-ip>:8888` in your browser.
+Use InfluxDB 3 Explorer to examine the tables and to run SQL queries without Grafana. Open `https://<dinis-host-ip>:8888` in your browser.
 
 In the Docker Compose stack, Explorer starts with a configured connection named `dinis`. It is not necessary to configure this connection manually. The connection uses these values from `.env`:
 
@@ -706,7 +743,7 @@ The default settings are for a safe test network. Before you use DINIS on a diff
 ├── docker-compose.yml    # DINIS, InfluxDB 3 Core, InfluxDB 3 Explorer, and Nginx
 ├── .env.example          # Template for the Docker Compose settings. Copy it to .env.
 ├── docker/
-│   └── nginx/            # Configuration of the Nginx reverse proxy
+│   └── nginx/            # Configuration of the Nginx reverse proxy. certs/ holds tls.crt and tls.key.
 ├── data/                 # Default directory for the data file and the alert state file
 ├── verify_e2e.py         # End-to-end API test script. CI runs it on the Compose stack.
 ├── .github/workflows/    # CI: gofmt, go vet, tests with the race detector, configuration checks, end-to-end test
