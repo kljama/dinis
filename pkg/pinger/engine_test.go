@@ -1081,3 +1081,82 @@ func TestConfirmationProbe(t *testing.T) {
 		onGrid(t, wait, c.Interval)
 	})
 }
+
+// timeoutProber waits for the whole timeout of each probe and fails it, like a host that does
+// not reply. It records when each probe starts and the timeout it got.
+type timeoutProber struct {
+	mu       sync.Mutex
+	starts   []time.Time
+	timeouts []time.Duration
+}
+
+func (p *timeoutProber) Probe(ctx context.Context, ip string, timeout time.Duration) PingResult {
+	p.mu.Lock()
+	p.starts = append(p.starts, time.Now())
+	p.timeouts = append(p.timeouts, timeout)
+	p.mu.Unlock()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	return PingResult{IP: ip, Error: "Request timeout", Timestamp: time.Now()}
+}
+func (p *timeoutProber) Mode() string       { return "fake" }
+func (p *timeoutProber) Stats() ProberStats { return ProberStats{Mode: "fake"} }
+func (p *timeoutProber) Close()             {}
+
+// A host that does not reply is probed at its interval also when the configured timeout is as
+// long as the interval or longer: the timeout is limited to a part of the interval, and the
+// next slot counts from the dispatch, not from the end of the probe.
+func TestFailingHostKeepsIntervalWithLongTimeout(t *testing.T) {
+	const iv = minProbeInterval
+	for _, timeout := range []time.Duration{iv / 2, iv, 2 * iv} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Interval, cfg.Timeout = iv, timeout
+			cfg.ConfirmDelay, cfg.DownProbeInterval = 0, 0
+			e := NewEngine(cfg)
+			p := &timeoutProber{}
+			e.prober = p
+			ip := "10.0.0.1"
+			e.SetHosts(map[string]*HostState{ip: {IP: ip, CIDR: "10.0.0.0/24", Status: StatusUp}})
+			e.Start()
+			time.Sleep(10*iv + iv/2)
+			e.Stop()
+
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if n := len(p.starts); n < 8 {
+				t.Fatalf("expected about 10 probes in 10 intervals, got %d", n)
+			}
+			for i := 1; i < len(p.starts); i++ {
+				if gap := p.starts[i].Sub(p.starts[i-1]); gap > iv*5/4 {
+					t.Fatalf("probe %d started %v after the one before, expected about %v", i, gap, iv)
+				}
+			}
+			want := probeTimeout(timeout, iv)
+			for _, got := range p.timeouts {
+				if got != want || got > iv {
+					t.Fatalf("expected a probe timeout of %v, got %v", want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestProbeTimeoutLimit(t *testing.T) {
+	cases := []struct{ timeout, interval, want time.Duration }{
+		{time.Second, 60 * time.Second, time.Second},
+		{time.Second, time.Second, 900 * time.Millisecond},
+		{2 * time.Second, time.Second, 900 * time.Millisecond},
+		{500 * time.Millisecond, time.Second, 500 * time.Millisecond},
+		{30 * time.Second, 5 * time.Minute, 30 * time.Second},
+	}
+	for _, c := range cases {
+		if got := probeTimeout(c.timeout, c.interval); got != c.want {
+			t.Errorf("probeTimeout(%v, %v) = %v, want %v", c.timeout, c.interval, got, c.want)
+		}
+	}
+}

@@ -607,7 +607,10 @@ func (e *Engine) workerLoop(ctx context.Context, workChan <-chan probeJob, stop 
 
 func (e *Engine) probeAndApply(job probeJob) {
 	e.mu.RLock()
-	timeout := e.config.Timeout
+	timeout := job.timeout
+	if timeout <= 0 {
+		timeout = e.config.Timeout
+	}
 	ctx := e.ctx
 	e.mu.RUnlock()
 
