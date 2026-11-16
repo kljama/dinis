@@ -67,6 +67,7 @@ DINIS calculates the time slot from the IP address. Adjacent addresses get time 
 
 DINIS sends all probes through one ICMP socket. One reader receives all replies. This section does not apply to the `ping` command method (refer to [Prerequisites](#prerequisites)).
 
+- Each sample in the history and in the InfluxDB export has the time when DINIS sent the probe. This also applies to a probe that timed out. Thus the samples of a host are on its time slots, and an outage does not start or end late by the timeout. DINIS writes a failed sample when its timeout ends, thus the sample arrives in InfluxDB up to `timeoutMs` after its timestamp.
 - The round-trip time starts immediately before DINIS sends the request. It ends at the time when the Linux kernel received the reply. Thus a busy DINIS process does not increase the measured latency.
 - If a router or the kernel reports that the host cannot be reached (ICMP Destination Unreachable or Time Exceeded), the probe fails immediately. The reason shows in the last error of the host and in its alert.
 - If a probe fails because of the DINIS system (for example, no free buffer space, or a local firewall rule), DINIS does not count it as packet loss, and the status of the host does not change. DINIS logs these errors a maximum of one time each minute. The metric `dinis_probe_local_errors_total` counts them.

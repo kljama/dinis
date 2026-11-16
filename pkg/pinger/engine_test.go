@@ -1160,3 +1160,40 @@ func TestProbeTimeoutLimit(t *testing.T) {
 		}
 	}
 }
+
+// A sample carries the send time of its probe, also when the probe waited for its timeout,
+// and the store waits for the longest timeout before it rolls a minute up.
+func TestSampleCarriesSendTime(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Timeout = 300 * time.Millisecond
+	e := NewEngine(cfg)
+	p := &timeoutProber{}
+	e.prober = p
+	ip := "10.0.0.1"
+	e.SetHosts(map[string]*HostState{ip: {IP: ip, Status: StatusUp}})
+	var recorded time.Time
+	e.OnProbeRecorded = func(_, _, _ string, _ float64, _ bool, ts time.Time) { recorded = ts }
+
+	e.mu.Lock()
+	e.inFlight = 1
+	e.mu.Unlock()
+	before := time.Now()
+	e.probeAndApply(probeJob{ip: ip, timeout: cfg.Timeout})
+
+	if recorded.Before(before) || recorded.After(p.starts[0]) {
+		t.Fatalf("expected the send time (%v to %v), got %v", before, p.starts[0], recorded)
+	}
+	samples := e.GetTimeseriesStore().GetRecentRawSamples(ip, 1)
+	if len(samples) != 1 || samples[0].Timestamp.UnixNano() != recorded.UnixNano() {
+		t.Fatalf("expected the raw sample at the send time %v, got %+v", recorded, samples)
+	}
+
+	if g := e.GetTimeseriesStore().RollupGrace(); g != cfg.Timeout+time.Second {
+		t.Fatalf("expected a rollup grace of timeout + 1 s, got %v", g)
+	}
+	cfg.Timeout = 5 * time.Second
+	e.UpdateConfig(cfg)
+	if g := e.GetTimeseriesStore().RollupGrace(); g != 6*time.Second {
+		t.Fatalf("expected the rollup grace to follow the timeout, got %v", g)
+	}
+}

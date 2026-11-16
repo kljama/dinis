@@ -620,27 +620,27 @@ func TestRollupDueBuckets(t *testing.T) {
 	}
 
 	// Not due yet: the bucket ending at 12:01 waits for the grace period
-	next := rollupDueBuckets(base.Add(time.Minute+500*time.Millisecond), base.Add(time.Minute), time.Minute, record)
+	next := rollupDueBuckets(base.Add(time.Minute+500*time.Millisecond), base.Add(time.Minute), time.Minute, defaultRollupGrace, record)
 	if len(got) != 0 || !next.Equal(base.Add(time.Minute)) {
 		t.Fatalf("expected nothing rolled up before the grace period, got %v next=%v", got, next)
 	}
 
 	// Due: exactly one bucket, then the next one is pending
-	next = rollupDueBuckets(base.Add(time.Minute+rollupGrace), next, time.Minute, record)
+	next = rollupDueBuckets(base.Add(time.Minute+defaultRollupGrace), next, time.Minute, defaultRollupGrace, record)
 	if len(got) != 1 || !got[0].Equal(base) || !next.Equal(base.Add(2*time.Minute)) {
 		t.Fatalf("expected bucket 12:00 rolled up once, got %v next=%v", got, next)
 	}
 
 	// A late tick rolls up every missed bucket in order
 	got = nil
-	next = rollupDueBuckets(base.Add(3*time.Minute+5*time.Second), next, time.Minute, record)
+	next = rollupDueBuckets(base.Add(3*time.Minute+5*time.Second), next, time.Minute, defaultRollupGrace, record)
 	if len(got) != 2 || !got[0].Equal(base.Add(time.Minute)) || !got[1].Equal(base.Add(2*time.Minute)) {
 		t.Fatalf("expected buckets 12:01 and 12:02, got %v", got)
 	}
 
 	// After a long pause only the most recent completed bucket is rolled up
 	got = nil
-	rollupDueBuckets(base.Add(3*time.Hour+30*time.Second), next, time.Minute, record)
+	rollupDueBuckets(base.Add(3*time.Hour+30*time.Second), next, time.Minute, defaultRollupGrace, record)
 	if len(got) != 1 || !got[0].Equal(base.Add(3*time.Hour-time.Minute)) {
 		t.Fatalf("expected only bucket 14:59 after a long pause, got %v", got)
 	}
@@ -871,5 +871,34 @@ func TestStoreWithoutHourHistory(t *testing.T) {
 	}
 	if EstimateMemoryMB(10000, false) >= EstimateMemoryMB(10000, true)/3 {
 		t.Fatal("expected far less memory without the hour history")
+	}
+}
+
+// A longer grace holds the rollup of a bucket until samples stamped inside it, but recorded
+// up to one probe timeout later, are in.
+func TestRollupGrace(t *testing.T) {
+	st := NewStoreWithLimit(10)
+	if g := st.RollupGrace(); g != defaultRollupGrace {
+		t.Fatalf("expected the default grace %v, got %v", defaultRollupGrace, g)
+	}
+	st.SetRollupGrace(31 * time.Second)
+	if g := st.RollupGrace(); g != 31*time.Second {
+		t.Fatalf("expected a grace of 31 s, got %v", g)
+	}
+	st.SetRollupGrace(0)
+	if g := st.RollupGrace(); g != defaultRollupGrace {
+		t.Fatalf("expected 0 to restore the default, got %v", g)
+	}
+
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	var got []time.Time
+	record := func(start, _ time.Time) { got = append(got, start) }
+	next := rollupDueBuckets(base.Add(time.Minute+30*time.Second), base.Add(time.Minute), time.Minute, 31*time.Second, record)
+	if len(got) != 0 {
+		t.Fatalf("expected nothing rolled up 30 s after the bucket with a 31 s grace, got %v", got)
+	}
+	rollupDueBuckets(base.Add(time.Minute+31*time.Second), next, time.Minute, 31*time.Second, record)
+	if len(got) != 1 || !got[0].Equal(base) {
+		t.Fatalf("expected bucket 12:00 rolled up after the grace, got %v", got)
 	}
 }
