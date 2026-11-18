@@ -2746,3 +2746,47 @@ func TestNormalizeSettingsProbeLimits(t *testing.T) {
 		}
 	}
 }
+
+// A settings change while a sweep runs must not be undone when the sweep ends: NextRun must
+// use the new discovery interval, not the one the sweep read when it started.
+func TestDiscoveryIntervalChangeDuringSweep(t *testing.T) {
+	srv, coord, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	for _, c := range coord.store.GetCIDRs() {
+		c.Enabled = false
+		_ = coord.store.AddOrUpdateCIDR(c)
+	}
+	settings := coord.store.GetSettings()
+	settings.DiscoveryIntervalMin = 60
+	if err := coord.applySettings(settings); err != nil {
+		t.Fatalf("applySettings: %v", err)
+	}
+
+	// Change the interval through the API after the sweep has read the settings
+	sweepDoneHook = func() {
+		req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"discoveryIntervalMin":1440}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("PUT /api/settings: got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	defer func() { sweepDoneHook = nil }()
+
+	if _, _, err := coord.RunDiscovery(""); err != nil {
+		t.Fatalf("RunDiscovery: %v", err)
+	}
+
+	status := coord.GetDiscoveryStatus()
+	if status.IntervalMin != 1440 {
+		t.Fatalf("IntervalMin: got %d, want 1440", status.IntervalMin)
+	}
+	if status.LastRun == nil || status.NextRun == nil {
+		t.Fatalf("LastRun and NextRun must be set: %+v", status)
+	}
+	if got := status.NextRun.Sub(*status.LastRun); got != 1440*time.Minute {
+		t.Errorf("NextRun - LastRun: got %v, want %v", got, 1440*time.Minute)
+	}
+}
