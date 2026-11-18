@@ -798,6 +798,10 @@ func (c *Coordinator) endDiscovery() {
 	c.discMu.Unlock()
 }
 
+// sweepDoneHook runs after a sweep's probes and before its result is recorded. Tests use it
+// to change settings while a sweep runs.
+var sweepDoneHook func()
+
 // updateNextRunUnsafe sets NextRun from the last full sweep. Caller holds discMu.
 func (c *Coordinator) updateNextRunUnsafe(intervalMin int) {
 	if intervalMin <= 0 || c.lastFullSweep.IsZero() {
@@ -999,13 +1003,19 @@ func (c *Coordinator) runSweep(all bool, only []string) (discoveredOnline, newDi
 		c.pinger.TriggerSweep()
 	}
 
+	if sweepDoneHook != nil {
+		sweepDoneHook()
+	}
+
 	now := time.Now()
 	c.discMu.Lock()
 	c.discoveryStatus.LastRun = &now
 	if all {
 		c.lastFullSweep = now
 	}
-	c.updateNextRunUnsafe(settings.DiscoveryIntervalMin)
+	// Not settings.DiscoveryIntervalMin: that copy is from the sweep start, and a settings
+	// change during the sweep has already set IntervalMin (under discMu) to the new value.
+	c.updateNextRunUnsafe(c.discoveryStatus.IntervalMin)
 	c.discoveryStatus.LastScannedCount = len(targets)
 	c.discoveryStatus.LastDiscoveredCount = len(c.store.GetDiscoveredHosts())
 	// Still "scanning" while more sweeps are queued
